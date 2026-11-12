@@ -1,0 +1,97 @@
+== Crossnode gate 1, loopback, 20261112T035111Z
+guest: QNX nodex 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+build: 87ef1f7
+  hellodev sha256 050bfc05fc5da0dc
+  crossnode-agent sha256 9e44ea492583eb9c
+  crossnode-net sha256 0780d2e9add5b075
+  cnprobe sha256 68f01c6ccd914d10
+
+== 1. Same answers locally and through /net/self
+local:
+  hello from nodex
+  op=set rc=EOK info=0 value=41
+  op=add rc=EOK info=0 value=42
+  op=get rc=EOK info=7 value=42
+remote:
+  hello from nodex
+  op=set rc=EOK info=0 value=41
+  op=add rc=EOK info=0 value=42
+  op=get rc=EOK info=7 value=42
+PASS  1 cat and devctl set/add/get give identical results, info value included  [compared 4 lines]
+
+== 2. A stock QNX tool (stty) through /net/self
+  same
+  13
+PASS  2 stty -a on /net/self/dev/ser1 matches /dev/ser1 byte for byte  [13 lines]
+
+== 3. A path outside the share list is refused
+  cat: /net/self/etc/passwd: Permission denied
+PASS  3 /net/self/etc/passwd is refused  [cat: /net/self/etc/passwd: Permission denied]
+PASS  3b a link that stays inside the share is followed  [plain file inside the share]
+PASS  3c a link that leads out of the share is refused  [cat: /net/self/tmp/cnx/escape: Permission denied]
+
+== 4. A waiting devctl when the peer is killed
+  kill_at=1826897
+  result=stopped rc=EHOSTDOWN call_ms=1057 t_end=1826924
+PASS  4 the waiting call returns EHOSTDOWN once the peer is killed  [rc=EHOSTDOWN, 27 ms after the kill]
+
+== 5. A waiting devctl when the peer freezes and stays silent
+  stop_at=1829676
+  result=stopped rc=EHOSTDOWN call_ms=1986 t_end=1831715
+PASS  5 the waiting call returns EHOSTDOWN within the liveness limit  [rc=EHOSTDOWN, 2039 ms after the freeze, limit 2000 ms]
+
+== 6. A new open while the peer is still frozen
+  op=open rc=EHOSTDOWN ms=2101
+  op=open rc=EHOSTDOWN ms=0
+PASS  6a the open fails with EHOSTDOWN within the liveness limit  [op=open rc=EHOSTDOWN ms=2101]
+PASS  6b a second open right after fails at once  [op=open rc=EHOSTDOWN ms=0]
+
+== 7. A new open after the peer is gone
+  op=open rc=EHOSTDOWN ms=8
+PASS  7 the open fails with EHOSTDOWN within the connect limit  [op=open rc=EHOSTDOWN ms=8]
+
+== 8. Using and closing an fd whose peer died
+  op=get-before rc=EOK value=42
+  op=get-after rc=EHOSTDOWN ms=1
+  op=close rc=EOK ms=0
+PASS  8a a call on the old fd fails at once with EHOSTDOWN  [op=get-after rc=EHOSTDOWN ms=1]
+PASS  8b close returns at once  [op=close rc=EOK ms=0]
+
+== 9. A process exits while holding an fd whose peer died
+  op=exit-with-open-fd opened=y ms=2
+PASS  9 the process exits at once  [op=exit-with-open-fd opened=y ms=2]
+
+== 10. A signal to a waiting caller
+  op=get-with-signal rc=EINTR ms=303
+PASS  10 the call returns EINTR when the signal arrives, not when the peer answers  [op=get-with-signal rc=EINTR ms=303]
+
+== 11. The path recovers when the peer comes back
+  op=get rc=EOK info=7 value=42 ms=4
+PASS  11 a fresh call works again  [op=get rc=EOK info=7 value=42 ms=4]
+
+== 12. Only root and the allowed group may use /net/self
+  qnxuser (group 1000): op=get rc=EOK info=7 value=42 ms=2
+  user1 (group 1001): op=open rc=EACCES errno=13 ms=0
+  /net/self mode: drwxr-x---
+PASS  12a a member of the allowed group may use the path  [op=get rc=EOK info=7 value=42 ms=2]
+PASS  12b any other user is refused before anything is forwarded  [op=open rc=EACCES errno=13 ms=0]
+
+== crossnode-net log
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms)
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: no answer within the liveness limit
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: no answer within the liveness limit
+  crossnode-net[self]: peer down: Connection refused
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+
+== RESULT: 17 passed, 0 failed
+transcript: evidence/gate1-loopback-20261112T035111Z.txt

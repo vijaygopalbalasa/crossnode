@@ -10,6 +10,9 @@
  *   - a signal to a waiting client fails its call with EINTR at once (unblock handler);
  *   - close() never waits on the peer.
  *
+ * Only root, or members of the group given with -g, may use /net/<name>. Replies from the peer are
+ * checked against what was asked before any client sees them.
+ *
  * Gate 1 limits, stated plainly: stat() answers from a placeholder, directory listing is not
  * forwarded yet, pread/pwrite are not supported, there is one peer per process and no authentication.
  */
@@ -62,6 +65,7 @@ struct pend {
     int err;
     int32_t val;
     uint32_t gen;
+    uint32_t req;             /* bytes asked for (READ, DEVCTL) or sent (WRITE) */
     unsigned char *data;
     uint32_t dlen;
     struct cn_ocb *ocb;       /* OPEN only: the OCB bound to the waiting client */
@@ -97,6 +101,7 @@ static resmgr_connect_funcs_t cf;
 static resmgr_io_funcs_t iof;
 static const char *name;
 static int verbose;
+static gid_t allowed_gid = (gid_t)-1;   /* -g: this group may use the path as well as root */
 
 static void vlog(const char *fmt, ...)
 {
@@ -224,24 +229,43 @@ static struct pend *find_seq_locked(uint32_t seq)
     return NULL;
 }
 
-static void handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
+/* A reply must match its request: same operation, no more bytes than asked, a sane count. */
+static int reply_valid(const struct pend *e, const struct cn_hdr *h)
+{
+    if (h->op != (uint16_t)(e->op | CN_REPLY) || h->a < 0)
+        return 0;
+    if (h->a != 0)
+        return h->len == 0;
+    switch (e->op) {
+    case CN_OP_OPEN:   return h->len == 0 && h->b >= 0 && h->b < CN_MAX_HANDLES;
+    case CN_OP_READ:   return h->len <= e->req && h->b == (int32_t)h->len;
+    case CN_OP_WRITE:  return h->len == 0 && h->b >= 0 && (uint32_t)h->b <= e->req;
+    case CN_OP_DEVCTL: return h->len == 0 || h->len == e->req;
+    default:           return 0;
+    }
+}
+
+/* Returns -1 when the frame breaks the protocol; the caller then drops the connection. */
+static int handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
 {
     G.last_rx = now_ms();
     if (h->op == (CN_OP_PING | CN_REPLY))
-        return;
+        return 0;
     struct pend *e = find_seq_locked(h->seq);
     if (e == NULL || e->done) {
         /* Nobody waits for this answer any more; never leak a handle the peer just opened. */
-        if (h->op == (CN_OP_OPEN | CN_REPLY) && h->a == 0)
+        if (h->op == (CN_OP_OPEN | CN_REPLY) && h->a == 0 && h->b >= 0)
             queue_close_locked(h->b);
-        return;
+        return 0;
     }
+    if (!reply_valid(e, h))
+        return -1;
     if (e->cancelled) {
         if (e->op == CN_OP_OPEN && h->a == 0)
             queue_close_locked(h->b);
         e->done = 1;
         G.ring = 1;
-        return;
+        return 0;
     }
     e->err = h->a;
     e->val = h->b;
@@ -257,6 +281,7 @@ static void handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
     }
     e->done = 1;
     G.ring = 1;
+    return 0;
 }
 
 static void io_read_locked(void)
@@ -285,7 +310,10 @@ static void io_read_locked(void)
             }
             if (G.rxlen - off < sizeof h + h.len)
                 break;
-            handle_frame_locked(&h, G.rx + off + sizeof h);
+            if (handle_frame_locked(&h, G.rx + off + sizeof h) != 0) {
+                teardown_locked("a reply did not match its request");
+                return;
+            }
             off += sizeof h + h.len;
         }
         memmove(G.rx, G.rx + off, G.rxlen - off);
@@ -387,7 +415,7 @@ static void wake_io(void)
  * an OPEN binds. Returns _RESMGR_NOREPLY when the client now waits on the pending table, or an errno.
  */
 static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct cn_ocb *open_ocb,
-                  int32_t handle, int32_t a, int32_t b, const void *payload, uint32_t plen)
+                  int32_t handle, int32_t a, int32_t b, const void *payload, uint32_t plen, uint32_t req)
 {
     pthread_mutex_lock(&G.mtx);
     if (gen_ocb != NULL && gen_ocb->gen != G.gen) {
@@ -419,6 +447,7 @@ static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct 
     e->op = op;
     e->seq = ++G.seq;
     e->rcvid = ctp->rcvid;
+    e->req = req;
     if (open_ocb != NULL) {
         e->ocb = open_ocb;
         e->info = ctp->info;
@@ -574,12 +603,30 @@ static int connect_unblock(resmgr_context_t *ctp, io_pulse_t *msg, iofunc_attr_t
     return _RESMGR_NOREPLY;
 }
 
+/* Root, or the -g group, as file_attr's owner and mode say; checked before anything is forwarded. */
+static int check_client(resmgr_context_t *ctp, unsigned ioflag)
+{
+    struct _client_info *ci = NULL;
+    int st = iofunc_client_info_ext(ctp, 0, &ci, IOFUNC_CLIENTINFO_GETGROUPS);
+    if (st != EOK)
+        return st;
+    mode_t want = S_IREAD;
+    if (ioflag & _IO_FLAG_WR)
+        want |= S_IWRITE;
+    st = iofunc_check_access(ctp, &file_attr, want, ci);
+    iofunc_client_info_ext_free(&ci);
+    return st;
+}
+
 static int cn_open(resmgr_context_t *ctp, io_open_t *msg, iofunc_attr_t *handle, void *extra)
 {
     (void)handle;
     const char *path = msg->connect.path;
     if (path[0] == '\0')
         return iofunc_open_default(ctp, msg, &dir_attr, extra);   /* /net/<name> itself */
+    int allowed = check_client(ctp, msg->connect.ioflag);
+    if (allowed != EOK)
+        return allowed;
 
     struct cn_ocb *ocb = ocb_new();
     if (ocb == NULL)
@@ -611,7 +658,7 @@ static int cn_open(resmgr_context_t *ctp, io_open_t *msg, iofunc_attr_t *handle,
         free(ocb);
         return st;
     }
-    st = submit(ctp, CN_OP_OPEN, NULL, ocb, -1, oflag, 0, path, (uint32_t)plen);
+    st = submit(ctp, CN_OP_OPEN, NULL, ocb, -1, oflag, 0, path, (uint32_t)plen, 0);
     if (st != _RESMGR_NOREPLY)
         drop_opening_ocb(ctp, &ctp->info, ocb);
     return st;
@@ -629,7 +676,7 @@ static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
     uint64_t n = _IO_READ_GET_NBYTES(msg);
     if (n > CN_MAX_DATA)
         n = CN_MAX_DATA;
-    return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0);
+    return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0, (uint32_t)n);
 }
 
 static int cn_write(resmgr_context_t *ctp, io_write_t *msg, struct cn_ocb *ocb)
@@ -653,7 +700,7 @@ static int cn_write(resmgr_context_t *ctp, io_write_t *msg, struct cn_ocb *ocb)
         free(buf);
         return EFAULT;
     }
-    st = submit(ctp, CN_OP_WRITE, ocb, NULL, ocb->rh, 0, 0, buf, (uint32_t)n);
+    st = submit(ctp, CN_OP_WRITE, ocb, NULL, ocb->rh, 0, 0, buf, (uint32_t)n, (uint32_t)n);
     free(buf);
     return st;
 }
@@ -681,7 +728,7 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
         }
         inlen = n;
     }
-    int st = submit(ctp, CN_OP_DEVCTL, ocb, NULL, ocb->rh, (int32_t)dcmd, (int32_t)n, in, inlen);
+    int st = submit(ctp, CN_OP_DEVCTL, ocb, NULL, ocb->rh, (int32_t)dcmd, (int32_t)n, in, inlen, n);
     free(in);
     return st;
 }
@@ -710,9 +757,10 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: crossnode-net -n NAME -c ADDRESS:PORT [-m DIR] [-v]\n"
+            "usage: crossnode-net -n NAME -c ADDRESS:PORT [-g GID] [-m DIR] [-v]\n"
             "  -n NAME          the peer appears as DIR/NAME\n"
             "  -c ADDRESS:PORT  the peer's crossnode-agent\n"
+            "  -g GID           members of this group may use DIR/NAME too (default: root only)\n"
             "  -m DIR           where peers appear (default /net)\n");
     exit(2);
 }
@@ -722,10 +770,11 @@ int main(int argc, char **argv)
     const char *mountdir = "/net";
     char *target = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "n:c:m:v")) != -1) {
+    while ((opt = getopt(argc, argv, "n:c:g:m:v")) != -1) {
         switch (opt) {
         case 'n': name = optarg; break;
         case 'c': target = optarg; break;
+        case 'g': allowed_gid = (gid_t)atoi(optarg); break;
         case 'm': mountdir = optarg; break;
         case 'v': verbose = 1; break;
         default: usage();
@@ -764,10 +813,13 @@ int main(int argc, char **argv)
     cn_ocb_funcs.ocb_free = cn_ocb_free;
     memset(&cn_mount, 0, sizeof cn_mount);
     cn_mount.funcs = &cn_ocb_funcs;
-    iofunc_attr_init(&dir_attr, S_IFDIR | 0555, NULL, NULL);
+    int group = allowed_gid != (gid_t)-1;
+    iofunc_attr_init(&dir_attr, S_IFDIR | (group ? 0750 : 0700), NULL, NULL);
     dir_attr.mount = &cn_mount;
-    iofunc_attr_init(&file_attr, S_IFCHR | 0666, NULL, NULL);
+    iofunc_attr_init(&file_attr, S_IFCHR | (group ? 0660 : 0600), NULL, NULL);
     file_attr.mount = &cn_mount;
+    dir_attr.uid = file_attr.uid = 0;
+    dir_attr.gid = file_attr.gid = group ? allowed_gid : 0;
 
     iofunc_func_init(_RESMGR_CONNECT_NFUNCS, &cf, _RESMGR_IO_NFUNCS, &iof);
     cf.open = cn_open;

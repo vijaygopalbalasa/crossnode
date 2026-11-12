@@ -30,7 +30,7 @@ check() {                       # check NAME STATUS DETAIL
 }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }    # le VALUE LIMIT, false if VALUE is empty
 
-AGENT='cd /tmp/cn && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -l 127.0.0.1 -p 7777 >> agent.log 2>&1 &)'
+AGENT='cd /tmp/cn && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 127.0.0.1 -p 7777 >> agent.log 2>&1 &)'
 P=/net/self/dev/hello
 
 echo "== Crossnode gate 1, loopback, $STAMP"
@@ -43,7 +43,9 @@ q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir
 for f in hellodev crossnode-agent crossnode-net cnprobe; do
     q "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
 done
-q 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-net -v -n self -c 127.0.0.1:7777 > net.log 2>&1 &)'
+q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape'
+# Root, plus group 1000 (qnxuser), may use /net/self.
+q 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 > net.log 2>&1 &)'
 q "$AGENT"
 sleep 1
 
@@ -70,6 +72,12 @@ E=$(q "cat /net/self/etc/passwd 2>&1; true")
 echo "  $E"
 echo "$E" | grep -q 'Permission denied'
 check "3 /net/self/etc/passwd is refused" $? "$E"
+E=$(q "cat /net/self/tmp/cnx/inside 2>&1; true")
+[ "$E" = "plain file inside the share" ]
+check "3b a link that stays inside the share is followed" $? "$E"
+E=$(q "cat /net/self/tmp/cnx/escape 2>&1; true")
+echo "$E" | grep -q 'Permission denied'
+check "3c a link that leads out of the share is refused" $? "$E"
 
 echo
 echo "== 4. A waiting devctl when the peer is killed"
@@ -142,6 +150,17 @@ O=$(q "cd /tmp/cn; ./cnprobe get $P")
 echo "  $O"
 [ "$(field rc "$O")" = EOK ] && [ "$(field info "$O")" = 7 ]
 check "11 a fresh call works again" $? "$O"
+
+echo
+echo "== 12. Only root and the allowed group may use /net/self"
+A=$(q "cd /tmp/cn; on -u qnxuser ./cnprobe get $P")
+B=$(q "cd /tmp/cn; on -u user1 ./cnprobe get $P")
+M=$(q "ls -ld /net/self | cut -c1-10")
+echo "  qnxuser (group 1000): $A"; echo "  user1 (group 1001): $B"; echo "  /net/self mode: $M"
+[ "$(field rc "$A")" = EOK ]
+check "12a a member of the allowed group may use the path" $? "$A"
+[ "$(field rc "$B")" = EACCES ]
+check "12b any other user is refused before anything is forwarded" $? "$B"
 
 echo
 echo "== crossnode-net log"

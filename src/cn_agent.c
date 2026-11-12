@@ -5,13 +5,17 @@
  * worker thread of its own. A request that blocks on a slow device therefore never delays the
  * liveness replies a peer uses to tell "slow" from "dead".
  *
- * Gate 1 limits, stated plainly: no authentication yet, so bind it to a private link address only;
- * symlinks inside an exported directory are followed.
+ * Every open is resolved with realpath() and must still land inside an export. Each operation
+ * works on its own dup() of the descriptor, so a close racing with it cannot redirect it to a
+ * file opened later. In-flight requests and connections are capped.
+ *
+ * Gate 1 limit, stated plainly: no peer authentication yet, so bind it to a private link address.
  */
 #include <arpa/inet.h>
 #include <devctl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -27,17 +31,23 @@
 #include "cn_proto.h"
 
 #define MAX_EXPORTS        32
+#define MAX_JOBS           64     /* requests in flight per connection */
+#define MAX_CONNS          16     /* peer connections at once */
 #define PEER_SILENCE_MS    5000   /* drop a peer that sends nothing, not even PING, for this long */
 
-static char *exports[MAX_EXPORTS];
+static char *exports[MAX_EXPORTS];      /* as given, without the leading '/' */
+static char *rexports[MAX_EXPORTS];     /* the same, resolved with realpath() at start */
 static int nexports;
 static int verbose;
+static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int nconns;
 
 struct conn {
     int sock;
     pthread_mutex_t mtx;          /* guards dead, refs, fds[] and every write to sock */
     int dead;
     int refs;
+    int jobs;
     int fds[CN_MAX_HANDLES];
     char peer[64];
 };
@@ -67,6 +77,9 @@ static void conn_put(struct conn *c)
         close(c->sock);
         pthread_mutex_destroy(&c->mtx);
         free(c);
+        pthread_mutex_lock(&conns_mtx);
+        nconns--;
+        pthread_mutex_unlock(&conns_mtx);
     }
 }
 
@@ -127,7 +140,7 @@ static void send_reply(struct conn *c, const struct cn_hdr *req, int32_t err, in
 }
 
 /* A path is allowed when it has no empty, "." or ".." component and sits at or under an export. */
-static int path_allowed(const char *p)
+static int path_allowed(const char *p, char **list)
 {
     if (p[0] == '\0' || p[0] == '/')
         return 0;
@@ -141,19 +154,20 @@ static int path_allowed(const char *p)
             s++;
     }
     for (int i = 0; i < nexports; i++) {
-        size_t n = strlen(exports[i]);
-        if (strncmp(p, exports[i], n) == 0 && (p[n] == '\0' || p[n] == '/'))
+        size_t n = strlen(list[i]);
+        if (strncmp(p, list[i], n) == 0 && (p[n] == '\0' || p[n] == '/'))
             return 1;
     }
     return 0;
 }
 
+/* A private duplicate of the handle's descriptor; the caller closes it when done. */
 static int get_fd(struct conn *c, int32_t h)
 {
     int fd = -1;
     pthread_mutex_lock(&c->mtx);
-    if (!c->dead && h >= 0 && h < CN_MAX_HANDLES)
-        fd = c->fds[h];
+    if (!c->dead && h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0)
+        fd = dup(c->fds[h]);
     pthread_mutex_unlock(&c->mtx);
     return fd;
 }
@@ -168,14 +182,25 @@ static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char 
     path[0] = '/';
     memcpy(path + 1, payload, h->len);
     path[h->len + 1] = '\0';
-    if (strlen(path + 1) != h->len || !path_allowed(path + 1)) {
+    if (strlen(path + 1) != h->len || !path_allowed(path + 1, exports)) {
         vlog("refused %s\n", path);
         send_reply(c, h, EACCES, -1, NULL, 0);
         return;
     }
+    /* Resolve links first: the real target must still be inside an export. */
+    char real[PATH_MAX];
+    if (realpath(path, real) == NULL) {
+        send_reply(c, h, errno, -1, NULL, 0);
+        return;
+    }
+    if (!path_allowed(real + 1, rexports)) {
+        vlog("refused %s (resolves to %s)\n", path, real);
+        send_reply(c, h, EACCES, -1, NULL, 0);
+        return;
+    }
     /* Only access mode, non-blocking and append travel; nothing is ever created or truncated. */
-    int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY;
-    int fd = open(path, oflag);
+    int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY | O_NOFOLLOW;
+    int fd = open(real, oflag);
     if (fd < 0) {
         send_reply(c, h, errno, -1, NULL, 0);
         return;
@@ -209,17 +234,21 @@ static void do_read(struct conn *c, const struct cn_hdr *h)
         return;
     }
     if (h->a < 0 || (uint32_t)h->a > CN_MAX_DATA) {
+        close(fd);
         send_reply(c, h, EINVAL, 0, NULL, 0);
         return;
     }
     unsigned char *buf = malloc((size_t)h->a + 1);
     if (buf == NULL) {
+        close(fd);
         send_reply(c, h, ENOMEM, 0, NULL, 0);
         return;
     }
     ssize_t r = read(fd, buf, (size_t)h->a);
+    int e = errno;
+    close(fd);
     if (r < 0)
-        send_reply(c, h, errno, 0, NULL, 0);
+        send_reply(c, h, e, 0, NULL, 0);
     else
         send_reply(c, h, 0, (int32_t)r, buf, (uint32_t)r);
     free(buf);
@@ -233,8 +262,10 @@ static void do_write(struct conn *c, const struct cn_hdr *h, const unsigned char
         return;
     }
     ssize_t w = write(fd, payload, h->len);
+    int e = errno;
+    close(fd);
     if (w < 0)
-        send_reply(c, h, errno, 0, NULL, 0);
+        send_reply(c, h, e, 0, NULL, 0);
     else
         send_reply(c, h, 0, (int32_t)w, NULL, 0);
 }
@@ -248,12 +279,14 @@ static void do_devctl(struct conn *c, const struct cn_hdr *h, const unsigned cha
         return;
     }
     if (h->b < 0 || (uint32_t)h->b > CN_MAX_DATA || h->len > (uint32_t)h->b) {
+        close(fd);
         send_reply(c, h, EINVAL, 0, NULL, 0);
         return;
     }
     size_t n = (size_t)h->b;
     unsigned char *buf = calloc(1, n + 1);
     if (buf == NULL) {
+        close(fd);
         send_reply(c, h, ENOMEM, 0, NULL, 0);
         return;
     }
@@ -261,6 +294,7 @@ static void do_devctl(struct conn *c, const struct cn_hdr *h, const unsigned cha
         memcpy(buf, payload, h->len);
     int info = 0;
     int err = devctl(fd, h->a, n ? buf : NULL, n, &info);
+    close(fd);
     unsigned dir = get_device_direction(h->a);
     uint32_t out = (err == EOK && (dir & DEVDIR_FROM)) ? (uint32_t)n : 0;
     send_reply(c, h, err, info, buf, out);
@@ -287,6 +321,9 @@ static void *worker(void *arg)
     case CN_OP_DEVCTL: do_devctl(j->c, &j->h, j->payload); break;
     default:           send_reply(j->c, &j->h, ENOSYS, 0, NULL, 0); break;
     }
+    pthread_mutex_lock(&j->c->mtx);
+    j->c->jobs--;
+    pthread_mutex_unlock(&j->c->mtx);
     conn_put(j->c);
     free(j->payload);
     free(j);
@@ -322,9 +359,12 @@ static void *reader(void *arg)
             free(p);
             continue;
         }
-        struct job *j = malloc(sizeof *j);
+        pthread_mutex_lock(&c->mtx);
+        int busy = c->jobs >= MAX_JOBS;
+        pthread_mutex_unlock(&c->mtx);
+        struct job *j = busy ? NULL : malloc(sizeof *j);
         if (j == NULL) {
-            send_reply(c, &h, ENOMEM, 0, NULL, 0);
+            send_reply(c, &h, busy ? EAGAIN : ENOMEM, 0, NULL, 0);
             free(p);
             continue;
         }
@@ -333,6 +373,7 @@ static void *reader(void *arg)
         j->payload = p;
         pthread_mutex_lock(&c->mtx);
         c->refs++;
+        c->jobs++;
         pthread_mutex_unlock(&c->mtx);
         pthread_attr_t at;
         pthread_t t;
@@ -342,6 +383,9 @@ static void *reader(void *arg)
             send_reply(c, &h, EAGAIN, 0, NULL, 0);
             free(p);
             free(j);
+            pthread_mutex_lock(&c->mtx);
+            c->jobs--;
+            pthread_mutex_unlock(&c->mtx);
             conn_put(c);
         }
         pthread_attr_destroy(&at);
@@ -403,6 +447,11 @@ int main(int argc, char **argv)
     }
     if (nexports == 0 || port <= 0 || port > 65535)
         usage();
+    for (int i = 0; i < nexports; i++) {
+        char given[PATH_MAX], real[PATH_MAX];
+        snprintf(given, sizeof given, "/%s", exports[i]);
+        rexports[i] = strdup(realpath(given, real) != NULL ? real + 1 : exports[i]);
+    }
     signal(SIGPIPE, SIG_IGN);
 
     struct sockaddr_in sa;
@@ -421,8 +470,11 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("crossnode-agent: serving %s:%d, exports:", addr, port);
-    for (int i = 0; i < nexports; i++)
+    for (int i = 0; i < nexports; i++) {
         printf(" /%s", exports[i]);
+        if (strcmp(exports[i], rexports[i]) != 0)
+            printf(" (= /%s)", rexports[i]);
+    }
     printf(" (no authentication in this build)\n");
     fflush(stdout);
 
@@ -435,6 +487,15 @@ int main(int argc, char **argv)
                 perror("crossnode-agent: accept");
             continue;
         }
+        pthread_mutex_lock(&conns_mtx);
+        int full = nconns >= MAX_CONNS;
+        if (!full)
+            nconns++;
+        pthread_mutex_unlock(&conns_mtx);
+        if (full) {
+            close(s);
+            continue;
+        }
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         struct timeval rtv = { PEER_SILENCE_MS / 1000, (PEER_SILENCE_MS % 1000) * 1000 };
         struct timeval stv = { 2, 0 };
@@ -443,6 +504,9 @@ int main(int argc, char **argv)
         struct conn *c = calloc(1, sizeof *c);
         if (c == NULL) {
             close(s);
+            pthread_mutex_lock(&conns_mtx);
+            nconns--;
+            pthread_mutex_unlock(&conns_mtx);
             continue;
         }
         c->sock = s;
@@ -456,11 +520,8 @@ int main(int argc, char **argv)
         pthread_t t;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&t, &at, reader, c) != 0) {
-            close(s);
-            pthread_mutex_destroy(&c->mtx);
-            free(c);
-        }
+        if (pthread_create(&t, &at, reader, c) != 0)
+            conn_put(c);            /* closes the socket and gives the slot back */
         pthread_attr_destroy(&at);
     }
 }
