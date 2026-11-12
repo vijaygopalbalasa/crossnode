@@ -35,7 +35,7 @@ P=/net/self/dev/hello
 
 echo "== Crossnode gate 1, loopback, $STAMP"
 echo "guest: $(q 'uname -a')"
-echo "build: $(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo uncommitted)"
+echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo uncommitted)"
 for f in hellodev crossnode-agent crossnode-net cnprobe; do
     echo "  $f sha256 $(shasum -a 256 "$BIN/$f" | cut -c1-16)"
 done
@@ -43,7 +43,7 @@ q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir
 for f in hellodev crossnode-agent crossnode-net cnprobe; do
     q "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
 done
-q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape'
+q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape && ln -s /etc/no-such-file /tmp/cnx/probe'
 # Root, plus group 1000 (qnxuser), may use /net/self.
 q 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 > net.log 2>&1 &)'
 q "$AGENT"
@@ -78,6 +78,12 @@ check "3b a link that stays inside the share is followed" $? "$E"
 E=$(q "cat /net/self/tmp/cnx/escape 2>&1; true")
 echo "$E" | grep -q 'Permission denied'
 check "3c a link that leads out of the share is refused" $? "$E"
+E=$(q "cat /net/self/tmp/cnx/missing 2>&1; true")
+echo "$E" | grep -q 'No such file'
+check "3d a missing name inside the share says so" $? "$E"
+E=$(q "cat /net/self/tmp/cnx/probe 2>&1; true")
+echo "$E" | grep -q 'Permission denied'
+check "3e a link to a missing name outside the share is refused, not reported missing" $? "$E"
 
 echo
 echo "== 4. A waiting devctl when the peer is killed"

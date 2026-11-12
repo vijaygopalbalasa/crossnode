@@ -1,0 +1,159 @@
+#!/bin/bash
+# Crossnode gate 1, part 2: two QNX 8.0 guests on a direct link (see twonode-up.sh).
+#
+# nodey shares /dev/hello and /dev/ser1; nodex reaches them as /net/nodey/... . Then nodey is
+# frozen (its QEMU stopped), and later its power is cut (its QEMU killed): nodey goes silent, no
+# reset ever arrives, and every caller on nodex must still get a clean error within the limit.
+#
+# Usage: test/gate1-twonode.sh IMAGES_DIR
+set -u
+IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=$ROOT/build/x86_64
+KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUT=$ROOT/evidence/gate1-twonode-$STAMP.txt
+mkdir -p "$ROOT/evidence"
+exec > >(tee "$OUT") 2>&1
+
+DEAD_MS=2000      # crossnode-net liveness limit (CN_DEAD_MS)
+CONNECT_MS=1500   # crossnode-net connect limit (CN_CONNECT_MS)
+SLACK_MS=1000     # allowance for emulated guests
+QPID=$IMG/nodey/output/qemu.pid
+
+qx() { ssh -i "$KEY" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes root@127.0.0.1 "$@"; }
+qy() { ssh -i "$KEY" -p 2223 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 root@127.0.0.1 "$@"; }
+host_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
+field() { echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
+PASS=0
+FAIL=0
+check() {
+    if [ "$2" -eq 0 ]; then echo "PASS  $1  [$3]"; PASS=$((PASS + 1));
+    else echo "FAIL  $1  [$3]"; FAIL=$((FAIL + 1)); fi
+}
+push() {   # push SSH_FUNCTION
+    $1 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; rm -f /tmp/cn/*.log /tmp/cn/*.txt; true'
+    for f in hellodev crossnode-agent crossnode-net cnprobe; do
+        $1 "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
+    done
+}
+start_nodey() {
+    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
+}
+wait_lines() {  # wait_lines FILE PATTERN SECONDS: until FILE on nodex has a line matching PATTERN
+    local i
+    for i in $(seq 1 $(( $3 * 4 ))); do
+        qx "grep -q '$2' $1 2>/dev/null" && return 0
+        sleep 0.25
+    done
+    return 1
+}
+P=/net/nodey/dev/hello
+
+echo "== Crossnode gate 1, two nodes, $STAMP"
+echo "nodex: $(qx 'uname -a')"
+echo "nodey: $(qy 'uname -a')"
+echo "link:  $(qx 'ifconfig vtnet1 | grep "inet "' | tr -s ' \t' ' ') <-> $(qy 'ifconfig vtnet1 | grep "inet "' | tr -s ' \t' ' ')"
+echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo uncommitted)"
+push qx
+push qy
+start_nodey
+qx 'cd /tmp/cn && (./crossnode-net -v -g 1000 -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
+sleep 1
+
+echo
+echo "== 1. nodex uses nodey's device through /net/nodey"
+R=$(qx "cd /tmp/cn; cat $P; for a in \"set 41\" \"add 1\" \"get\"; do ./cnprobe \${a%% *} $P \${a#* } | cut -d' ' -f1-4; done")
+L=$(qy 'cd /tmp/cn; cat /dev/hello; ./cnprobe get /dev/hello | cut -d" " -f1-4')
+echo "on nodex, through /net/nodey:"; echo "$R" | sed 's/^/  /'
+echo "on nodey, locally:";            echo "$L" | sed 's/^/  /'
+[ "$(echo "$R" | head -1)" = "hello from nodey" ] && [ "$(echo "$R" | tail -1)" = "$(echo "$L" | tail -1)" ]
+check "1 the answer comes from nodey, and nodey sees the value nodex set" $? "$(echo "$R" | tail -1)"
+
+echo
+echo "== 2. stty on nodex against nodey's serial port"
+qx 'stty -a < /net/nodey/dev/ser1' > /tmp/cn-stty-x.txt 2>&1
+qy 'stty -a < /dev/ser1' > /tmp/cn-stty-y.txt 2>&1
+cmp -s /tmp/cn-stty-x.txt /tmp/cn-stty-y.txt
+check "2 stty -a through /net/nodey matches stty -a run on nodey" $? "$(wc -l < /tmp/cn-stty-x.txt | tr -d ' ') lines"
+rm -f /tmp/cn-stty-x.txt /tmp/cn-stty-y.txt
+
+echo
+echo "== 3. nodey freezes: a signal reaches a waiting caller on nodex"
+qx "cd /tmp/cn; ./cnprobe get $P >/dev/null; (./cnprobe eintr $P 300 1500 > e3.txt 2>&1 &)"
+sleep 1
+kill -STOP "$(cat "$QPID")"
+wait_lines /tmp/cn/e3.txt op= 10
+kill -CONT "$(cat "$QPID")"
+O=$(qx 'cat /tmp/cn/e3.txt')
+echo "  $O"
+[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" 1000
+check "3 the call returns EINTR when the signal arrives" $? "$O"
+
+echo
+echo "== 4. nodey freezes: a waiting call on nodex fails within the liveness limit"
+sleep 3
+qx "cd /tmp/cn; (./cnprobe watch $P 600 50 > w4.txt 2>&1 &)"
+sleep 1.5
+T0=$(host_ms); kill -STOP "$(cat "$QPID")"
+wait_lines /tmp/cn/w4.txt result= 15
+T1=$(host_ms); kill -CONT "$(cat "$QPID")"
+O=$(qx 'tail -1 /tmp/cn/w4.txt')
+echo "  $O  (host saw it $((T1 - T0)) ms after the freeze, polling included)"
+[ "$(field rc "$O")" = EHOSTDOWN ] && le "$(field call_ms "$O")" $((DEAD_MS + SLACK_MS))
+check "4 EHOSTDOWN within the liveness limit" $? "call_ms=$(field call_ms "$O"), limit ${DEAD_MS} ms"
+
+echo
+echo "== 5. nodey loses power while nodex has three callers on it"
+sleep 3
+qx "cd /tmp/cn; ./cnprobe get $P > /dev/null; (./cnprobe watch $P 600 50 > w5.txt 2>&1 &); (./cnprobe stale $P 5000 > s5.txt 2>&1 &); (./cnprobe exit $P 5000 > x5.txt 2>&1 &)"
+sleep 1.5
+T0=$(host_ms); kill -KILL "$(cat "$QPID")"
+wait_lines /tmp/cn/w5.txt result= 15
+T1=$(host_ms)
+wait_lines /tmp/cn/s5.txt op=close 15
+wait_lines /tmp/cn/x5.txt op=exit 15
+W=$(qx 'tail -1 /tmp/cn/w5.txt'); S=$(qx 'cat /tmp/cn/s5.txt'); X=$(qx 'cat /tmp/cn/x5.txt')
+echo "  waiting call:  $W  (host saw it $((T1 - T0)) ms after the power cut, polling included)"
+echo "$S" | sed 's/^/  idle fd:       /'
+echo "  holding exit:  $X"
+[ "$(field rc "$W")" = EHOSTDOWN ] && le "$(field call_ms "$W")" $((DEAD_MS + SLACK_MS))
+check "5a the waiting call gets EHOSTDOWN within the liveness limit" $? "call_ms=$(field call_ms "$W")"
+AFTER=$(echo "$S" | grep get-after); CL=$(echo "$S" | grep op=close)
+[ "$(field rc "$AFTER")" = EHOSTDOWN ] && le "$(field ms "$AFTER")" 100 && [ "$(field rc "$CL")" = EOK ] && le "$(field ms "$CL")" 100
+check "5b a call on an idle fd fails at once, and close returns at once" $? "$AFTER; $CL"
+[ "$(field opened "$X")" = y ] && le "$(field ms "$X")" 200
+check "5c a process holding an fd exits at once" $? "$X"
+
+echo
+echo "== 6. New opens while nodey is off"
+O=$(qx "cd /tmp/cn; sleep 2; ./cnprobe open $P; ./cnprobe open $P")
+echo "$O" | sed 's/^/  /'
+FIRST=$(echo "$O" | sed -n 1p); SECOND=$(echo "$O" | sed -n 2p)
+[ "$(field rc "$FIRST")" = EHOSTDOWN ] && le "$(field ms "$FIRST")" $((CONNECT_MS + SLACK_MS))
+check "6a the open fails with EHOSTDOWN within the connect limit" $? "$FIRST"
+[ "$(field rc "$SECOND")" = EHOSTDOWN ] && le "$(field ms "$SECOND")" 100
+check "6b a second open right after fails at once" $? "$SECOND"
+
+echo
+echo "== 7. nodey boots again; nodex needs no restart"
+"$ROOT/test/twonode-up.sh" "$IMG" nodey | sed 's/^/  /'
+push qy
+start_nodey
+sleep 1
+O=$(qx "cd /tmp/cn; cat $P; ./cnprobe get $P")
+echo "$O" | sed 's/^/  /'
+echo "$O" | head -1 | grep -q 'hello from nodey' && [ "$(field rc "$(echo "$O" | tail -1)")" = EOK ]
+check "7 /net/nodey works again" $? "$(echo "$O" | tail -1)"
+
+echo
+echo "== crossnode-net log on nodex"
+qx 'cat /tmp/cn/net.log' | sed 's/^/  /'
+qx 'slay -f -s KILL crossnode-net >/dev/null 2>&1; true'
+qy 'slay -f -s KILL hellodev crossnode-agent >/dev/null 2>&1; true'
+
+echo
+echo "== RESULT: $PASS passed, $FAIL failed"
+echo "transcript: evidence/$(basename "$OUT")"
+[ "$FAIL" -eq 0 ]

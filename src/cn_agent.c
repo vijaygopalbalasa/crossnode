@@ -5,9 +5,12 @@
  * worker thread of its own. A request that blocks on a slow device therefore never delays the
  * liveness replies a peer uses to tell "slow" from "dead".
  *
- * Every open is resolved with realpath() and must still land inside an export. Each operation
- * works on its own dup() of the descriptor, so a close racing with it cannot redirect it to a
- * file opened later. In-flight requests and connections are capped.
+ * Every open is resolved with realpath() and must land inside an export; then the descriptor itself
+ * is asked where it points (iofdinfo), so swapping a path component between the check and the open
+ * gains nothing. Names outside the share all answer EACCES, so a peer cannot probe what exists there.
+ * Each operation works on its own dup() of the descriptor, so a close racing with it cannot
+ * redirect it to a file opened later. In-flight requests, connections, and connections per peer
+ * address are capped, and every refusal is logged.
  *
  * Gate 1 limit, stated plainly: no peer authentication yet, so bind it to a private link address.
  */
@@ -24,7 +27,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/iomgr.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -33,14 +38,16 @@
 #define MAX_EXPORTS        32
 #define MAX_JOBS           64     /* requests in flight per connection */
 #define MAX_CONNS          16     /* peer connections at once */
+#define MAX_PER_ADDR       4      /* connections at once from one address */
 #define PEER_SILENCE_MS    5000   /* drop a peer that sends nothing, not even PING, for this long */
 
 static char *exports[MAX_EXPORTS];      /* as given, without the leading '/' */
 static char *rexports[MAX_EXPORTS];     /* the same, resolved with realpath() at start */
 static int nexports;
 static int verbose;
-static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int nconns;
+static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards the slot table */
+static struct in_addr slot_addr[MAX_CONNS];
+static int slot_used[MAX_CONNS];
 
 struct conn {
     int sock;
@@ -48,6 +55,7 @@ struct conn {
     int dead;
     int refs;
     int jobs;
+    int slot;                 /* index in the slot table */
     int fds[CN_MAX_HANDLES];
     char peer[64];
 };
@@ -75,11 +83,11 @@ static void conn_put(struct conn *c)
     pthread_mutex_unlock(&c->mtx);
     if (last) {
         close(c->sock);
+        pthread_mutex_lock(&conns_mtx);
+        slot_used[c->slot] = 0;
+        pthread_mutex_unlock(&conns_mtx);
         pthread_mutex_destroy(&c->mtx);
         free(c);
-        pthread_mutex_lock(&conns_mtx);
-        nconns--;
-        pthread_mutex_unlock(&conns_mtx);
     }
 }
 
@@ -190,7 +198,20 @@ static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char 
     /* Resolve links first: the real target must still be inside an export. */
     char real[PATH_MAX];
     if (realpath(path, real) == NULL) {
-        send_reply(c, h, errno, -1, NULL, 0);
+        /* ENOENT only when the name itself is absent from a directory inside the share; a link
+         * that dangles may point anywhere, so it is refused like any other name outside. */
+        int e = EACCES;
+        struct stat st;
+        if (errno == ENOENT && lstat(path, &st) != 0 && errno == ENOENT) {
+            char dir[CN_MAX_PATH + 2], rdir[PATH_MAX];
+            strcpy(dir, path);
+            char *slash = strrchr(dir, '/');
+            if (slash != NULL && slash != dir)
+                *slash = '\0';
+            if (realpath(dir, rdir) != NULL && path_allowed(rdir + 1, rexports))
+                e = ENOENT;
+        }
+        send_reply(c, h, e, -1, NULL, 0);
         return;
     }
     if (!path_allowed(real + 1, rexports)) {
@@ -202,7 +223,16 @@ static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char 
     int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY | O_NOFOLLOW;
     int fd = open(real, oflag);
     if (fd < 0) {
-        send_reply(c, h, errno, -1, NULL, 0);
+        send_reply(c, h, errno == ENOENT ? ENOENT : errno, -1, NULL, 0);
+        return;
+    }
+    /* Ask the descriptor what it actually opened; a component swapped after realpath() fails here. */
+    char got[PATH_MAX];
+    struct _fdinfo fi;
+    if (iofdinfo(fd, 0, &fi, got, (int)sizeof got) < 0 || got[0] != '/' || !path_allowed(got + 1, rexports)) {
+        vlog("refused %s (the descriptor points at %s)\n", real, got);
+        close(fd);
+        send_reply(c, h, EACCES, -1, NULL, 0);
         return;
     }
     int slot = -1;
@@ -487,12 +517,24 @@ int main(int argc, char **argv)
                 perror("crossnode-agent: accept");
             continue;
         }
+        int slot = -1, same = 0;
         pthread_mutex_lock(&conns_mtx);
-        int full = nconns >= MAX_CONNS;
-        if (!full)
-            nconns++;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (slot_used[i] && slot_addr[i].s_addr == pa.sin_addr.s_addr)
+                same++;
+            else if (!slot_used[i] && slot < 0)
+                slot = i;
+        }
+        if (same >= MAX_PER_ADDR)
+            slot = -1;
+        if (slot >= 0) {
+            slot_used[slot] = 1;
+            slot_addr[slot] = pa.sin_addr;
+        }
         pthread_mutex_unlock(&conns_mtx);
-        if (full) {
+        if (slot < 0) {
+            fprintf(stderr, "crossnode-agent: refused a connection from %s (%s)\n", inet_ntoa(pa.sin_addr),
+                    same >= MAX_PER_ADDR ? "too many from that address" : "all slots in use");
             close(s);
             continue;
         }
@@ -505,11 +547,12 @@ int main(int argc, char **argv)
         if (c == NULL) {
             close(s);
             pthread_mutex_lock(&conns_mtx);
-            nconns--;
+            slot_used[slot] = 0;
             pthread_mutex_unlock(&conns_mtx);
             continue;
         }
         c->sock = s;
+        c->slot = slot;
         c->refs = 1;
         pthread_mutex_init(&c->mtx, NULL);
         for (int i = 0; i < CN_MAX_HANDLES; i++)
