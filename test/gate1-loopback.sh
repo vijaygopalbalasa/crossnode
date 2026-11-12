@@ -17,7 +17,8 @@ mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
 
 DEAD_MS=2000      # crossnode-net liveness limit (CN_DEAD_MS)
-SLACK_MS=1000     # allowance for an emulated guest
+CONNECT_MS=1500   # crossnode-net connect limit (CN_CONNECT_MS)
+SLACK_MS=200      # stated allowance on top of a limit: process start and scheduling on an emulated guest
 
 q() { ssh -i "$KEY" -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
           -o LogLevel=ERROR -o BatchMode=yes root@127.0.0.1 "$@"; }
@@ -29,6 +30,13 @@ check() {                       # check NAME STATUS DETAIL
     else echo "FAIL  $1  [$3]"; FAIL=$((FAIL + 1)); fi
 }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }    # le VALUE LIMIT, false if VALUE is empty
+
+# Refuse to produce evidence from a stale build: each binary must be newer than its own sources.
+stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
+if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
+   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
+    echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
+fi
 
 AGENT='cd /tmp/cn && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 127.0.0.1 -p 7777 >> agent.log 2>&1 &)'
 P=/net/self/dev/hello
@@ -92,7 +100,7 @@ echo "$O" | sed 's/^/  /'
 RC=$(field rc "$O"); TE=$(field t_end "$O"); K=$(field kill_at "$O")
 D=$(( ${TE:-0} - ${K:-0} ))
 [ "$RC" = EHOSTDOWN ] && le "$D" $SLACK_MS
-check "4 the waiting call returns EHOSTDOWN once the peer is killed" $? "rc=$RC, ${D} ms after the kill"
+check "4 the waiting call returns EHOSTDOWN once the peer is killed" $? "rc=$RC, ${D} ms after the kill, bound ${SLACK_MS} ms"
 
 echo
 echo "== 5. A waiting devctl when the peer freezes and stays silent"
@@ -102,7 +110,7 @@ echo "$O" | sed 's/^/  /'
 RC=$(field rc "$O"); TE=$(field t_end "$O"); S=$(field stop_at "$O")
 D=$(( ${TE:-0} - ${S:-0} ))
 [ "$RC" = EHOSTDOWN ] && le "$D" $((DEAD_MS + SLACK_MS))
-check "5 the waiting call returns EHOSTDOWN within the liveness limit" $? "rc=$RC, ${D} ms after the freeze, limit ${DEAD_MS} ms"
+check "5 the waiting call returns EHOSTDOWN within the liveness limit" $? "rc=$RC, ${D} ms after the freeze, bound ${DEAD_MS}+${SLACK_MS} ms"
 
 echo
 echo "== 6. A new open while the peer is still frozen"
@@ -118,8 +126,8 @@ echo
 echo "== 7. A new open after the peer is gone"
 O=$(q "cd /tmp/cn; slay -s KILL crossnode-agent; sleep 2; ./cnprobe open $P")
 echo "  $O"
-[ "$(field rc "$O")" = EHOSTDOWN ] && le "$(field ms "$O")" 1600
-check "7 the open fails with EHOSTDOWN within the connect limit" $? "$O"
+[ "$(field rc "$O")" = EHOSTDOWN ] && le "$(field ms "$O")" $SLACK_MS
+check "7 the open fails with EHOSTDOWN at once (the port is closed)" $? "$O"
 
 echo
 echo "== 8. Using and closing an fd whose peer died"
@@ -145,7 +153,7 @@ echo "== 10. A signal to a waiting caller"
 q "$AGENT"; sleep 1
 O=$(q "cd /tmp/cn; ./cnprobe eintr $P 300 1500 > e10.txt 2>&1 & W=\$!; sleep 1; slay -s STOP crossnode-agent; wait \$W; slay -s CONT crossnode-agent; cat e10.txt")
 echo "  $O"
-[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" 1000
+[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" $((300 + SLACK_MS))
 check "10 the call returns EINTR when the signal arrives, not when the peer answers" $? "$O"
 
 echo
@@ -167,6 +175,81 @@ echo "  qnxuser (group 1000): $A"; echo "  user1 (group 1001): $B"; echo "  /net
 check "12a a member of the allowed group may use the path" $? "$A"
 [ "$(field rc "$B")" = EACCES ]
 check "12b any other user is refused before anything is forwarded" $? "$B"
+
+echo
+echo "== 13. lseek is refused, not faked"
+O=$(q "cd /tmp/cn; ./cnprobe seek $P")
+echo "  $O"
+[ "$(field rc "$O")" = ESPIPE ]
+check "13 lseek on a /net fd answers ESPIPE instead of moving a local copy of the offset" $? "$O"
+
+echo
+echo "== 14. A signal during a waiting open"
+O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; slay -s STOP crossnode-agent; ./cnprobe eintr-open $P 300; slay -s CONT crossnode-agent")
+echo "  $O"
+[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" $((300 + SLACK_MS))
+check "14a the open returns EINTR when the signal arrives" $? "$O"
+O=$(q "cd /tmp/cn; for i in 1 2 3 4 5 6 7 8 9 10; do ./cnprobe get $P >/dev/null; slay -s STOP crossnode-agent; ./cnprobe eintr-open $P 100 | cut -d' ' -f2; slay -s CONT crossnode-agent; done | sort | uniq -c; ./cnprobe get $P; grep -c 'unbind after' net.log; true")
+echo "$O" | sed 's/^/  /'
+[ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ] && echo "$O" | grep -q '10 rc=EINTR' && [ "$(echo "$O" | tail -1)" = 0 ]
+check "14b ten more interrupted opens: all EINTR, no unbind error, the path still works" $? "$(echo "$O" | grep op=get)"
+
+echo
+echo "== 15. Transfers larger than one network packet"
+q 'dd if=/dev/urandom of=/tmp/cnx/big bs=1024 count=200 2>/dev/null; : > /tmp/cnx/w'
+O=$(q 'cksum < /tmp/cnx/big; cksum < /net/self/tmp/cnx/big; cat /tmp/cnx/big > /net/self/tmp/cnx/w; cksum < /tmp/cnx/w')
+echo "$O" | sed 's/^/  /'
+A1=$(echo "$O" | sed -n 1p); A2=$(echo "$O" | sed -n 2p); A3=$(echo "$O" | sed -n 3p)
+[ -n "$A1" ] && [ "$A1" = "$A2" ]
+check "15a a 200 KB read through /net matches the file" $? "$A2"
+[ -n "$A1" ] && [ "$A1" = "$A3" ]
+check "15b a 200 KB write through /net lands intact" $? "$A3"
+
+echo
+echo "== 16. A peer that is alive but slow: a read that waits for input"
+N0=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; pidin -P crossnode-agent | wc -l" | tr -d ' ')
+O=$(q "cd /tmp/cn; cat /net/self/dev/ser1 > /dev/null 2>&1 & C=\$!; sleep 10; kill -0 \$C && echo still_waiting=yes; ./cnprobe get $P; N1=\$(pidin -P crossnode-agent | wc -l); T0=\$(./cnprobe now); kill -INT \$C; wait \$C; T1=\$(./cnprobe now); echo threads_while_waiting=\$N1 interrupt_ms=\$((T1 - T0)); sleep 1; echo threads_after=\$(pidin -P crossnode-agent | wc -l)")
+echo "$O" | sed 's/^/  /'
+echo "  threads_before=$N0 (pidin lines, header included)"
+echo "$O" | grep -q still_waiting=yes
+check "16a the read stays blocked for 10 s while the peer is alive" $? "$(echo "$O" | grep -c still_waiting) of 1"
+[ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ]
+check "16b another caller is served meanwhile" $? "$(echo "$O" | grep op=get)"
+IM=$(field interrupt_ms "$O"); WT=$(field threads_while_waiting "$O" | tr -d ' '); AT=$(field threads_after "$O" | tr -d ' ')
+le "$IM" $SLACK_MS
+check "16c Ctrl-C on the waiting reader returns at once" $? "${IM} ms"
+[ -n "$WT" ] && [ "$WT" -gt "$N0" ] && [ "$AT" = "$N0" ]
+check "16d the agent's blocked worker ends when the caller gives up" $? "threads $N0 -> $WT -> $AT"
+O=$(q "cd /tmp/cn; for i in 1 2 3 4; do cat /net/self/dev/ser1 > /dev/null 2>&1 & sleep 1; slay -f -s KILL crossnode-net; (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &); sleep 1; done; ./cnprobe get $P; echo threads_after_cycles=\$(pidin -P crossnode-agent | wc -l)")
+echo "$O" | sed 's/^/  /'
+[ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ] && [ "$(field threads_after_cycles "$O" | tr -d ' ')" = "$N0" ]
+check "16e four client restarts during blocked reads leave no stuck worker or connection" $? "$(echo "$O" | tail -1 | tr -d ' ')"
+
+echo
+echo "== 17. Connection caps"
+O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; ./cnprobe conns 127.0.0.1 7777 6; grep -c 'too many from that address' agent.log; true")
+echo "$O" | sed 's/^/  /'
+[ "$(field kept "$O")" = 3 ]
+check "17 one address holds at most 4 connections (crossnode-net has one, 3 of 6 more kept)" $? "$(echo "$O" | head -1)"
+
+echo
+echo "== 18. Replies that break the protocol are refused"
+python3 "$ROOT/test/fake-agent.py" 7799 > "$ROOT/evidence/.fake-agent.log" 2>&1 &
+FAKE=$!
+sleep 1
+q 'cd /tmp/cn && (./crossnode-net -v -n evil -c 10.0.2.2:7799 > evil.log 2>&1 &)'
+sleep 1
+O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x")
+kill $FAKE 2>/dev/null
+echo "$O" | sed 's/^/  /'
+echo "  fake agent:"; sed 's/^/    /' "$ROOT/evidence/.fake-agent.log"; rm -f "$ROOT/evidence/.fake-agent.log"
+EV=$(q 'cat /tmp/cn/evil.log; slay -f -s KILL crossnode-net >/dev/null 2>&1; true')
+echo "$EV" | sed 's/^/  evil.log: /'
+R1=$(echo "$O" | grep op=readn); R2=$(echo "$O" | grep op=get)
+[ "$(field rc "$R1")" = EHOSTDOWN ] && [ "$(echo "$EV" | grep -c 'did not match')" -ge 2 ]
+check "18a an oversized read reply never reaches the program" $? "$R1"
+[ "$(field rc "$R2")" = EHOSTDOWN ]
+check "18b a reply with the wrong operation is refused" $? "$R2"
 
 echo
 echo "== crossnode-net log"

@@ -14,7 +14,8 @@
  * checked against what was asked before any client sees them.
  *
  * Gate 1 limits, stated plainly: stat() answers from a placeholder, directory listing is not
- * forwarded yet, pread/pwrite are not supported, there is one peer per process and no authentication.
+ * forwarded yet, lseek, pread and pwrite answer ESPIPE or ENOSYS, there is one peer per process and
+ * no authentication.
  */
 struct cn_ocb;
 #define IOFUNC_OCB_T struct cn_ocb
@@ -364,13 +365,26 @@ static void *io_thread(void *arg)
             fds[1].revents = 0;
             nfds = 2;
         }
+        /* Sleep exactly until the next deadline, so the limits hold to the millisecond. */
+        int64_t wait = 1000;
+        if (G.state == C_CONNECTING)
+            wait = (int64_t)G.connect_deadline - (int64_t)t;
+        if (G.state == C_UP) {
+            int64_t dead = (int64_t)(G.last_rx + CN_DEAD_MS) - (int64_t)t;
+            int64_t ping = (int64_t)(G.last_ping + CN_PING_MS) - (int64_t)t;
+            wait = dead < ping ? dead : ping;
+        }
+        if (wait < 0)
+            wait = 0;
+        if (wait > 1000)
+            wait = 1000;
         int ring = G.ring;
         G.ring = 0;
         pthread_mutex_unlock(&G.mtx);
 
         if (ring)
             MsgSendPulse(G.self_coid, -1, G.pulse_code, 0);
-        (void)poll(fds, (nfds_t)nfds, 100);
+        (void)poll(fds, (nfds_t)nfds, (int)wait);
 
         pthread_mutex_lock(&G.mtx);
         if (fds[0].revents & POLLIN) {
@@ -470,7 +484,8 @@ static void drop_opening_ocb(resmgr_context_t *ctp, const struct _msg_info *info
 {
     struct _msg_info keep = ctp->info;
     ctp->info = *info;
-    (void)resmgr_unbind(ctp);
+    if (resmgr_unbind(ctp) != 0)
+        vlog("unbind after a failed open: %s\n", strerror(errno));
     iofunc_attr_lock(&file_attr);
     (void)iofunc_ocb_detach(ctp, &ocb->hdr);
     iofunc_attr_unlock(&file_attr);
@@ -578,12 +593,31 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
         info = e->info;
         if (e->done && op == CN_OP_OPEN && e->err == EOK)
             queue_close_locked(e->val);
+        if (!e->done && G.state == C_UP) {
+            /* Tell the peer to stop the work too, so a device call that never returns is let go. */
+            struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_CANCEL, .seq = ++G.seq, .handle = -1,
+                                .a = (int32_t)e->seq };
+            (void)out_append(&h, NULL, 0);
+        }
+        /* Free the slot now. A late answer then matches nothing, and a late successful open is
+         * closed on the peer (handle_frame_locked), so nothing leaks either way. */
+        e->done = 1;
+        G.ring = 1;
     }
     pthread_mutex_unlock(&G.mtx);
     if (e == NULL)
         return;
-    if (op == CN_OP_OPEN && ocb != NULL)
-        drop_opening_ocb(ctp, &info, ocb);
+    if (op == CN_OP_OPEN && ocb != NULL) {
+        /* The library holds the binding while an unblock is handled and closes the OCB itself when
+         * it lets go (seen in a crash dump: _resmgr_put_binding -> iofunc_close_ocb). So only the
+         * client mapping is removed here; freeing the OCB as well would free it twice. */
+        ocb->state = OCB_LOCAL;
+        struct _msg_info keep = ctp->info;
+        ctp->info = info;
+        if (resmgr_unbind(ctp) != 0)
+            vlog("unbind after an interrupted open: %s\n", strerror(errno));
+        ctp->info = keep;
+    }
     MsgError(rcvid, EINTR);
     wake_io();
 }
@@ -733,6 +767,15 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
     return st;
 }
 
+/* Offsets live on the peer and are not forwarded yet: say so instead of moving a local copy. */
+static int cn_lseek(resmgr_context_t *ctp, io_lseek_t *msg, struct cn_ocb *ocb)
+{
+    (void)ctp;
+    (void)msg;
+    (void)ocb;
+    return ESPIPE;
+}
+
 static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *ocb)
 {
     pthread_mutex_lock(&G.mtx);
@@ -828,6 +871,7 @@ int main(int argc, char **argv)
     iof.write = cn_write;
     iof.devctl = cn_devctl;
     iof.close_ocb = cn_close_ocb;
+    iof.lseek = cn_lseek;
     iof.unblock = io_unblock;
     /* One dispatch thread, so no attribute locking; this also keeps the library away from an OCB
      * that an unblock handler has just freed. Metadata changes are not forwarded yet. */

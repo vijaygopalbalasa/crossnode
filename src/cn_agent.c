@@ -5,6 +5,13 @@
  * worker thread of its own. A request that blocks on a slow device therefore never delays the
  * liveness replies a peer uses to tell "slow" from "dead".
  *
+ * A worker's device call is interrupted with a signal (EINTR) when the peer cancels the request
+ * (its caller got a signal), when the peer closes the handle, and when the connection ends, so a
+ * read that would never return cannot pin a job, a connection or a peer slot. The signal is sent
+ * again until the worker is done, which closes the window where it lands just before the call.
+ * (pthread_cancel is not used: on QNX 8.0 a cancelled thread is ended again at the first
+ * cancellation point inside its cleanup handler, so the handler cannot release anything.)
+ *
  * Every open is resolved with realpath() and must land inside an export; then the descriptor itself
  * is asked where it points (iofdinfo), so swapping a path component between the check and the open
  * gains nothing. Names outside the share all answer EACCES, so a peer cannot probe what exists there.
@@ -49,21 +56,34 @@ static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards the sl
 static struct in_addr slot_addr[MAX_CONNS];
 static int slot_used[MAX_CONNS];
 
+struct jobslot {
+    int used;
+    uint32_t seq;
+    int32_t handle;
+    int cancel;               /* cancellation asked for */
+    int tid_ok;
+    pthread_t tid;
+};
+
 struct conn {
     int sock;
-    pthread_mutex_t mtx;          /* guards dead, refs, fds[] and every write to sock */
+    pthread_mutex_t mtx;      /* guards everything below and every write to sock */
     int dead;
     int refs;
     int jobs;
     int slot;                 /* index in the slot table */
     int fds[CN_MAX_HANDLES];
+    struct jobslot js[MAX_JOBS];
     char peer[64];
 };
 
 struct job {
     struct conn *c;
+    int js;                   /* index in c->js */
     struct cn_hdr h;
     unsigned char *payload;
+    unsigned char *buf;
+    int fd;                   /* this job's private dup, -1 if none */
 };
 
 static void vlog(const char *fmt, ...)
@@ -76,12 +96,29 @@ static void vlog(const char *fmt, ...)
     va_end(ap);
 }
 
+#define CN_INTERRUPT SIGUSR2   /* interrupts a worker's blocked device call; the handler does nothing */
+
+static void on_interrupt(int sig)
+{
+    (void)sig;
+}
+
+/* Has the peer given up on this job? Checked right before each device call. */
+static int job_cancelled(const struct job *j)
+{
+    pthread_mutex_lock(&j->c->mtx);
+    int x = j->c->js[j->js].cancel;
+    pthread_mutex_unlock(&j->c->mtx);
+    return x;
+}
+
 static void conn_put(struct conn *c)
 {
     pthread_mutex_lock(&c->mtx);
     int last = (--c->refs == 0);
     pthread_mutex_unlock(&c->mtx);
     if (last) {
+        vlog("connection %s released\n", c->peer);
         close(c->sock);
         pthread_mutex_lock(&conns_mtx);
         slot_used[c->slot] = 0;
@@ -89,6 +126,33 @@ static void conn_put(struct conn *c)
         pthread_mutex_destroy(&c->mtx);
         free(c);
     }
+}
+
+/* With c->mtx held: ask one job to stop. A job not yet started stops before its device call. */
+static void cancel_job_locked(struct conn *c, int i)
+{
+    struct jobslot *s = &c->js[i];
+    if (!s->used || s->cancel)
+        return;
+    s->cancel = 1;
+    if (s->tid_ok)
+        pthread_kill(s->tid, CN_INTERRUPT);
+    vlog("cancelled request %u\n", s->seq);
+}
+
+/* With c->mtx held: signal every cancelled job that is still running, in case it was about to
+ * enter its device call when the first signal arrived. Returns how many are still running. */
+static int resignal_locked(struct conn *c)
+{
+    int running = 0;
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (c->js[i].used && c->js[i].cancel) {
+            running++;
+            if (c->js[i].tid_ok)
+                pthread_kill(c->js[i].tid, CN_INTERRUPT);
+        }
+    }
+    return running;
 }
 
 static int read_full(int fd, void *buf, size_t n)
@@ -169,7 +233,7 @@ static int path_allowed(const char *p, char **list)
     return 0;
 }
 
-/* A private duplicate of the handle's descriptor; the caller closes it when done. */
+/* A private duplicate of the handle's descriptor; the job closes it when done. */
 static int get_fd(struct conn *c, int32_t h)
 {
     int fd = -1;
@@ -180,15 +244,17 @@ static int get_fd(struct conn *c, int32_t h)
     return fd;
 }
 
-static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char *payload)
+static void do_open(struct job *j)
 {
+    struct conn *c = j->c;
+    const struct cn_hdr *h = &j->h;
     char path[CN_MAX_PATH + 2];
     if (h->len == 0 || h->len > CN_MAX_PATH) {
         send_reply(c, h, ENAMETOOLONG, -1, NULL, 0);
         return;
     }
     path[0] = '/';
-    memcpy(path + 1, payload, h->len);
+    memcpy(path + 1, j->payload, h->len);
     path[h->len + 1] = '\0';
     if (strlen(path + 1) != h->len || !path_allowed(path + 1, exports)) {
         vlog("refused %s\n", path);
@@ -221,16 +287,23 @@ static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char 
     }
     /* Only access mode, non-blocking and append travel; nothing is ever created or truncated. */
     int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY | O_NOFOLLOW;
+    if (job_cancelled(j)) {
+        send_reply(c, h, EINTR, -1, NULL, 0);
+        return;
+    }
     int fd = open(real, oflag);
     if (fd < 0) {
-        send_reply(c, h, errno == ENOENT ? ENOENT : errno, -1, NULL, 0);
+        send_reply(c, h, errno, -1, NULL, 0);
         return;
     }
     /* Ask the descriptor what it actually opened; a component swapped after realpath() fails here. */
     char got[PATH_MAX];
     struct _fdinfo fi;
-    if (iofdinfo(fd, 0, &fi, got, (int)sizeof got) < 0 || got[0] != '/' || !path_allowed(got + 1, rexports)) {
-        vlog("refused %s (the descriptor points at %s)\n", real, got);
+    got[0] = '\0';
+    int gl = iofdinfo(fd, 0, &fi, got, (int)sizeof got);
+    got[sizeof got - 1] = '\0';
+    if (gl < 0 || got[0] != '/' || !path_allowed(got + 1, rexports)) {
+        vlog("refused %s (the descriptor %s)\n", real, gl < 0 ? "could not be checked" : "points elsewhere");
         close(fd);
         send_reply(c, h, EACCES, -1, NULL, 0);
         return;
@@ -256,108 +329,169 @@ static void do_open(struct conn *c, const struct cn_hdr *h, const unsigned char 
     send_reply(c, h, 0, slot, NULL, 0);
 }
 
-static void do_read(struct conn *c, const struct cn_hdr *h)
+static void do_read(struct job *j)
 {
-    int fd = get_fd(c, h->handle);
-    if (fd < 0) {
-        send_reply(c, h, EBADF, 0, NULL, 0);
-        return;
-    }
+    const struct cn_hdr *h = &j->h;
     if (h->a < 0 || (uint32_t)h->a > CN_MAX_DATA) {
-        close(fd);
-        send_reply(c, h, EINVAL, 0, NULL, 0);
+        send_reply(j->c, h, EINVAL, 0, NULL, 0);
         return;
     }
-    unsigned char *buf = malloc((size_t)h->a + 1);
-    if (buf == NULL) {
-        close(fd);
-        send_reply(c, h, ENOMEM, 0, NULL, 0);
+    if ((j->fd = get_fd(j->c, h->handle)) < 0) {
+        send_reply(j->c, h, EBADF, 0, NULL, 0);
         return;
     }
-    ssize_t r = read(fd, buf, (size_t)h->a);
-    int e = errno;
-    close(fd);
+    if ((j->buf = malloc((size_t)h->a + 1)) == NULL) {
+        send_reply(j->c, h, ENOMEM, 0, NULL, 0);
+        return;
+    }
+    ssize_t r = job_cancelled(j) ? (errno = EINTR, -1) : read(j->fd, j->buf, (size_t)h->a);
     if (r < 0)
-        send_reply(c, h, e, 0, NULL, 0);
+        send_reply(j->c, h, errno, 0, NULL, 0);
     else
-        send_reply(c, h, 0, (int32_t)r, buf, (uint32_t)r);
-    free(buf);
+        send_reply(j->c, h, 0, (int32_t)r, j->buf, (uint32_t)r);
 }
 
-static void do_write(struct conn *c, const struct cn_hdr *h, const unsigned char *payload)
+static void do_write(struct job *j)
 {
-    int fd = get_fd(c, h->handle);
-    if (fd < 0) {
-        send_reply(c, h, EBADF, 0, NULL, 0);
+    const struct cn_hdr *h = &j->h;
+    if ((j->fd = get_fd(j->c, h->handle)) < 0) {
+        send_reply(j->c, h, EBADF, 0, NULL, 0);
         return;
     }
-    ssize_t w = write(fd, payload, h->len);
-    int e = errno;
-    close(fd);
+    ssize_t w = job_cancelled(j) ? (errno = EINTR, -1) : write(j->fd, j->payload, h->len);
     if (w < 0)
-        send_reply(c, h, e, 0, NULL, 0);
+        send_reply(j->c, h, errno, 0, NULL, 0);
     else
-        send_reply(c, h, 0, (int32_t)w, NULL, 0);
+        send_reply(j->c, h, 0, (int32_t)w, NULL, 0);
 }
 
 /* Generic devctl: only the command's direction bits and the caller's byte count matter. */
-static void do_devctl(struct conn *c, const struct cn_hdr *h, const unsigned char *payload)
+static void do_devctl(struct job *j)
 {
-    int fd = get_fd(c, h->handle);
-    if (fd < 0) {
-        send_reply(c, h, EBADF, 0, NULL, 0);
+    const struct cn_hdr *h = &j->h;
+    if (h->b < 0 || (uint32_t)h->b > CN_MAX_DATA || h->len > (uint32_t)h->b) {
+        send_reply(j->c, h, EINVAL, 0, NULL, 0);
         return;
     }
-    if (h->b < 0 || (uint32_t)h->b > CN_MAX_DATA || h->len > (uint32_t)h->b) {
-        close(fd);
-        send_reply(c, h, EINVAL, 0, NULL, 0);
+    if ((j->fd = get_fd(j->c, h->handle)) < 0) {
+        send_reply(j->c, h, EBADF, 0, NULL, 0);
         return;
     }
     size_t n = (size_t)h->b;
-    unsigned char *buf = calloc(1, n + 1);
-    if (buf == NULL) {
-        close(fd);
-        send_reply(c, h, ENOMEM, 0, NULL, 0);
+    if ((j->buf = calloc(1, n + 1)) == NULL) {
+        send_reply(j->c, h, ENOMEM, 0, NULL, 0);
         return;
     }
     if (h->len)
-        memcpy(buf, payload, h->len);
+        memcpy(j->buf, j->payload, h->len);
     int info = 0;
-    int err = devctl(fd, h->a, n ? buf : NULL, n, &info);
-    close(fd);
+    int err = job_cancelled(j) ? EINTR : devctl(j->fd, h->a, n ? j->buf : NULL, n, &info);
     unsigned dir = get_device_direction(h->a);
     uint32_t out = (err == EOK && (dir & DEVDIR_FROM)) ? (uint32_t)n : 0;
-    send_reply(c, h, err, info, buf, out);
-    free(buf);
+    send_reply(j->c, h, err, info, j->buf, out);
 }
 
+/* Close a handle; any job still working on it is cancelled, since nobody can want its answer. */
 static void do_close(struct conn *c, int32_t h)
 {
     pthread_mutex_lock(&c->mtx);
     if (h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0) {
         close(c->fds[h]);
         c->fds[h] = -1;
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (c->js[i].used && c->js[i].handle == h)
+                cancel_job_locked(c, i);
+        }
     }
     pthread_mutex_unlock(&c->mtx);
+}
+
+static void do_cancel(struct conn *c, uint32_t seq)
+{
+    pthread_mutex_lock(&c->mtx);
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (c->js[i].used && c->js[i].seq == seq)
+            cancel_job_locked(c, i);
+    }
+    pthread_mutex_unlock(&c->mtx);
+}
+
+/* Runs when a job ends: give back everything it held. */
+static void job_end(struct job *j)
+{
+    struct conn *c = j->c;
+    if (j->fd >= 0)
+        close(j->fd);
+    free(j->buf);
+    free(j->payload);
+    pthread_mutex_lock(&c->mtx);
+    c->js[j->js].used = 0;
+    c->js[j->js].tid_ok = 0;
+    c->jobs--;
+    vlog("request %u ended (%d still running on %s)\n", j->h.seq, c->jobs, c->peer);
+    pthread_mutex_unlock(&c->mtx);
+    conn_put(c);
+    free(j);
 }
 
 static void *worker(void *arg)
 {
     struct job *j = arg;
+    pthread_mutex_lock(&j->c->mtx);
+    j->c->js[j->js].tid = pthread_self();
+    j->c->js[j->js].tid_ok = 1;
+    pthread_mutex_unlock(&j->c->mtx);
     switch (j->h.op) {
-    case CN_OP_OPEN:   do_open(j->c, &j->h, j->payload);   break;
-    case CN_OP_READ:   do_read(j->c, &j->h);               break;
-    case CN_OP_WRITE:  do_write(j->c, &j->h, j->payload);  break;
-    case CN_OP_DEVCTL: do_devctl(j->c, &j->h, j->payload); break;
+    case CN_OP_OPEN:   do_open(j);   break;
+    case CN_OP_READ:   do_read(j);   break;
+    case CN_OP_WRITE:  do_write(j);  break;
+    case CN_OP_DEVCTL: do_devctl(j); break;
     default:           send_reply(j->c, &j->h, ENOSYS, 0, NULL, 0); break;
     }
-    pthread_mutex_lock(&j->c->mtx);
-    j->c->jobs--;
-    pthread_mutex_unlock(&j->c->mtx);
-    conn_put(j->c);
-    free(j->payload);
-    free(j);
+    job_end(j);
     return NULL;
+}
+
+static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
+{
+    int js = -1;
+    pthread_mutex_lock(&c->mtx);
+    if (c->jobs < MAX_JOBS) {
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (!c->js[i].used) {
+                js = i;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&c->mtx);
+    struct job *j = js >= 0 ? calloc(1, sizeof *j) : NULL;
+    if (j == NULL) {
+        send_reply(c, h, js < 0 ? EAGAIN : ENOMEM, 0, NULL, 0);
+        free(p);
+        return;
+    }
+    j->c = c;
+    j->js = js;
+    j->h = *h;
+    j->payload = p;
+    j->fd = -1;
+    pthread_mutex_lock(&c->mtx);
+    c->js[js] = (struct jobslot){ .used = 1, .seq = h->seq, .handle = h->handle };
+    c->jobs++;
+    c->refs++;
+    pthread_mutex_unlock(&c->mtx);
+
+    pthread_attr_t at;
+    pthread_t t;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&t, &at, worker, j);
+    pthread_attr_destroy(&at);
+    if (rc != 0) {
+        send_reply(c, h, EAGAIN, 0, NULL, 0);
+        job_end(j);
+    }
 }
 
 static void *reader(void *arg)
@@ -379,49 +513,46 @@ static void *reader(void *arg)
                 break;
             }
         }
-        if (h.op == CN_OP_PING) {
+        switch (h.op) {
+        case CN_OP_PING:
             send_reply(c, &h, 0, 0, NULL, 0);
             free(p);
-            continue;
-        }
-        if (h.op == CN_OP_CLOSE) {
+            break;
+        case CN_OP_CLOSE:
             do_close(c, h.handle);
             free(p);
-            continue;
+            break;
+        case CN_OP_CANCEL:
+            do_cancel(c, (uint32_t)h.a);
+            free(p);
+            break;
+        default:
+            start_job(c, &h, p);
+            break;
         }
         pthread_mutex_lock(&c->mtx);
-        int busy = c->jobs >= MAX_JOBS;
+        (void)resignal_locked(c);
         pthread_mutex_unlock(&c->mtx);
-        struct job *j = busy ? NULL : malloc(sizeof *j);
-        if (j == NULL) {
-            send_reply(c, &h, busy ? EAGAIN : ENOMEM, 0, NULL, 0);
-            free(p);
-            continue;
-        }
-        j->c = c;
-        j->h = h;
-        j->payload = p;
-        pthread_mutex_lock(&c->mtx);
-        c->refs++;
-        c->jobs++;
-        pthread_mutex_unlock(&c->mtx);
-        pthread_attr_t at;
-        pthread_t t;
-        pthread_attr_init(&at);
-        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&t, &at, worker, j) != 0) {
-            send_reply(c, &h, EAGAIN, 0, NULL, 0);
-            free(p);
-            free(j);
-            pthread_mutex_lock(&c->mtx);
-            c->jobs--;
-            pthread_mutex_unlock(&c->mtx);
-            conn_put(c);
-        }
-        pthread_attr_destroy(&at);
     }
+    /* The connection is over: stop every job, signalling again until each one has ended. */
     pthread_mutex_lock(&c->mtx);
     c->dead = 1;
+    for (int i = 0; i < MAX_JOBS; i++)
+        cancel_job_locked(c, i);
+    pthread_mutex_unlock(&c->mtx);
+    int left = 0;
+    for (int tries = 0; tries < 40; tries++) {
+        pthread_mutex_lock(&c->mtx);
+        left = resignal_locked(c);
+        pthread_mutex_unlock(&c->mtx);
+        if (left == 0)
+            break;
+        usleep(50 * 1000);
+    }
+    if (left > 0)
+        fprintf(stderr, "crossnode-agent: %d request(s) from %s did not stop; their device calls ignore signals\n",
+                left, c->peer);
+    pthread_mutex_lock(&c->mtx);
     for (int i = 0; i < CN_MAX_HANDLES; i++) {
         if (c->fds[i] >= 0) {
             close(c->fds[i]);
@@ -483,6 +614,10 @@ int main(int argc, char **argv)
         rexports[i] = strdup(realpath(given, real) != NULL ? real + 1 : exports[i]);
     }
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction si;
+    memset(&si, 0, sizeof si);
+    si.sa_handler = on_interrupt;           /* no SA_RESTART: the device call returns EINTR */
+    sigaction(CN_INTERRUPT, &si, NULL);
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);

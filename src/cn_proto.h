@@ -21,6 +21,7 @@ enum cn_op {
     CN_OP_WRITE  = 4,   /* handle; payload: the bytes */
     CN_OP_DEVCTL = 5,   /* handle; a: dcmd; b: byte count; payload: input bytes */
     CN_OP_CLOSE  = 6,   /* handle; never answered */
+    CN_OP_CANCEL = 7,   /* a: the seq of a request whose caller gave up; never answered */
 };
 
 #define CN_REPLY        0x8000u         /* set in op on every reply */

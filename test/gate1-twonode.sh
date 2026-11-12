@@ -18,7 +18,7 @@ exec > >(tee "$OUT") 2>&1
 
 DEAD_MS=2000      # crossnode-net liveness limit (CN_DEAD_MS)
 CONNECT_MS=1500   # crossnode-net connect limit (CN_CONNECT_MS)
-SLACK_MS=1000     # allowance for emulated guests
+SLACK_MS=200      # stated allowance on top of a limit: process start and scheduling on emulated guests
 QPID=$IMG/nodey/output/qemu.pid
 
 qx() { ssh -i "$KEY" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes root@127.0.0.1 "$@"; }
@@ -26,6 +26,11 @@ qy() { ssh -i "$KEY" -p 2223 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/
 host_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
 field() { echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
+stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
+if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
+   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
+    echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
+fi
 PASS=0
 FAIL=0
 check() {
@@ -39,7 +44,8 @@ push() {   # push SSH_FUNCTION
     done
 }
 start_nodey() {
-    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
+    qy 'rm -rf /tmp/cnx && mkdir /tmp/cnx && : > /tmp/cnx/w && dd if=/dev/urandom of=/tmp/cnx/big bs=1024 count=200 2>/dev/null'
+    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
 }
 wait_lines() {  # wait_lines FILE PATTERN SECONDS: until FILE on nodex has a line matching PATTERN
     local i
@@ -80,6 +86,31 @@ check "2 stty -a through /net/nodey matches stty -a run on nodey" $? "$(wc -l < 
 rm -f /tmp/cn-stty-x.txt /tmp/cn-stty-y.txt
 
 echo
+echo "== 2b. 200 KB each way across the link"
+qx 'dd if=/dev/urandom of=/tmp/cn/big2 bs=1024 count=200 2>/dev/null'
+R1=$(qx 'cksum < /net/nodey/tmp/cnx/big'); L1=$(qy 'cksum < /tmp/cnx/big')
+qx 'cat /tmp/cn/big2 > /net/nodey/tmp/cnx/w'
+L2=$(qx 'cksum < /tmp/cn/big2'); R2=$(qy 'cksum < /tmp/cnx/w')
+echo "  read:  nodey file $L1, through /net on nodex $R1"
+echo "  write: nodex file $L2, landed on nodey $R2"
+[ -n "$L1" ] && [ "$L1" = "$R1" ]
+check "2b-read a 200 KB read across the link is byte-exact" $? "$R1"
+[ -n "$L2" ] && [ "$L2" = "$R2" ]
+check "2b-write a 200 KB write across the link is byte-exact" $? "$R2"
+
+echo
+echo "== 2c. nodey is alive but its serial port has no input"
+N0=$(qy 'pidin -P crossnode-agent | wc -l' | tr -d ' ')
+O=$(qx "cd /tmp/cn; cat /net/nodey/dev/ser1 > /dev/null 2>&1 & C=\$!; sleep 10; kill -0 \$C && echo still_waiting=yes; ./cnprobe get $P; T0=\$(./cnprobe now); kill -INT \$C; wait \$C; T1=\$(./cnprobe now); echo interrupt_ms=\$((T1 - T0))")
+sleep 1
+N1=$(qy 'pidin -P crossnode-agent | wc -l' | tr -d ' ')
+echo "$O" | sed 's/^/  /'; echo "  nodey agent threads (pidin lines): before $N0, after $N1"
+echo "$O" | grep -q still_waiting=yes && [ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ]
+check "2c-1 the read waits 10 s on a live peer while another caller is served" $? "$(echo "$O" | grep op=get)"
+le "$(field interrupt_ms "$O")" $SLACK_MS && [ "$N1" = "$N0" ]
+check "2c-2 Ctrl-C returns at once and nodey's worker ends" $? "$(field interrupt_ms "$O") ms, threads $N0 -> $N1"
+
+echo
 echo "== 3. nodey freezes: a signal reaches a waiting caller on nodex"
 qx "cd /tmp/cn; ./cnprobe get $P >/dev/null; (./cnprobe eintr $P 300 1500 > e3.txt 2>&1 &)"
 sleep 1
@@ -88,8 +119,15 @@ wait_lines /tmp/cn/e3.txt op= 10
 kill -CONT "$(cat "$QPID")"
 O=$(qx 'cat /tmp/cn/e3.txt')
 echo "  $O"
-[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" 1000
+[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" $((300 + SLACK_MS))
 check "3 the call returns EINTR when the signal arrives" $? "$O"
+qx "cd /tmp/cn; ./cnprobe get $P >/dev/null"
+kill -STOP "$(cat "$QPID")"
+O=$(qx "cd /tmp/cn; ./cnprobe eintr-open $P 300")
+kill -CONT "$(cat "$QPID")"
+echo "  $O"
+[ "$(field rc "$O")" = EINTR ] && le "$(field ms "$O")" $((300 + SLACK_MS))
+check "3b an open waiting on the frozen node returns EINTR when the signal arrives" $? "$O"
 
 echo
 echo "== 4. nodey freezes: a waiting call on nodex fails within the liveness limit"
@@ -102,7 +140,7 @@ T1=$(host_ms); kill -CONT "$(cat "$QPID")"
 O=$(qx 'tail -1 /tmp/cn/w4.txt')
 echo "  $O  (host saw it $((T1 - T0)) ms after the freeze, polling included)"
 [ "$(field rc "$O")" = EHOSTDOWN ] && le "$(field call_ms "$O")" $((DEAD_MS + SLACK_MS))
-check "4 EHOSTDOWN within the liveness limit" $? "call_ms=$(field call_ms "$O"), limit ${DEAD_MS} ms"
+check "4 EHOSTDOWN within the liveness limit" $? "call_ms=$(field call_ms "$O"), bound ${DEAD_MS}+${SLACK_MS} ms"
 
 echo
 echo "== 5. nodey loses power while nodex has three callers on it"

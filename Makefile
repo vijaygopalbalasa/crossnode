@@ -23,7 +23,7 @@ $(OUT)/hellodev: tools/hellodev.c tools/hello_dcmd.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/hellodev.c
 
 $(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h | $(OUT)
-	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c
+	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c -lsocket
 
 clean:
 	rm -rf build

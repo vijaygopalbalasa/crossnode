@@ -8,6 +8,10 @@
  *   cnprobe stale PATH WAIT_MS             open, GET, wait, GET again, then time close
  *   cnprobe eintr PATH ALARM_MS [WAIT_MS]  open, wait, then GET with a signal arriving after ALARM_MS
  *   cnprobe exit PATH [WAIT_MS]            a child opens PATH, waits, exits without closing; time the exit
+ *   cnprobe eintr-open PATH ALARM_MS        open with a signal arriving after ALARM_MS
+ *   cnprobe seek PATH                       lseek on an open fd
+ *   cnprobe readn PATH N                    one read of N bytes; prints the count returned
+ *   cnprobe conns ADDRESS PORT N            open N TCP connections, report how many stay open
  *   cnprobe now                            print this machine's monotonic clock in ms
  */
 #include <errno.h>
@@ -20,6 +24,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "hello_dcmd.h"
 
@@ -48,6 +55,7 @@ static const char *ename(int e)
     case ECONNREFUSED: return "ECONNREFUSED";
     case EAGAIN:       return "EAGAIN";
     case ENXIO:        return "ENXIO";
+    case ESPIPE:       return "ESPIPE";
     default:           return "EOTHER";
     }
 }
@@ -185,6 +193,77 @@ int main(int argc, char **argv)
         int rc = do_get(fd, &v, &info);
         printf("op=get-with-signal rc=%s ms=%.0f\n", ename(rc), now_ms() - t0);
         close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "eintr-open") == 0) {
+        if (argc < 4)
+            return usage();
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_alarm;
+        sigaction(SIGALRM, &sa, NULL);
+        long ms = atol(argv[3]);
+        struct itimerval it = { { 0, 0 }, { ms / 1000, (ms % 1000) * 1000 } };
+        double t0 = now_ms();
+        setitimer(ITIMER_REAL, &it, NULL);
+        int fd = open(path, O_RDONLY);
+        int e = fd < 0 ? errno : EOK;
+        printf("op=open-with-signal rc=%s ms=%.0f\n", ename(e), now_ms() - t0);
+        if (fd >= 0)
+            close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "seek") == 0) {
+        int fd = open_or_report(path, O_RDONLY);
+        if (fd < 0)
+            return 0;
+        off_t r = lseek(fd, 0, SEEK_SET);
+        printf("op=seek rc=%s\n", r == (off_t)-1 ? ename(errno) : "EOK");
+        close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "readn") == 0) {
+        if (argc < 4)
+            return usage();
+        size_t n = (size_t)atol(argv[3]);
+        char *buf = malloc(n + 1);
+        int fd = buf ? open_or_report(path, O_RDONLY) : -1;
+        if (fd < 0)
+            return 0;
+        ssize_t r = read(fd, buf, n);
+        printf("op=readn asked=%zu rc=%s got=%zd\n", n, r < 0 ? ename(errno) : "EOK", r);
+        close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "conns") == 0) {
+        if (argc < 5)
+            return usage();
+        int n = atoi(argv[4]), open_ok = 0, fds[64];
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)atoi(argv[3]));
+        inet_pton(AF_INET, path, &sa.sin_addr);
+        if (n > 64)
+            n = 64;
+        for (int i = 0; i < n; i++) {
+            fds[i] = socket(AF_INET, SOCK_STREAM, 0);
+            if (fds[i] >= 0 && connect(fds[i], (struct sockaddr *)&sa, sizeof sa) != 0) {
+                close(fds[i]);
+                fds[i] = -1;
+            }
+        }
+        pause_ms(500);
+        for (int i = 0; i < n; i++) {
+            char b;
+            if (fds[i] < 0)
+                continue;
+            ssize_t r = recv(fds[i], &b, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                open_ok++;              /* still open: the agent kept it */
+            close(fds[i]);
+        }
+        printf("op=conns tried=%d kept=%d\n", n, open_ok);
         return 0;
     }
     if (strcmp(cmd, "exit") == 0) {
