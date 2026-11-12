@@ -9,8 +9,9 @@
  * (its caller got a signal), when the peer closes the handle, and when the connection ends, so a
  * read that would never return cannot pin a job, a connection or a peer slot. The signal is sent
  * again until the worker is done, which closes the window where it lands just before the call.
- * (pthread_cancel is not used: on QNX 8.0 a cancelled thread is ended again at the first
- * cancellation point inside its cleanup handler, so the handler cannot release anything.)
+ * (pthread_cancel is not used: in our tests on QNX 8.0, x86_64 under QEMU, a thread cancelled while
+ * blocked in read() ended at the first cancellation point inside its cleanup handler, even after the
+ * handler disabled cancellation, so the handler could not release anything.)
  *
  * Every open is resolved with realpath() and must land inside an export; then the descriptor itself
  * is asked where it points (iofdinfo), so swapping a path component between the check and the open

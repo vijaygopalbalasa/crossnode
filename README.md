@@ -103,8 +103,8 @@ besides root; `-m DIR` changes `/net`.
 - `crossnode-agent` answers liveness probes on the connection's reader thread and runs every other request on a
   worker thread, so a slow device never looks like a dead machine. A worker's device call is interrupted with a
   signal when its caller gives up, its handle is closed or the connection ends.
-- Each open is resolved with `realpath()` and must land inside a share; then the agent asks the opened descriptor
-  where it really points (`iofdinfo`) and checks that too.
+- Each open is resolved with `realpath()` and must land inside a share. As a second check, the agent asks the opened
+  descriptor where it really points (`iofdinfo`); no test yet wins the race that this second check is there for.
 
 Wire format: `src/cn_proto.h` (a 28-byte header and a payload; both ends little-endian).
 
