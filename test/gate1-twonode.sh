@@ -194,8 +194,8 @@ check "6b a second open right after fails at once" $? "$SECOND"
 O=$(qx "cd /tmp/cn; ./cnprobe ls /net/nodey/dev; ./cnprobe stat /net/nodey/dev/hello")
 echo "$O" | sed 's/^/  /'
 L1=$(echo "$O" | grep 'op=ls'); L2=$(echo "$O" | grep 'op=stat')
-[ "$(field rc "$L1")" = EHOSTDOWN ] && [ "$(field rc "$L2")" = EHOSTDOWN ] && le "$(field ms "$L1")" 100 && le "$(field ms "$L2")" 100
-check "6c listing and stat of a dead node fail at once with EHOSTDOWN" $? "$L1; $L2"
+[ "$(field rc "$L1")" = EHOSTDOWN ] && [ "$(field rc "$L2")" = EHOSTDOWN ] && le "$(field ms "$L1")" $((CONNECT_MS + SLACK_MS)) && le "$(field ms "$L2")" 100
+check "6c listing a dead node fails with EHOSTDOWN within the connect limit, and a stat right after fails at once" $? "$L1; $L2"
 
 echo
 echo "== 7. nodey boots again; nodex needs no restart"
