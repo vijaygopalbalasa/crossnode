@@ -1,0 +1,7 @@
+PASS rfc4231 case 1
+PASS rfc4231 case 2
+PASS rfc4231 case 6 (key longer than a block)
+PASS ct_equal same
+PASS ct_equal differs
+PASS client and agent proofs differ
+ALL PASSED
