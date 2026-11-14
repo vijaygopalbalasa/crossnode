@@ -398,6 +398,33 @@ check "23b an authenticated peer connects while the trickling strangers fill the
 q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 
+echo
+echo "== 24. A flood of handshakes from one address cannot push out another address's handshake"
+q "cd /tmp/cn; (./crossnode-agent -v -k /tmp/cn/key -e /dev/hello -l 0.0.0.0 -p 7782 > a2.log 2>&1 &); sleep 1; true"
+LINKIP=$(q 'ifconfig vtnet1 2>/dev/null | grep "inet 10.9.0.1" | wc -l' | tr -d ' ')
+O=$(q "cd /tmp/cn; ./cnprobe trickle 10.9.0.1 7782 1 > vb.txt 2>&1 & sleep 0.3; ./cnprobe trickle 127.0.0.1 7782 6 > va.txt 2>&1; wait; echo B; cat vb.txt; echo A; cat va.txt")
+echo "$O" | sed 's/^/  /'
+VB=$(echo "$O" | sed -n '/^B$/,/^A$/p' | grep op=); VA=$(echo "$O" | sed -n '/^A$/,$p' | grep op=)
+[ "$LINKIP" = 1 ] && [ "$(field instant "$VB")" = 0 ] && [ "$(field held "$VB")" = 1 ] && [ "$(field held_max_ms "$VB")" -ge 1700 ] && [ "$(field instant "$VA")" -ge 3 ]
+check "24a six handshakes from 127.0.0.1 lose their own places; the older handshake from 10.9.0.1 is held to its full 2 s" $? "other address: $VB / flooder: $VA"
+q 'slay -f -s KILL crossnode-agent >/dev/null 2>&1; true'; q "cd /tmp/cn; $AGENT"; sleep 1
+ALL=0
+q "cd /tmp/cn; ./cnprobe trickle 127.0.0.1 7777 8 > fl.txt 2>&1 & true"
+for n in 1 2 3 4; do
+    q "cd /tmp/cn; ./crossnode-net -k /tmp/cn/key -n tk$n -c 127.0.0.1:7777 > tk$n.log 2>&1 &"
+    sleep 0.6
+    O=$(q "cd /tmp/cn; i=0; while [ \$i -lt 20 ] && ! ls -d /net/tk$n >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; ./cnprobe open /net/tk$n/dev/hello")
+    echo "  tk$n: $O"
+    [ "$(field rc "$O")" = EOK ] || ALL=1
+done
+check "24b four authenticated peers from one address connect while that address floods handshakes (dropped handshakes are never counted as peers)" $ALL "all four opens"
+q "cd /tmp/cn; ./crossnode-net -k /tmp/cn/key -n tk5 -c 127.0.0.1:7777 > tk5.log 2>&1 &"; sleep 1
+O=$(q "cd /tmp/cn; i=0; while [ \$i -lt 20 ] && ! ls -d /net/tk5 >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; sleep 4; ./cnprobe open /net/tk5/dev/hello")
+echo "  tk5: $O"
+[ "$(field rc "$O")" = EHOSTDOWN ]
+check "24c a fifth authenticated peer from the same address is refused (the per-address cap is exactly 4)" $? "$O"
+q 'slay -f -s KILL crossnode-net crossnode-agent >/dev/null 2>&1; sleep 1; true'
+q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 q 'slay -f -s KILL crossnode-agent crossnode-net >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 

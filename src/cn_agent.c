@@ -57,6 +57,7 @@
 #define MAX_CONNS          16     /* peer connections at once */
 #define MAX_PER_ADDR       4      /* connections at once from one address */
 #define MAX_UNAUTH         4      /* connections still in the handshake, at most, so they can never take every slot */
+#define MAX_UNAUTH_PER_ADDR 2     /* ... and at most this many from one address, so one address cannot fill them */
 #define HANDSHAKE_MS       2000   /* the whole handshake, not each read */
 #define PEER_SILENCE_MS    5000   /* drop a peer that sends nothing, not even PING, for this long */
 
@@ -69,8 +70,10 @@ static int verbose;
 static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards the slot table */
 static struct in_addr slot_addr[MAX_CONNS];
 static int slot_used[MAX_CONNS];
-static int slot_unauth[MAX_CONNS];      /* still in the handshake: counts against MAX_UNAUTH, not against a peer address */
-static int unauth_count;
+enum { S_FREE = 0, S_UNAUTH, S_AUTH, S_EVICTED };
+/* S_UNAUTH: in the handshake, counted against MAX_UNAUTH only. S_AUTH: a peer, counted against its address.
+ * S_EVICTED: told to leave and shut down, but the slot is not free until its reader has ended; counted nowhere. */
+static int slot_state[MAX_CONNS];
 static uint64_t slot_since[MAX_CONNS];  /* when a slot was taken, for dropping the longest-waiting stranger */
 struct conn;
 static struct conn *slot_conn[MAX_CONNS];
@@ -141,14 +144,13 @@ static void conn_put(struct conn *c)
     pthread_mutex_unlock(&c->mtx);
     if (last) {
         vlog("connection %s released\n", c->peer);
+        pthread_mutex_lock(&conns_mtx);
+        slot_conn[c->slot] = NULL;              /* from here nobody may shut the socket down */
+        pthread_mutex_unlock(&conns_mtx);
         close(c->sock);
         pthread_mutex_lock(&conns_mtx);
         slot_used[c->slot] = 0;
-        slot_conn[c->slot] = NULL;
-        if (slot_unauth[c->slot]) {
-            slot_unauth[c->slot] = 0;
-            unauth_count--;
-        }
+        slot_state[c->slot] = S_FREE;
         pthread_mutex_unlock(&conns_mtx);
         pthread_mutex_destroy(&c->mtx);
         pthread_mutex_destroy(&c->dir_mtx);
@@ -919,6 +921,36 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
     }
 }
 
+/* With conns_mtx held: how many slots in this state come from this address. */
+static int addr_count(struct in_addr a, int state)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (slot_used[i] && slot_state[i] == state && slot_addr[i].s_addr == a.s_addr)
+            n++;
+    return n;
+}
+
+/* With conns_mtx held: tell a handshake to give up, and cut its socket so its slot frees at once. */
+static void evict_locked(int i)
+{
+    slot_state[i] = S_EVICTED;
+    slot_conn[i]->evict = 1;
+    shutdown(slot_conn[i]->sock, SHUT_RDWR);
+}
+
+/* With conns_mtx held: the longest-waiting handshake, optionally only from one address (a.s_addr != 0). */
+static int oldest_unauth_locked(struct in_addr a, int only_addr)
+{
+    int old = -1;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (slot_used[i] && slot_state[i] == S_UNAUTH && slot_conn[i] != NULL &&
+            (!only_addr || slot_addr[i].s_addr == a.s_addr) && (old < 0 || slot_since[i] < slot_since[old]))
+            old = i;
+    }
+    return old;
+}
+
 /* The first thing on a connection: prove both ends hold the key, or hang up. Returns 0 when it is a peer. */
 static int handshake(struct conn *c)
 {
@@ -941,23 +973,14 @@ static int handshake(struct conn *c)
         fprintf(stderr, "crossnode-agent: authentication failed from %s (no valid proof of the key)\n", c->peer);
         return -1;
     }
-    /* A peer now: stop counting it as a stranger, and hold it to the per-address cap. */
-    int too_many = 0;
-    if (c->evict)
-        return -1;
+    /* A peer now, if it was not told to leave meanwhile and its address has room: decided under the lock. */
     pthread_mutex_lock(&conns_mtx);
-    int same = 0;
-    for (int i = 0; i < MAX_CONNS; i++)
-        if (slot_used[i] && !slot_unauth[i] && i != c->slot && slot_addr[i].s_addr == slot_addr[c->slot].s_addr)
-            same++;
-    if (same >= MAX_PER_ADDR)
-        too_many = 1;
-    else if (slot_unauth[c->slot]) {
-        slot_unauth[c->slot] = 0;
-        unauth_count--;
-    }
+    int promote = !c->evict && slot_state[c->slot] == S_UNAUTH &&
+                  addr_count(slot_addr[c->slot], S_AUTH) < MAX_PER_ADDR;
+    if (promote)
+        slot_state[c->slot] = S_AUTH;
     pthread_mutex_unlock(&conns_mtx);
-    if (too_many)
+    if (!promote)
         return -1;
     struct cn_hdr r = { .magic = CN_MAGIC, .op = CN_OP_AUTH | CN_REPLY, .seq = h.seq, .handle = -1, .len = CN_MAC_LEN };
     memcpy(out, &r, sizeof r);
@@ -1149,45 +1172,54 @@ int main(int argc, char **argv)
                 perror("crossnode-agent: accept");
             continue;
         }
-        int slot = -1, same = 0;
+        int slot = -1;
+        const char *why = NULL;
         pthread_mutex_lock(&conns_mtx);
-        if (keylen && unauth_count >= MAX_UNAUTH) {
-            /* A real peer finishes the handshake in milliseconds, a stranger holds on for the full two
-             * seconds. So the newcomer is let in and the longest-waiting stranger is told to go. */
-            int old = -1;
-            for (int i = 0; i < MAX_CONNS; i++) {
-                if (slot_used[i] && slot_unauth[i] && slot_conn[i] != NULL && (old < 0 || slot_since[i] < slot_since[old]))
-                    old = i;
-            }
-            if (old >= 0) {
-                slot_conn[old]->evict = 1;
-                slot_unauth[old] = 0;
-                unauth_count--;
-                fprintf(stderr, "crossnode-agent: dropped the longest-waiting unauthenticated connection (too many in the handshake)\n");
-            }
-        }
-        for (int i = 0; i < MAX_CONNS; i++) {
-            if (slot_used[i] && !slot_unauth[i] && slot_addr[i].s_addr == pa.sin_addr.s_addr)
-                same++;
-            else if (!slot_used[i] && slot < 0)
+        for (int i = 0; i < MAX_CONNS && slot < 0; i++)
+            if (!slot_used[i])
                 slot = i;
-        }
-        if (same >= MAX_PER_ADDR || (keylen && unauth_count >= MAX_UNAUTH))
+        if (slot < 0) {
+            why = "all slots in use";
+        } else if (addr_count(pa.sin_addr, S_AUTH) >= MAX_PER_ADDR) {
+            why = "too many from that address";
             slot = -1;
+        } else if (keylen) {
+            /* A real peer finishes the handshake in milliseconds, a stranger holds on for the full two
+             * seconds, so a newcomer is let in and someone is told to go. Never someone from another
+             * address than the flooder's: an address first loses its own oldest handshake, and only when
+             * the places are all taken by different addresses does the address holding the most lose one.
+             * This runs only when a free slot is already in hand, so an eviction always admits somebody. */
+            int total = 0, heaviest = -1, heavy_n = 0;
+            for (int i = 0; i < MAX_CONNS; i++) {
+                if (slot_used[i] && slot_state[i] == S_UNAUTH) {
+                    total++;
+                    int n = addr_count(slot_addr[i], S_UNAUTH);
+                    if (n > heavy_n) {
+                        heavy_n = n;
+                        heaviest = i;
+                    }
+                }
+            }
+            int victim = -1;
+            if (addr_count(pa.sin_addr, S_UNAUTH) >= MAX_UNAUTH_PER_ADDR)
+                victim = oldest_unauth_locked(pa.sin_addr, 1);
+            else if (total >= MAX_UNAUTH && heaviest >= 0)
+                victim = oldest_unauth_locked(slot_addr[heaviest], 1);
+            if (victim >= 0) {
+                evict_locked(victim);
+                fprintf(stderr, "crossnode-agent: dropped an unauthenticated connection to make room (too many in the handshake)\n");
+            }
+        }
         if (slot >= 0) {
             slot_used[slot] = 1;
             slot_conn[slot] = NULL;
             slot_since[slot] = mono_ms();
             slot_addr[slot] = pa.sin_addr;
-            if (keylen) {
-                slot_unauth[slot] = 1;
-                unauth_count++;
-            }
+            slot_state[slot] = keylen ? S_UNAUTH : S_AUTH;
         }
         pthread_mutex_unlock(&conns_mtx);
         if (slot < 0) {
-            fprintf(stderr, "crossnode-agent: refused a connection from %s (%s)\n", inet_ntoa(pa.sin_addr),
-                    keylen && unauth_count >= MAX_UNAUTH ? "too many connections still in the handshake" : same >= MAX_PER_ADDR ? "too many from that address" : "all slots in use");
+            fprintf(stderr, "crossnode-agent: refused a connection from %s (%s)\n", inet_ntoa(pa.sin_addr), why);
             close(s);
             continue;
         }
@@ -1201,10 +1233,7 @@ int main(int argc, char **argv)
             close(s);
             pthread_mutex_lock(&conns_mtx);
             slot_used[slot] = 0;
-            if (slot_unauth[slot]) {
-                slot_unauth[slot] = 0;
-                unauth_count--;
-            }
+            slot_state[slot] = S_FREE;
             pthread_mutex_unlock(&conns_mtx);
             continue;
         }
