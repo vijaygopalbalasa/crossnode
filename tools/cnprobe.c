@@ -16,9 +16,11 @@
  *   cnprobe ls PATH | lsr PATH             list a directory (lsr: list, rewinddir, list again)
  *   cnprobe eintr-stat PATH ALARM_MS        stat() with a signal arriving after ALARM_MS
  *   cnprobe rawping ADDRESS PORT            send an unauthenticated PING; report whether it was answered and whether the agent hung up
+ *   cnprobe trickle ADDRESS PORT N          open N connections that send one byte every 1.5 s; report how long each was held
  *   cnprobe now                            print this machine's monotonic clock in ms
  */
 #include <dirent.h>
+#include <poll.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -326,6 +328,72 @@ int main(int argc, char **argv)
             off += sizeof h + h.len;
         }
         printf("op=rawping ping_reply=%s closed=%s\n", replied ? "yes" : "no", closed ? "yes" : "no");
+        return 0;
+    }
+    if (strcmp(cmd, "trickle") == 0) {
+        if (argc < 5)
+            return usage();
+        int n = atoi(argv[4]);
+        if (n > 16)
+            n = 16;
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)atoi(argv[3]));
+        inet_pton(AF_INET, path, &sa.sin_addr);
+        int fds[16];
+        double closed_at[16], t0 = now_ms(), last_send = t0;
+        for (int i = 0; i < n; i++) {
+            fds[i] = socket(AF_INET, SOCK_STREAM, 0);
+            if (fds[i] >= 0 && connect(fds[i], (struct sockaddr *)&sa, sizeof sa) != 0) {
+                close(fds[i]);
+                fds[i] = -1;
+            }
+            closed_at[i] = fds[i] < 0 ? 0 : -1;
+        }
+        while (now_ms() - t0 < 6000) {
+            struct pollfd pf[16];
+            for (int i = 0; i < n; i++) {
+                pf[i].fd = closed_at[i] < 0 ? fds[i] : -1;
+                pf[i].events = POLLIN;
+                pf[i].revents = 0;
+            }
+            (void)poll(pf, (nfds_t)n, 100);
+            for (int i = 0; i < n; i++) {
+                if (closed_at[i] >= 0 || !(pf[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                    continue;
+                char b[256];
+                ssize_t r = recv(fds[i], b, sizeof b, 0);
+                if (r <= 0)
+                    closed_at[i] = now_ms() - t0;
+            }
+            if (now_ms() - last_send >= 1500) {
+                last_send = now_ms();
+                for (int i = 0; i < n; i++)
+                    if (closed_at[i] < 0)
+                        (void)send(fds[i], "x", 1, MSG_NOSIGNAL);
+            }
+            int open_left = 0;
+            for (int i = 0; i < n; i++)
+                if (closed_at[i] < 0)
+                    open_left++;
+            if (!open_left)
+                break;
+        }
+        int instant = 0, held = 0, never = 0;
+        double hmax = 0;
+        for (int i = 0; i < n; i++) {
+            if (closed_at[i] < 0)
+                never++;
+            else if (closed_at[i] < 300)
+                instant++;
+            else {
+                held++;
+                if (closed_at[i] > hmax)
+                    hmax = closed_at[i];
+            }
+        }
+        printf("op=trickle tried=%d instant=%d held=%d never=%d held_max_ms=%.0f\n", n, instant, held, never, hmax);
         return 0;
     }
     if (strcmp(cmd, "seek") == 0) {

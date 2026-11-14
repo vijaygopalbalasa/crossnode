@@ -230,8 +230,8 @@ echo
 echo "== 17. Connection caps"
 O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; ./cnprobe conns 127.0.0.1 7777 6; grep -c 'too many from that address' agent.log; true")
 echo "$O" | sed 's/^/  /'
-[ "$(field kept "$O")" = 3 ]
-check "17 one address holds at most 4 connections (crossnode-net has one, 3 of 6 more kept)" $? "$(echo "$O" | head -1)"
+[ "$(field kept "$O")" = 4 ]
+check "17 at most 4 connections still in the handshake are held at once (4 of 6 kept; crossnode-net's own authenticated connection is not counted)" $? "$(echo "$O" | head -1)"
 
 echo
 echo "== 18. Replies that break the protocol are refused"
@@ -384,6 +384,20 @@ O=$(q 'cd /tmp/cn; ./crossnode-agent -k /tmp/cn/key2 -e /dev/hello -p 7781 2>&1;
 echo "$O" | sed 's/^/  /'
 echo "$O" | grep -q 'readable by others' && [ "$(echo "$O" | grep -c 'rc=0')" = 0 ] && echo "$O" | grep -q 'no -k KEYFILE'
 check "22f a key file others can read is refused, and so is starting with neither a key nor -I" $? "$(echo "$O" | head -1)"
+echo
+echo "== 23. Strangers cannot hold the agent open"
+q 'cd /tmp/cn; ./crossnode-net -k /tmp/cn/key -n tk -c 127.0.0.1:7777 > tk.log 2>&1 &'
+q "cd /tmp/cn; ./cnprobe trickle 127.0.0.1 7777 6 > tr.txt 2>&1 & sleep 0.7; i=0; while [ \$i -lt 20 ] && ! ls -d /net/tk >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; ./cnprobe open /net/tk/dev/hello > tk-open.txt 2>&1; wait; true"
+O=$(q 'cd /tmp/cn; cat tr.txt tk-open.txt')
+echo "$O" | sed 's/^/  /'
+TR=$(echo "$O" | grep op=trickle); TO=$(echo "$O" | grep op=open)
+[ "$(field held "$TR")" = 4 ] && [ "$(field instant "$TR")" = 2 ] && le "$(field held_max_ms "$TR")" $((2000 + SLACK_MS + 300))
+check "23a six trickling strangers: four are held and dropped at about 2 s in total, the other two are refused at once" $? "$TR"
+[ "$(field rc "$TO")" = EOK ]
+check "23b an authenticated peer connects while the trickling strangers are held" $? "$TO"
+q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; sleep 1; true'
+q "cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
+
 q 'slay -f -s KILL crossnode-agent crossnode-net >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 

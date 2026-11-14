@@ -35,6 +35,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -55,6 +56,8 @@
 #define MAX_JOBS           64     /* requests in flight per connection */
 #define MAX_CONNS          16     /* peer connections at once */
 #define MAX_PER_ADDR       4      /* connections at once from one address */
+#define MAX_UNAUTH         4      /* connections still in the handshake, at most, so they can never take every slot */
+#define HANDSHAKE_MS       2000   /* the whole handshake, not each read */
 #define PEER_SILENCE_MS    5000   /* drop a peer that sends nothing, not even PING, for this long */
 
 static unsigned char key[CN_KEY_MAX];   /* -k: the shared key */
@@ -66,6 +69,8 @@ static int verbose;
 static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards the slot table */
 static struct in_addr slot_addr[MAX_CONNS];
 static int slot_used[MAX_CONNS];
+static int slot_unauth[MAX_CONNS];      /* still in the handshake: counts against MAX_UNAUTH, not against a peer address */
+static int unauth_count;
 
 struct jobslot {
     int used;
@@ -135,6 +140,10 @@ static void conn_put(struct conn *c)
         close(c->sock);
         pthread_mutex_lock(&conns_mtx);
         slot_used[c->slot] = 0;
+        if (slot_unauth[c->slot]) {
+            slot_unauth[c->slot] = 0;
+            unauth_count--;
+        }
         pthread_mutex_unlock(&conns_mtx);
         pthread_mutex_destroy(&c->mtx);
         pthread_mutex_destroy(&c->dir_mtx);
@@ -181,6 +190,39 @@ static int read_full(int fd, void *buf, size_t n)
             continue;
         } else {
             return -1;            /* EOF, error, or SO_RCVTIMEO expired: the peer is gone */
+        }
+    }
+    return 0;
+}
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Like read_full, but everything must arrive before one absolute deadline: a stranger who sends a byte every
+ * second gains nothing. */
+static int read_by(int fd, void *buf, size_t n, uint64_t deadline)
+{
+    unsigned char *p = buf;
+    while (n > 0) {
+        uint64_t now = mono_ms();
+        if (now >= deadline)
+            return -1;
+        struct pollfd pf = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pf, 1, (int)(deadline - now));
+        if (pr < 0 && errno == EINTR)
+            continue;
+        if (pr <= 0)
+            return -1;
+        ssize_t r = recv(fd, p, n, MSG_DONTWAIT);
+        if (r > 0) {
+            p += r;
+            n -= (size_t)r;
+        } else if (r == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            return -1;
         }
     }
     return 0;
@@ -874,17 +916,16 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
 static int handshake(struct conn *c)
 {
     unsigned char na[CN_NONCE_LEN], req[CN_NONCE_LEN + CN_MAC_LEN], want[CN_MAC_LEN];
-    struct timeval tv = { 2, 0 };
-    setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);     /* a stranger gets two seconds */
+    uint64_t deadline = mono_ms() + HANDSHAKE_MS;      /* a stranger gets two seconds in all */
     if (cn_random(na, sizeof na) != 0)
         return -1;
     struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_AUTH | CN_REPLY, .handle = -1, .len = sizeof na };
     unsigned char out[sizeof h + CN_MAC_LEN];
     memcpy(out, &h, sizeof h);
     memcpy(out + sizeof h, na, sizeof na);
-    int ok = write_full(c->sock, out, sizeof h + sizeof na) == 0 && read_full(c->sock, &h, sizeof h) == 0 &&
+    int ok = write_full(c->sock, out, sizeof h + sizeof na) == 0 && read_by(c->sock, &h, sizeof h, deadline) == 0 &&
              h.magic == CN_MAGIC && h.op == CN_OP_AUTH && h.len == sizeof req &&
-             read_full(c->sock, req, sizeof req) == 0;
+             read_by(c->sock, req, sizeof req, deadline) == 0;
     if (ok) {
         cn_auth_mac(key, keylen, 'C', na, req, want);
         ok = cn_ct_equal(want, req + CN_NONCE_LEN, CN_MAC_LEN);
@@ -893,6 +934,22 @@ static int handshake(struct conn *c)
         fprintf(stderr, "crossnode-agent: authentication failed from %s (no valid proof of the key)\n", c->peer);
         return -1;
     }
+    /* A peer now: stop counting it as a stranger, and hold it to the per-address cap. */
+    int too_many = 0;
+    pthread_mutex_lock(&conns_mtx);
+    int same = 0;
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (slot_used[i] && !slot_unauth[i] && i != c->slot && slot_addr[i].s_addr == slot_addr[c->slot].s_addr)
+            same++;
+    if (same >= MAX_PER_ADDR)
+        too_many = 1;
+    else if (slot_unauth[c->slot]) {
+        slot_unauth[c->slot] = 0;
+        unauth_count--;
+    }
+    pthread_mutex_unlock(&conns_mtx);
+    if (too_many)
+        return -1;
     struct cn_hdr r = { .magic = CN_MAGIC, .op = CN_OP_AUTH | CN_REPLY, .seq = h.seq, .handle = -1, .len = CN_MAC_LEN };
     memcpy(out, &r, sizeof r);
     cn_auth_mac(key, keylen, 'A', req, na, out + sizeof r);
@@ -1086,21 +1143,25 @@ int main(int argc, char **argv)
         int slot = -1, same = 0;
         pthread_mutex_lock(&conns_mtx);
         for (int i = 0; i < MAX_CONNS; i++) {
-            if (slot_used[i] && slot_addr[i].s_addr == pa.sin_addr.s_addr)
+            if (slot_used[i] && !slot_unauth[i] && slot_addr[i].s_addr == pa.sin_addr.s_addr)
                 same++;
             else if (!slot_used[i] && slot < 0)
                 slot = i;
         }
-        if (same >= MAX_PER_ADDR)
+        if (same >= MAX_PER_ADDR || (keylen && unauth_count >= MAX_UNAUTH))
             slot = -1;
         if (slot >= 0) {
             slot_used[slot] = 1;
             slot_addr[slot] = pa.sin_addr;
+            if (keylen) {
+                slot_unauth[slot] = 1;
+                unauth_count++;
+            }
         }
         pthread_mutex_unlock(&conns_mtx);
         if (slot < 0) {
             fprintf(stderr, "crossnode-agent: refused a connection from %s (%s)\n", inet_ntoa(pa.sin_addr),
-                    same >= MAX_PER_ADDR ? "too many from that address" : "all slots in use");
+                    keylen && unauth_count >= MAX_UNAUTH ? "too many connections still in the handshake" : same >= MAX_PER_ADDR ? "too many from that address" : "all slots in use");
             close(s);
             continue;
         }
