@@ -27,10 +27,11 @@ host_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
 field() { echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
-if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
+if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
    || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
+HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT   # one shared key for this run
 PASS=0
 FAIL=0
 check() {
@@ -42,10 +43,11 @@ push() {   # push SSH_FUNCTION
     for f in hellodev crossnode-agent crossnode-net cnprobe; do
         $1 "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
     done
+    $1 'umask 077; cat > /tmp/cn/key' < "$HOSTKEY"
 }
 start_nodey() {
     qy 'rm -rf /tmp/cnx && mkdir /tmp/cnx && : > /tmp/cnx/w && dd if=/dev/urandom of=/tmp/cnx/big bs=1024 count=200 2>/dev/null'
-    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
+    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
 }
 wait_lines() {  # wait_lines FILE PATTERN SECONDS: until FILE on nodex has a line matching PATTERN
     local i
@@ -65,7 +67,7 @@ echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo u
 push qx
 push qy
 start_nodey
-qx 'cd /tmp/cn && (./crossnode-net -v -g 1000 -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
+qx 'cd /tmp/cn && (./crossnode-net -v -k /tmp/cn/key -g 1000 -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
 sleep 1
 
 echo

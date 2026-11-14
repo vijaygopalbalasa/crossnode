@@ -15,6 +15,7 @@
  *   cnprobe stat PATH | fstat PATH         stat() a path, or open it and fstat() the descriptor
  *   cnprobe ls PATH | lsr PATH             list a directory (lsr: list, rewinddir, list again)
  *   cnprobe eintr-stat PATH ALARM_MS        stat() with a signal arriving after ALARM_MS
+ *   cnprobe rawping ADDRESS PORT            send an unauthenticated PING; report whether it was answered and whether the agent hung up
  *   cnprobe now                            print this machine's monotonic clock in ms
  */
 #include <dirent.h>
@@ -34,6 +35,7 @@
 #include <sys/socket.h>
 
 #include "hello_dcmd.h"
+#include "../src/cn_proto.h"
 
 static double now_ms(void)
 {
@@ -281,6 +283,51 @@ int main(int argc, char **argv)
         printf("op=stat-with-signal rc=%s ms=%.0f\n", rc == 0 ? "EOK" : ename(errno), now_ms() - t0);
         return 0;
     }
+    if (strcmp(cmd, "rawping") == 0) {
+        if (argc < 4)
+            return usage();
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)atoi(argv[3]));
+        inet_pton(AF_INET, path, &sa.sin_addr);
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0 || connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
+            printf("op=rawping connect=failed\n");
+            return 0;
+        }
+        struct timeval tv = { 3, 0 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct cn_hdr h;
+        memset(&h, 0, sizeof h);
+        h.magic = CN_MAGIC;
+        h.op = CN_OP_PING;
+        h.seq = 1;
+        h.handle = -1;
+        (void)send(s, &h, sizeof h, 0);
+        unsigned char buf[4096];
+        size_t got = 0;
+        int closed = 0, replied = 0;
+        for (;;) {
+            ssize_t r = recv(s, buf + got, sizeof buf - got, 0);
+            if (r == 0) {
+                closed = 1;
+                break;
+            }
+            if (r < 0)
+                break;
+            got += (size_t)r;
+        }
+        size_t off = 0;
+        while (got - off >= sizeof h) {
+            memcpy(&h, buf + off, sizeof h);
+            if (h.op == (CN_OP_PING | CN_REPLY))
+                replied = 1;
+            off += sizeof h + h.len;
+        }
+        printf("op=rawping ping_reply=%s closed=%s\n", replied ? "yes" : "no", closed ? "yes" : "no");
+        return 0;
+    }
     if (strcmp(cmd, "seek") == 0) {
         int fd = open_or_report(path, O_RDONLY);
         if (fd < 0)
@@ -327,8 +374,8 @@ int main(int argc, char **argv)
             if (fds[i] < 0)
                 continue;
             ssize_t r = recv(fds[i], &b, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                open_ok++;              /* still open: the agent kept it */
+            if (r > 0 || (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+                open_ok++;              /* still open: the agent kept it (a keyed agent has sent its challenge) */
             close(fds[i]);
         }
         printf("op=conns tried=%d kept=%d\n", n, open_ok);

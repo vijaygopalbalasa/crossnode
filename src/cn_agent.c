@@ -23,7 +23,9 @@
  * stat and directory listing go through the same resolver as open (resolve()). A directory above a share
  * (a proper ancestor of an export, or the root) is virtual: it lists only the way to the shares.
  *
- * Limit, stated plainly: no peer authentication yet, so bind it to a private link address.
+ * Every connection starts with a handshake (cn_auth.h): the agent sends a nonce and serves nothing until the peer
+ * proves it holds the shared key (-k). -I turns this off. Limit, stated plainly: authentication only; the traffic
+ * after the handshake is neither encrypted nor integrity-protected, so use a protected link.
  */
 #include <arpa/inet.h>
 #include <devctl.h>
@@ -46,6 +48,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "cn_auth.h"
 #include "cn_proto.h"
 
 #define MAX_EXPORTS        32
@@ -54,6 +57,8 @@
 #define MAX_PER_ADDR       4      /* connections at once from one address */
 #define PEER_SILENCE_MS    5000   /* drop a peer that sends nothing, not even PING, for this long */
 
+static unsigned char key[CN_KEY_MAX];   /* -k: the shared key */
+static size_t keylen;                   /* 0 with -I: no authentication */
 static char *exports[MAX_EXPORTS];      /* as given, without the leading '/' */
 static char *rexports[MAX_EXPORTS];     /* the same, resolved with realpath() at start */
 static int nexports;
@@ -865,10 +870,45 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
     }
 }
 
+/* The first thing on a connection: prove both ends hold the key, or hang up. Returns 0 when it is a peer. */
+static int handshake(struct conn *c)
+{
+    unsigned char na[CN_NONCE_LEN], req[CN_NONCE_LEN + CN_MAC_LEN], want[CN_MAC_LEN];
+    struct timeval tv = { 2, 0 };
+    setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);     /* a stranger gets two seconds */
+    if (cn_random(na, sizeof na) != 0)
+        return -1;
+    struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_AUTH | CN_REPLY, .handle = -1, .len = sizeof na };
+    unsigned char out[sizeof h + CN_MAC_LEN];
+    memcpy(out, &h, sizeof h);
+    memcpy(out + sizeof h, na, sizeof na);
+    int ok = write_full(c->sock, out, sizeof h + sizeof na) == 0 && read_full(c->sock, &h, sizeof h) == 0 &&
+             h.magic == CN_MAGIC && h.op == CN_OP_AUTH && h.len == sizeof req &&
+             read_full(c->sock, req, sizeof req) == 0;
+    if (ok) {
+        cn_auth_mac(key, keylen, 'C', na, req, want);
+        ok = cn_ct_equal(want, req + CN_NONCE_LEN, CN_MAC_LEN);
+    }
+    if (!ok) {
+        fprintf(stderr, "crossnode-agent: authentication failed from %s (no valid proof of the key)\n", c->peer);
+        return -1;
+    }
+    struct cn_hdr r = { .magic = CN_MAGIC, .op = CN_OP_AUTH | CN_REPLY, .seq = h.seq, .handle = -1, .len = CN_MAC_LEN };
+    memcpy(out, &r, sizeof r);
+    cn_auth_mac(key, keylen, 'A', req, na, out + sizeof r);
+    if (write_full(c->sock, out, sizeof r + CN_MAC_LEN) != 0)
+        return -1;
+    struct timeval rtv = { PEER_SILENCE_MS / 1000, (PEER_SILENCE_MS % 1000) * 1000 };
+    setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+    vlog("peer %s authenticated\n", c->peer);
+    return 0;
+}
+
 static void *reader(void *arg)
 {
     struct conn *c = arg;
-    for (;;) {
+    int ok = keylen == 0 || handshake(c) == 0;
+    for (; ok;) {
         struct cn_hdr h;
         if (read_full(c->sock, &h, sizeof h) != 0)
             break;
@@ -936,7 +976,9 @@ static void *reader(void *arg)
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: crossnode-agent -e PATH [-e PATH ...] [-l ADDRESS] [-p PORT] [-v]\n"
+            "usage: crossnode-agent (-k KEYFILE | -I) -e PATH [-e PATH ...] [-l ADDRESS] [-p PORT] [-v]\n"
+            "  -k KEYFILE  shared key (at least 16 bytes, mode 600); peers must prove they hold it\n"
+            "  -I          run with NO authentication (anyone who reaches the port can use the shares)\n"
             "  -e PATH     export PATH and everything under it (for example /dev/hello or /dev)\n"
             "  -l ADDRESS  listen on this IPv4 address (default 127.0.0.1)\n"
             "  -p PORT     listen on this TCP port (default 7777)\n");
@@ -948,7 +990,9 @@ int main(int argc, char **argv)
     const char *addr = "127.0.0.1";
     int port = 7777;
     int opt;
-    while ((opt = getopt(argc, argv, "e:l:p:v")) != -1) {
+    const char *keyfile = NULL;
+    int insecure = 0;
+    while ((opt = getopt(argc, argv, "e:l:p:vk:I")) != -1) {
         switch (opt) {
         case 'e': {
             if (nexports == MAX_EXPORTS)
@@ -970,11 +1014,30 @@ int main(int argc, char **argv)
         case 'l': addr = optarg; break;
         case 'p': port = atoi(optarg); break;
         case 'v': verbose = 1; break;
+        case 'k': keyfile = optarg; break;
+        case 'I': insecure = 1; break;
         default: usage();
         }
     }
     if (nexports == 0 || port <= 0 || port > 65535)
         usage();
+    if (keyfile != NULL && insecure) {
+        fprintf(stderr, "crossnode-agent: -k and -I together make no sense\n");
+        return 2;
+    }
+    if (keyfile == NULL && !insecure) {
+        fprintf(stderr, "crossnode-agent: no -k KEYFILE (give a key, or -I to run without authentication)\n");
+        return 2;
+    }
+    if (keyfile != NULL) {
+        char err[256];
+        int n = cn_load_key(keyfile, key, err, sizeof err);
+        if (n < 0) {
+            fprintf(stderr, "crossnode-agent: %s\n", err);
+            return 2;
+        }
+        keylen = (size_t)n;
+    }
     for (int i = 0; i < nexports; i++) {
         char given[PATH_MAX], real[PATH_MAX];
         snprintf(given, sizeof given, "/%s", exports[i]);
@@ -1008,7 +1071,7 @@ int main(int argc, char **argv)
         if (strcmp(exports[i], rexports[i]) != 0)
             printf(" (= /%s)", rexports[i]);
     }
-    printf(" (no authentication in this build)\n");
+    printf(keylen ? " (peers must prove a shared key)\n" : " (NO AUTHENTICATION: -I)\n");
     fflush(stdout);
 
     for (;;) {

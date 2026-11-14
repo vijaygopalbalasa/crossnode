@@ -26,6 +26,8 @@ enum cn_op {
                            Reply payload: struct cn_stat */
     CN_OP_READDIR = 9,  /* handle of a directory; a: index of the first entry wanted; b: most payload bytes.
                            Reply payload: b entries (struct cn_dent + name, padded to 8); b == 0 is the end */
+    CN_OP_AUTH   = 10,  /* handshake, see cn_auth.h: the agent opens with a challenge (a reply-flagged frame with a
+                           nonce), the net side answers with a nonce and a proof, the agent answers with its proof */
 };
 
 #define CN_OFLAG_DIR    0x40000000      /* in the flags of an OPEN request: fail with ENOTDIR unless a directory */

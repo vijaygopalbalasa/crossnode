@@ -15,7 +15,8 @@
  *
  * stat() and fstat() are answered by the peer; a directory reads as dirent records built from the peer's
  * entry list. Limits, stated plainly: lseek works only on directories (files answer ESPIPE), there is no
- * pread or pwrite, one peer per process, and no authentication yet.
+ * pread or pwrite, and one peer per process. The agent must prove it holds the shared key (-k) before any
+ * request is sent; -I turns that off. Traffic after the handshake is not encrypted.
  */
 struct cn_ocb;
 #define IOFUNC_OCB_T struct cn_ocb
@@ -43,6 +44,7 @@ struct cn_ocb;
 #include <time.h>
 #include <unistd.h>
 
+#include "cn_auth.h"
 #include "cn_proto.h"
 
 #define CN_PING_MS      500   /* liveness probe period while connected */
@@ -86,7 +88,7 @@ struct pend {
     struct _msg_info info;    /* OPEN only: that client's connection, to unbind on failure */
 };
 
-enum conn_state { C_DOWN = 0, C_CONNECTING, C_UP };
+enum conn_state { C_DOWN = 0, C_CONNECTING, C_AUTH, C_UP };
 
 static struct {
     pthread_mutex_t mtx;      /* guards everything in this struct */
@@ -106,6 +108,13 @@ static struct {
     struct sockaddr_in peer;
     int self_coid;
     int pulse_code;
+    unsigned char key[CN_KEY_MAX];   /* -k; keylen 0 means -I, no authentication */
+    size_t keylen;
+    int auth_stage;                  /* 0: waiting for the agent's challenge, 1: waiting for its proof */
+    unsigned char na[CN_NONCE_LEN], nc[CN_NONCE_LEN];
+    unsigned char authout[sizeof(struct cn_hdr) + CN_NONCE_LEN + CN_MAC_LEN];
+    size_t authlen;
+    const char *why;                 /* set when a frame is refused: the reason for the log */
 } G = { .mtx = PTHREAD_MUTEX_INITIALIZER, .sock = -1 };
 
 static iofunc_attr_t dir_attr, file_attr;
@@ -197,8 +206,12 @@ static void teardown_locked(const char *why)
         close(G.sock);
         G.sock = -1;
     }
-    if (G.state != C_DOWN)
+    if (G.state == C_AUTH)
+        vlog("peer down: authentication failed (%s)\n", why);
+    else if (G.state != C_DOWN)
         vlog("peer down: %s\n", why);
+    G.authlen = 0;
+    G.auth_stage = 0;
     G.state = C_DOWN;
     G.gen++;
     G.last_fail = now_ms();
@@ -221,6 +234,17 @@ static void up_locked(void)
     vlog("peer up\n");
 }
 
+static void connected_locked(void)
+{
+    if (G.keylen == 0) {
+        up_locked();
+        return;
+    }
+    G.state = C_AUTH;               /* nothing but the handshake until the agent has proved the key */
+    G.auth_stage = 0;
+    G.authlen = 0;
+}
+
 static void start_connect_locked(void)
 {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -235,7 +259,7 @@ static void start_connect_locked(void)
     G.state = C_CONNECTING;
     G.connect_deadline = now_ms() + CN_CONNECT_MS;
     if (connect(s, (struct sockaddr *)&G.peer, sizeof G.peer) == 0)
-        up_locked();
+        connected_locked();
     else if (errno != EINPROGRESS)
         teardown_locked(strerror(errno));
 }
@@ -306,10 +330,47 @@ static int reply_valid(const struct pend *e, const struct cn_hdr *h, const unsig
     }
 }
 
+/* One frame while authenticating. Returns -1 to drop the connection. */
+static int handle_auth_frame_locked(const struct cn_hdr *h, const unsigned char *p)
+{
+    if (h->op != (CN_OP_AUTH | CN_REPLY))
+        return -1;
+    if (G.auth_stage == 0) {
+        if (h->len != CN_NONCE_LEN)
+            return -1;
+        memcpy(G.na, p, CN_NONCE_LEN);
+        if (cn_random(G.nc, CN_NONCE_LEN) != 0)
+            return -1;
+        struct cn_hdr r = { .magic = CN_MAGIC, .op = CN_OP_AUTH, .seq = ++G.seq, .handle = -1,
+                            .len = CN_NONCE_LEN + CN_MAC_LEN };
+        memcpy(G.authout, &r, sizeof r);
+        memcpy(G.authout + sizeof r, G.nc, CN_NONCE_LEN);
+        cn_auth_mac(G.key, G.keylen, 'C', G.na, G.nc, G.authout + sizeof r + CN_NONCE_LEN);
+        G.authlen = sizeof r + CN_NONCE_LEN + CN_MAC_LEN;
+        G.auth_stage = 1;
+        return 0;
+    }
+    unsigned char want[CN_MAC_LEN];
+    if (h->a != 0 || h->len != CN_MAC_LEN)
+        return -1;
+    cn_auth_mac(G.key, G.keylen, 'A', G.nc, G.na, want);
+    if (!cn_ct_equal(want, p, CN_MAC_LEN))
+        return -1;
+    up_locked();
+    return 0;
+}
+
 /* Returns -1 when the frame breaks the protocol; the caller then drops the connection. */
 static int handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
 {
     G.last_rx = now_ms();
+    if (G.state == C_AUTH)
+        return handle_auth_frame_locked(h, p);
+    if (h->op == (CN_OP_AUTH | CN_REPLY)) {
+        /* The agent opened with a challenge, so it wants a key and this side was started with -I. */
+        G.why = "the agent requires authentication (start crossnode-net with -k KEYFILE)";
+        return -1;
+    }
     if (h->op == (CN_OP_PING | CN_REPLY))
         return 0;
     struct pend *e = find_seq_locked(h->seq);
@@ -372,8 +433,10 @@ static void io_read_locked(void)
             }
             if (G.rxlen - off < sizeof h + h.len)
                 break;
+            int was_auth = G.state == C_AUTH;
             if (handle_frame_locked(&h, G.rx + off + sizeof h) != 0) {
-                teardown_locked("a reply did not match its request");
+                teardown_locked(G.why ? G.why : was_auth ? "the agent's answer was wrong" : "a reply did not match its request");
+                G.why = NULL;
                 return;
             }
             off += sizeof h + h.len;
@@ -385,6 +448,18 @@ static void io_read_locked(void)
 
 static void io_write_locked(void)
 {
+    if (G.state == C_AUTH) {                 /* only the handshake may be sent before the agent is trusted */
+        if (G.authlen) {
+            ssize_t w = send(G.sock, G.authout, G.authlen, 0);
+            if (w > 0) {
+                memmove(G.authout, G.authout + w, G.authlen - (size_t)w);
+                G.authlen -= (size_t)w;
+            } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                teardown_locked(strerror(errno));
+            }
+        }
+        return;
+    }
     ssize_t w = send(G.sock, G.out, G.outlen, 0);
     if (w > 0) {
         memmove(G.out, G.out + w, G.outlen - (size_t)w);
@@ -408,6 +483,8 @@ static void *io_thread(void *arg)
         }
         if (G.state == C_CONNECTING && t >= G.connect_deadline)
             teardown_locked("connect timed out");
+        if (G.state == C_AUTH && t >= G.connect_deadline)
+            teardown_locked("timed out");
         if (G.state == C_UP) {
             if (t - G.last_rx >= CN_DEAD_MS) {
                 teardown_locked("no answer within the liveness limit");
@@ -422,13 +499,14 @@ static void *io_thread(void *arg)
         fds[0].revents = 0;
         if (G.sock >= 0) {
             fds[1].fd = G.sock;
-            fds[1].events = (short)(G.state == C_CONNECTING ? POLLOUT : (POLLIN | (G.outlen ? POLLOUT : 0)));
+            size_t pending = G.state == C_AUTH ? G.authlen : G.outlen;
+            fds[1].events = (short)(G.state == C_CONNECTING ? POLLOUT : (POLLIN | (pending ? POLLOUT : 0)));
             fds[1].revents = 0;
             nfds = 2;
         }
         /* Sleep exactly until the next deadline, so the limits hold to the millisecond. */
         int64_t wait = 1000;
-        if (G.state == C_CONNECTING)
+        if (G.state == C_CONNECTING || G.state == C_AUTH)
             wait = (int64_t)G.connect_deadline - (int64_t)t;
         if (G.state == C_UP) {
             int64_t dead = (int64_t)(G.last_rx + CN_DEAD_MS) - (int64_t)t;
@@ -460,15 +538,16 @@ static void *io_thread(void *arg)
                 socklen_t el = sizeof err;
                 getsockopt(G.sock, SOL_SOCKET, SO_ERROR, &err, &el);
                 if (err == 0 && (re & POLLOUT))
-                    up_locked();
+                    connected_locked();
                 else
                     teardown_locked(err ? strerror(err) : "connect failed");
-            } else if (G.state == C_UP) {
+            } else if (G.state == C_UP || G.state == C_AUTH) {
                 if (re & POLLIN)
                     io_read_locked();
-                if (G.state == C_UP && (re & POLLOUT) && G.outlen)
+                if ((G.state == C_UP || G.state == C_AUTH) && (re & POLLOUT) &&
+                    (G.state == C_AUTH ? G.authlen : G.outlen))
                     io_write_locked();
-                if (G.state == C_UP && (re & (POLLERR | POLLHUP | POLLNVAL)) && !(re & POLLIN))
+                if ((G.state == C_UP || G.state == C_AUTH) && (re & (POLLERR | POLLHUP | POLLNVAL)) && !(re & POLLIN))
                     teardown_locked("connection error");
             }
         }
@@ -1025,7 +1104,9 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: crossnode-net -n NAME -c ADDRESS:PORT [-g GID] [-m DIR] [-v]\n"
+            "usage: crossnode-net -n NAME -c ADDRESS:PORT (-k KEYFILE | -I) [-g GID] [-m DIR] [-v]\n"
+            "  -k KEYFILE       shared key with the agent (at least 16 bytes, mode 600)\n"
+            "  -I               no authentication (only against an agent that was also started with -I)\n"
             "  -n NAME          the peer appears as DIR/NAME\n"
             "  -c ADDRESS:PORT  the peer's crossnode-agent\n"
             "  -g GID           members of this group may use DIR/NAME too (default: root only)\n"
@@ -1037,19 +1118,36 @@ int main(int argc, char **argv)
 {
     const char *mountdir = "/net";
     char *target = NULL;
+    const char *keyfile = NULL;
+    int insecure = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "n:c:g:m:v")) != -1) {
+    while ((opt = getopt(argc, argv, "n:c:g:m:vk:I")) != -1) {
         switch (opt) {
         case 'n': name = optarg; break;
         case 'c': target = optarg; break;
         case 'g': allowed_gid = (gid_t)atoi(optarg); break;
         case 'm': mountdir = optarg; break;
         case 'v': verbose = 1; break;
+        case 'k': keyfile = optarg; break;
+        case 'I': insecure = 1; break;
         default: usage();
         }
     }
     if (name == NULL || target == NULL || strchr(name, '/') != NULL || name[0] == '\0')
         usage();
+    if ((keyfile == NULL) == (insecure == 0)) {
+        fprintf(stderr, "crossnode-net: give either -k KEYFILE or -I (no authentication), not both and not neither\n");
+        return 2;
+    }
+    if (keyfile != NULL) {
+        char err[256];
+        int n = cn_load_key(keyfile, G.key, err, sizeof err);
+        if (n < 0) {
+            fprintf(stderr, "crossnode-net: %s\n", err);
+            return 2;
+        }
+        G.keylen = (size_t)n;
+    }
     char *colon = strrchr(target, ':');
     if (colon == NULL)
         usage();
@@ -1128,8 +1226,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "crossnode-net: cannot start the I/O thread\n");
         return 1;
     }
-    printf("crossnode-net: %s -> %s:%d (liveness %d ms, connect %d ms)\n", path, target,
-           ntohs(G.peer.sin_port), CN_DEAD_MS, CN_CONNECT_MS);
+    printf("crossnode-net: %s -> %s:%d (liveness %d ms, connect %d ms, %s)\n", path, target,
+           ntohs(G.peer.sin_port), CN_DEAD_MS, CN_CONNECT_MS, G.keylen ? "authenticated" : "NO AUTHENTICATION: -I");
     fflush(stdout);
 
     dispatch_context_t *ctp = dispatch_context_alloc(dpp);

@@ -13,10 +13,10 @@ all: $(BINS)
 $(OUT):
 	mkdir -p $@
 
-$(OUT)/crossnode-net: src/cn_net.c src/cn_proto.h | $(OUT)
+$(OUT)/crossnode-net: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ src/cn_net.c -lsocket
 
-$(OUT)/crossnode-agent: src/cn_agent.c src/cn_proto.h | $(OUT)
+$(OUT)/crossnode-agent: src/cn_agent.c src/cn_proto.h src/cn_auth.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ src/cn_agent.c -lsocket
 
 $(OUT)/hellodev: tools/hellodev.c tools/hello_dcmd.h | $(OUT)

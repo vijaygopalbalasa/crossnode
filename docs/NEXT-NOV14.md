@@ -56,9 +56,11 @@ Dates: items 2 and 3 by Nov 20, items 4 and 5 by Nov 25, item 6 by Dec 1, item 7
 
 - stat follows links, so `ls -l` shows a link inside a share as the file it points to, and a link that leaves
   the share shows as refused (question marks). Plain `ls -l` in the fixture directory shows exactly that.
-- The stat answer is read by name, not through a descriptor (opening a device only to stat it would run its
-  open handler). The agent resolves the name, reads the attributes, and resolves again; a path component
-  swapped between the two looks is not caught if it is swapped back in time.
+- Stat of a regular file or a directory goes through a checked descriptor (opened with O_NOFOLLOW, checked
+  with iofdinfo against the share and against the resolved name's device and inode, then fstat'ed), so a path
+  swapped after the resolve is refused. A device or FIFO is not opened, because that would run its open handler,
+  so it is looked at by name before and after a second resolve; that narrows a path swap but does not rule it
+  out (commit efe5fc1).
 - A directory handle is the second of two opens of the same directory, checked to be the same object by device
   and inode, because `iofdinfo()` could not check a descriptor opened with `O_DIRECTORY` (observed: ENOSYS) and
   `fdopendir()` needs one (observed: ENOTDIR otherwise).

@@ -27,6 +27,7 @@ What does not work yet is listed too.
 | A stock QNX tool through `/net` gives byte-identical output | `stty -a` on a remote serial port |
 | 200 KB each way across the link, byte-exact | `cksum` both sides |
 | A read that waits on a live peer keeps waiting, while other callers are served | `cat /net/nodey/dev/ser1` for 10 s |
+| Both ends must prove they hold a shared key (HMAC-SHA256 challenge, no key on the wire) before anything is served; no key, wrong key, or an agent that cannot prove it are refused | checks 22a to 22f, `test/auth-vectors.c` (RFC 4231 vectors) |
 | A peer that dies or goes silent fails every waiting call with `EHOSTDOWN` within the 2 s liveness limit | QEMU of the peer killed (power cut) or stopped (frozen) |
 | A signal (Ctrl-C) to a waiting caller returns `EINTR` at once, and the work on the peer is stopped | `cnprobe eintr`, `eintr-open` |
 | `close` and process exit never wait on the peer | timed in the suites |
@@ -37,7 +38,7 @@ What does not work yet is listed too.
 | A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | checks 21a, 21e |
 | Replies that break the protocol never reach a program | `test/fake-agent.py`, a deliberately broken agent |
 
-Evidence: `evidence/gate1-loopback-*.txt` (58 checks, one machine over loopback) and
+Evidence: `evidence/gate1-loopback-*.txt` (64 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
 ran on. The times in them are behaviour bounds on emulated machines, not performance figures.
 
@@ -48,7 +49,7 @@ ran on. The times in them are behaviour bounds on emulated machines, not perform
 - No `mmap`, shared memory, or server-to-client events (`select`, `ionotify`).
 - Programs that find a server by name (`name_open`) rather than by path are not covered.
 - One peer per `crossnode-net` process.
-- No peer authentication yet: bind the agent to a private link address only.
+- Authentication proves both ends hold a shared key; the traffic after it is not encrypted or integrity-protected, so use a protected link.
 - Built and tested for x86_64 under QEMU. The base SDP has no QEMU startup for aarch64, so a mixed pair is not shown.
 
 ## Requirements
@@ -72,17 +73,17 @@ On the machine that shares (here nodey, link address 10.9.0.2):
 
 ```
 ./hellodev &                                                     # optional test device at /dev/hello
-./crossnode-agent -e /dev/hello -e /dev/ser1 -l 10.9.0.2 -p 7777 &
+./crossnode-agent -k /etc/crossnode.key -e /dev/hello -e /dev/ser1 -l 10.9.0.2 -p 7777 &
 ```
 
 On the machine that uses it (here nodex):
 
 ```
-./crossnode-net -n nodey -c 10.9.0.2:7777 -g 1000 &              # nodey appears as /net/nodey
+./crossnode-net -k /etc/crossnode.key -n nodey -c 10.9.0.2:7777 -g 1000 &              # nodey appears as /net/nodey
 cat /net/nodey/dev/hello
 ```
 
-`crossnode-agent -e PATH` shares PATH and everything under it; `-l` and `-p` choose the listening address and
+Both programs need `-k KEYFILE` (the same 16 or more random bytes on both machines, mode 600, for example `head -c 32 /dev/urandom > /etc/crossnode.key`) or, for a throwaway test, `-I` (no authentication, on both). `crossnode-agent -e PATH` shares PATH and everything under it; `-l` and `-p` choose the listening address and
 port. `crossnode-net -n NAME -c ADDRESS:PORT` mounts the peer at `/net/NAME`; `-g GID` lets that group use it
 besides root; `-m DIR` changes `/net`.
 
@@ -114,7 +115,7 @@ Wire format: `src/cn_proto.h` (a 28-byte header and a payload; both ends little-
 
 ```
 test/twonode-up.sh IMAGES_DIR             # boot nodex and nodey in QEMU with a direct link
-test/gate1-loopback.sh 2222               # 58 checks on one machine
+test/gate1-loopback.sh 2222               # 64 checks on one machine
 test/gate1-twonode.sh IMAGES_DIR          # 19 checks across the two machines
 ```
 

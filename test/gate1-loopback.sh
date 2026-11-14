@@ -33,12 +33,12 @@ le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }    # le VALUE LIMIT, false if VALUE i
 
 # Refuse to produce evidence from a stale build: each binary must be newer than its own sources.
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
-if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
+if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
    || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 
-AGENT='cd /tmp/cn && (./crossnode-agent -v -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 127.0.0.1 -p 7777 >> agent.log 2>&1 &)'
+AGENT='cd /tmp/cn && (./crossnode-agent -v -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 127.0.0.1 -p 7777 >> agent.log 2>&1 &)'
 P=/net/self/dev/hello
 
 echo "== Crossnode gate 1, loopback, $STAMP"
@@ -51,9 +51,10 @@ q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir
 for f in hellodev crossnode-agent crossnode-net cnprobe; do
     q "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
 done
+q 'umask 077; rm -f /tmp/cn/key /tmp/cn/key2; head -c 32 /dev/urandom > /tmp/cn/key; head -c 32 /dev/urandom > /tmp/cn/key2; ls -l /tmp/cn/key | cut -c1-10'
 q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape && ln -s /etc/no-such-file /tmp/cnx/probe'
 # Root, plus group 1000 (qnxuser), may use /net/self.
-q 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 > net.log 2>&1 &)'
+q 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 > net.log 2>&1 &)'
 q "$AGENT"
 sleep 1
 
@@ -220,7 +221,7 @@ le "$IM" $SLACK_MS
 check "16c Ctrl-C on the waiting reader returns at once" $? "${IM} ms"
 [ -n "$WT" ] && [ "$WT" -gt "$N0" ] && [ "$AT" = "$N0" ]
 check "16d the agent's blocked worker ends when the caller gives up" $? "threads $N0 -> $WT -> $AT"
-O=$(q "cd /tmp/cn; for i in 1 2 3 4; do cat /net/self/dev/ser1 > /dev/null 2>&1 & sleep 1; slay -f -s KILL crossnode-net; (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &); sleep 1; done; ./cnprobe get $P; echo threads_after_cycles=\$(pidin -P crossnode-agent | wc -l)")
+O=$(q "cd /tmp/cn; for i in 1 2 3 4; do cat /net/self/dev/ser1 > /dev/null 2>&1 & sleep 1; slay -f -s KILL crossnode-net; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &); sleep 1; done; ./cnprobe get $P; echo threads_after_cycles=\$(pidin -P crossnode-agent | wc -l)")
 echo "$O" | sed 's/^/  /'
 [ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ] && [ "$(field threads_after_cycles "$O" | tr -d ' ')" = "$N0" ]
 check "16e four client restarts during blocked reads leave no stuck worker or connection" $? "$(echo "$O" | tail -1 | tr -d ' ')"
@@ -237,7 +238,7 @@ echo "== 18. Replies that break the protocol are refused"
 python3 "$ROOT/test/fake-agent.py" 7799 > "$ROOT/evidence/.fake-agent.log" 2>&1 &
 FAKE=$!
 sleep 1
-q 'cd /tmp/cn && (./crossnode-net -v -n evil -c 10.0.2.2:7799 > evil.log 2>&1 &)'
+q 'cd /tmp/cn && (./crossnode-net -v -I -n evil -c 10.0.2.2:7799 > evil.log 2>&1 &)'
 sleep 1
 O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x; sleep 1.2; ./cnprobe stat /net/evil/x; sleep 1.2; ./cnprobe ls /net/evil/dir")
 kill $FAKE 2>/dev/null
@@ -258,7 +259,7 @@ check "18d a directory entry whose name contains a slash never reaches the progr
 
 echo
 echo "== 19. stat() and fstat() answer from the peer, through the same containment as open"
-q "cd /tmp/cn; $AGENT; (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
+q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 q 'rm -rf /tmp/cnx/d /tmp/cnx/many; mkdir /tmp/cnx/d /tmp/cnx/many; echo aaa > /tmp/cnx/d/a; echo bbbbbb > /tmp/cnx/d/b; : > /tmp/cnx/d/c; i=0; while [ $i -lt 300 ]; do : > /tmp/cnx/many/f$i; i=$((i + 1)); done; echo fixtures-ready'
 same_fields() { for k in mode size uid gid nlink mtime; do [ "$(field $k "$1")" = "$(field $k "$2")" ] || return 1; done; [ -n "$(field mode "$1")" ]; }
 L=$(q 'cd /tmp/cn; ./cnprobe stat /tmp/cnx/d/b'); R=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/tmp/cnx/d/b')
@@ -355,6 +356,36 @@ O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; i=0; while [ \$i -lt 400 ]; do .
 echo "$O" | sed 's/^/  /'
 echo "$O" | grep -q 'op=fstat rc=EOK'
 check "21d 400 stats in a row leave the service working" $? "$(echo "$O" | head -1)"
+
+echo
+echo "== 22. Peer authentication"
+q "cd /tmp/cn; $AGENT"; sleep 1
+O=$(q 'cd /tmp/cn; ./cnprobe rawping 127.0.0.1 7777')
+echo "  $O"
+[ "$(field ping_reply "$O")" = no ] && [ "$(field closed "$O")" = yes ]
+check "22a a client that skips the handshake gets no answer and is hung up on" $? "$O"
+q 'cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key2 -n wrongkey -c 127.0.0.1:7777 > wk.log 2>&1 &) ; (./crossnode-net -v -I -n nokey -c 127.0.0.1:7777 > nk.log 2>&1 &); i=0; while [ $i -lt 20 ] && ! ls -d /net/wrongkey /net/nokey >/dev/null 2>&1; do sleep 0.5; i=$((i + 1)); done; true'
+O=$(q 'cd /tmp/cn; ./cnprobe open /net/wrongkey/dev/hello; ./cnprobe open /net/nokey/dev/hello; cat wk.log nk.log | grep -c "authentication"')
+echo "$O" | sed 's/^/  /'
+R1=$(echo "$O" | sed -n 1p); R2=$(echo "$O" | sed -n 2p)
+[ "$(field rc "$R1")" = EHOSTDOWN ] && le "$(field ms "$R1")" $((CONNECT_MS + SLACK_MS))
+check "22b a client with the wrong key is refused with EHOSTDOWN" $? "$R1"
+[ "$(field rc "$R2")" = EHOSTDOWN ] && le "$(field ms "$R2")" $((CONNECT_MS + SLACK_MS))
+check "22c a client with no key is refused with EHOSTDOWN" $? "$R2"
+[ "$(echo "$O" | tail -1)" -ge 2 ]
+check "22d each refusal is logged on the refusing side as an authentication failure" $? "$(echo "$O" | tail -1) lines"
+q 'cd /tmp/cn; (./crossnode-agent -v -I -e /dev/hello -l 127.0.0.1 -p 7780 > agent2.log 2>&1 &); (./crossnode-net -v -k /tmp/cn/key -n openagent -c 127.0.0.1:7780 > oa.log 2>&1 &); i=0; while [ $i -lt 20 ] && ! ls -d /net/openagent >/dev/null 2>&1; do sleep 0.5; i=$((i + 1)); done; true'
+O=$(q 'cd /tmp/cn; ./cnprobe open /net/openagent/dev/hello; slay -f -s KILL crossnode-net >/dev/null 2>&1; true')
+echo "  $O"
+[ "$(field rc "$O")" = EHOSTDOWN ] && le "$(field ms "$O")" $((CONNECT_MS + SLACK_MS))
+check "22e a keyed client refuses an agent that does not prove it holds the key" $? "$O"
+q 'chmod 644 /tmp/cn/key2'
+O=$(q 'cd /tmp/cn; ./crossnode-agent -k /tmp/cn/key2 -e /dev/hello -p 7781 2>&1; echo rc=$?; ./crossnode-agent -e /dev/hello -p 7781 2>&1; echo rc=$?')
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q 'readable by others' && [ "$(echo "$O" | grep -c 'rc=0')" = 0 ] && echo "$O" | grep -q 'no -k KEYFILE'
+check "22f a key file others can read is refused, and so is starting with neither a key nor -I" $? "$(echo "$O" | head -1)"
+q 'slay -f -s KILL crossnode-agent crossnode-net >/dev/null 2>&1; sleep 1; true'
+q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 
 echo
 echo "== crossnode-net log"
