@@ -537,17 +537,45 @@ static void do_stat(struct job *j)
     if (virt) {
         stat_virtual(&out, path + 1);
     } else {
-        /* The attributes are read by name, not through a descriptor (opening a device only to stat it
-         * would run its open handler), so look again afterwards: the name must still resolve to the
-         * same place. A component swapped in between is caught only if it is still swapped. */
-        char again[PATH_MAX];
-        if (stat(real, &st) != 0) {
+        /* Regular files and directories cannot have side effects when opened, so they are stat'ed through a
+         * descriptor that is checked the way do_open checks one (iofdinfo inside the share, same device and
+         * inode as the resolved name). Anything else (a device, a FIFO) is not opened, because that would run
+         * its open handler: it is looked at by name before and after a second resolve, which narrows a
+         * path swap but cannot rule it out. */
+        struct stat pre;
+        if (lstat(real, &pre) != 0) {
             send_reply(j->c, h, errno, 0, NULL, 0);
             return;
         }
-        if (realpath(path, again) == NULL || strcmp(again, real) != 0) {
-            send_reply(j->c, h, EACCES, 0, NULL, 0);
-            return;
+        if (S_ISREG(pre.st_mode) || S_ISDIR(pre.st_mode)) {
+            int fd = open(real, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_NOFOLLOW);
+            if (fd < 0) {
+                send_reply(j->c, h, errno, 0, NULL, 0);
+                return;
+            }
+            char got[PATH_MAX];
+            struct _fdinfo fi;
+            got[0] = '\0';
+            int gl = iofdinfo(fd, 0, &fi, got, (int)sizeof got);
+            got[sizeof got - 1] = '\0';
+            size_t gn = strlen(got);
+            if (gn > 1 && got[gn - 1] == '/')
+                got[gn - 1] = '\0';
+            if (gl < 0 || got[0] != '/' || !path_allowed(got + 1, rexports) || fstat(fd, &st) != 0 ||
+                st.st_dev != pre.st_dev || st.st_ino != pre.st_ino) {
+                vlog("refused stat of %s (the descriptor points elsewhere)\n", real);
+                close(fd);
+                send_reply(j->c, h, EACCES, 0, NULL, 0);
+                return;
+            }
+            close(fd);
+        } else {
+            char again[PATH_MAX];
+            if (realpath(path, again) == NULL || strcmp(again, real) != 0 || lstat(real, &st) != 0 ||
+                st.st_dev != pre.st_dev || st.st_ino != pre.st_ino) {
+                send_reply(j->c, h, EACCES, 0, NULL, 0);
+                return;
+            }
         }
         stat_from_native(&out, &st);
     }
