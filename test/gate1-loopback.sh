@@ -239,7 +239,7 @@ FAKE=$!
 sleep 1
 q 'cd /tmp/cn && (./crossnode-net -v -n evil -c 10.0.2.2:7799 > evil.log 2>&1 &)'
 sleep 1
-O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x")
+O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x; sleep 1.2; ./cnprobe stat /net/evil/x; sleep 1.2; ./cnprobe ls /net/evil/dir")
 kill $FAKE 2>/dev/null
 echo "$O" | sed 's/^/  /'
 echo "  fake agent:"; sed 's/^/    /' "$ROOT/evidence/.fake-agent.log"; rm -f "$ROOT/evidence/.fake-agent.log"
@@ -250,6 +250,111 @@ R1=$(echo "$O" | grep op=readn); R2=$(echo "$O" | grep op=get)
 check "18a an oversized read reply never reaches the program" $? "$R1"
 [ "$(field rc "$R2")" = EHOSTDOWN ]
 check "18b a reply with the wrong operation is refused" $? "$R2"
+R3=$(echo "$O" | grep 'op=stat'); R4=$(echo "$O" | grep 'op=ls')
+[ "$(field rc "$R3")" = EHOSTDOWN ] && [ "$(echo "$EV" | grep -c 'did not match')" -ge 4 ]
+check "18c a stat reply with an impossible file type never reaches the program" $? "$R3"
+[ "$(field rc "$R4")" = EHOSTDOWN ] && [ "$(echo "$O" | grep -c '^ent=')" = 0 ]
+check "18d a directory entry whose name contains a slash never reaches the program" $? "$R4"
+
+echo
+echo "== 19. stat() and fstat() answer from the peer, through the same containment as open"
+q "cd /tmp/cn; $AGENT; (./crossnode-net -v -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
+q 'rm -rf /tmp/cnx/d /tmp/cnx/many; mkdir /tmp/cnx/d /tmp/cnx/many; echo aaa > /tmp/cnx/d/a; echo bbbbbb > /tmp/cnx/d/b; : > /tmp/cnx/d/c; i=0; while [ $i -lt 300 ]; do : > /tmp/cnx/many/f$i; i=$((i + 1)); done; echo fixtures-ready'
+same_fields() { for k in mode size uid gid nlink mtime; do [ "$(field $k "$1")" = "$(field $k "$2")" ] || return 1; done; [ -n "$(field mode "$1")" ]; }
+L=$(q 'cd /tmp/cn; ./cnprobe stat /tmp/cnx/d/b'); R=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/tmp/cnx/d/b')
+echo "  local:  $L"; echo "  remote: $R"
+same_fields "$L" "$R"
+check "19a stat of a file through /net matches the file's own stat (mode size uid gid nlink mtime)" $? "$R"
+L=$(q 'cd /tmp/cn; ./cnprobe stat /dev/hello'); R=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/dev/hello')
+echo "  local:  $L"; echo "  remote: $R"
+same_fields "$L" "$R"
+check "19b stat of the remote device matches the device's own stat" $? "$R"
+L=$(q 'cd /tmp/cn; ./cnprobe fstat /tmp/cnx/d/b'); R=$(q 'cd /tmp/cn; ./cnprobe fstat /net/self/tmp/cnx/d/b')
+echo "  local:  $L"; echo "  remote: $R"
+same_fields "$L" "$R"
+check "19c fstat on an open /net descriptor matches" $? "$R"
+L=$(q 'cd /tmp/cn; ./cnprobe stat /tmp/cnx/d'); R=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/tmp/cnx/d')
+echo "  local:  $L"; echo "  remote: $R"
+same_fields "$L" "$R"
+check "19d stat of a directory inside the share matches" $? "$R"
+V=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/dev; ./cnprobe stat /net/self/tmp')
+echo "$V" | sed 's/^/  virtual: /'
+[ "$(echo "$V" | wc -l | tr -d ' ')" = 2 ] && ! echo "$V" | grep -v 'mode=40[0-7]*[0-7] ' | grep -q 'mode='
+check "19e a directory above a share is a read-only directory (mode 040xxx, no write bits)" $? "$(echo "$V" | head -1 | cut -d' ' -f1-3)"
+echo "$V" | cut -d' ' -f3 | grep -q 'mode=40[0-7][0-5][0-5]'
+check "19e2 and it grants no write permission" $? "$(echo "$V" | head -1 | cut -d' ' -f3)"
+for t in etc/passwd tmp/cnx/escape tmp/cnx/probe; do
+    O=$(q "cd /tmp/cn; ./cnprobe stat /net/self/$t")
+    [ "$(field rc "$O")" = EACCES ]
+    check "19f stat of /net/self/$t is refused" $? "$O"
+done
+O=$(q 'cd /tmp/cn; ./cnprobe stat /net/self/tmp/cnx/missing')
+[ "$(field rc "$O")" = ENOENT ]
+check "19g stat of a missing name inside the share says ENOENT" $? "$O"
+M=$(q 'cd /tmp/cn; ./cnprobe stat /net/self')
+echo "  mount root: $M"
+[ "$(field mode "$M")" = 40750 ]
+check "19h the mount root's own stat stays local and shows the access policy (group allowed: 40750)" $? "$M"
+
+echo
+echo "== 20. Directory listing"
+lst() { echo "$1" | sed -n 's/^ent=//p' | sort | tr '\n' ' '; }
+O=$(q 'cd /tmp/cn; ./cnprobe ls /net/self')
+echo "  /net/self: $(lst "$O")"
+[ "$(lst "$O")" = ". .. dev tmp " ]
+check "20a the mount root lists only the top of the share list" $? "$(lst "$O")"
+O=$(q 'cd /tmp/cn; ./cnprobe ls /net/self/dev')
+echo "  /net/self/dev: $(lst "$O")"
+[ "$(lst "$O")" = ". .. hello ser1 " ]
+check "20b a directory above shares lists exactly the shared names, not the other devices" $? "$(lst "$O")"
+L=$(q 'cd /tmp/cn; ./cnprobe ls /tmp/cnx/many'); R=$(q 'cd /tmp/cn; ./cnprobe ls /net/self/tmp/cnx/many')
+[ "$(lst "$L")" = "$(lst "$R")" ] && [ "$(echo "$R" | grep -c '^ent=')" = 302 ]
+check "20c a 300-entry directory lists completely through /net (several reads)" $? "$(echo "$R" | tail -1)"
+O=$(q 'cd /tmp/cn; ./cnprobe lsr /net/self/tmp/cnx/many | grep "^op="')
+echo "$O" | sed 's/^/  /'
+[ "$(field n "$(echo "$O" | sed -n 1p)")" = 302 ] && [ "$(field n "$(echo "$O" | sed -n 2p)")" = 302 ]
+check "20d rewinddir lists the directory again" $? "$(echo "$O" | tr '\n' ' ' | cut -c1-120)"
+O=$(q 'cd /tmp/cn; ./cnprobe ls /net/self/etc')
+[ "$(field rc "$O")" = EACCES ]
+check "20e listing a directory outside the share is refused" $? "$O"
+L=$(q 'ls -l /tmp/cnx/d | sed 1d'); R=$(q 'ls -l /net/self/tmp/cnx/d | sed 1d')
+echo "$R" | sed 's/^/  ls -l: /'
+[ -n "$R" ] && [ "$L" = "$R" ]
+check "20f the stock 'ls -l' prints the same through /net as locally" $? "$(echo "$R" | wc -l | tr -d ' ') lines"
+R=$(q 'ls /net/self/dev; ls /net/self' | tr '\n' ' ')
+echo "  ls: $R"
+[ "$R" = "hello ser1 dev tmp " ]
+check "20g the stock 'ls' shows the shared devices and the top of the share list" $? "$R"
+O=$(q 'ls -l /net/self/tmp/cnx 2>&1')
+echo "$O" | sed 's/^/  ls -l: /'
+echo "$O" | grep -q ' ok$' && [ "$(echo "$O" | grep -E -c '^-\?+ .* (escape|probe)$')" = 2 ]
+check "20h 'ls -l' on the fixture directory lists the plain files and shows the two links that leave the share as refused (all question marks)" $? "$(echo "$O" | grep -E -c '^-\?+ .* (escape|probe)$') refused rows"
+
+echo
+echo "== 21. A waiting stat blocks nobody else"
+q "$AGENT"; sleep 1
+O=$(q "cd /tmp/cn; ./cnprobe eintr $P 300 1500 > e21.txt 2>&1 & W=\$!; sleep 0.8; slay -s STOP crossnode-agent; ./cnprobe stat /net/self/tmp/cnx/d/b > st21.txt 2>&1 & ST=\$!; wait \$W; wait \$ST; slay -s CONT crossnode-agent; cat e21.txt st21.txt")
+echo "$O" | sed 's/^/  /'
+E=$(echo "$O" | grep get-with-signal); S=$(echo "$O" | grep 'op=stat')
+[ "$(field rc "$E")" = EINTR ] && le "$(field ms "$E")" $((300 + SLACK_MS))
+check "21a while a stat waits on a frozen peer, another caller still gets EINTR on time" $? "$E"
+[ "$(field rc "$S")" = EHOSTDOWN ] && le "$(field ms "$S")" $((DEAD_MS + SLACK_MS + 1000))
+check "21b the waiting stat itself fails with EHOSTDOWN within the liveness limit" $? "$S"
+q "$AGENT" >/dev/null; sleep 2
+O=$(q "cd /tmp/cn; for i in 1 2 3 4 5 6; do ./cnprobe get $P >/dev/null; slay -s STOP crossnode-agent; ./cnprobe eintr-stat /net/self/tmp/cnx/d/b 100 | cut -d' ' -f2; slay -s CONT crossnode-agent; done | sort | uniq -c; sleep 1; ./cnprobe stat /net/self/tmp/cnx/d/b | cut -d' ' -f1-2; grep -c 'unbind after' net.log; true")
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q '6 rc=EINTR' && echo "$O" | grep -q 'op=stat rc=EOK' && [ "$(echo "$O" | tail -1)" = 0 ]
+check "21c six interrupted stats: all EINTR, no unbind error, the path still works" $? "$(echo "$O" | head -2 | tr '\n' ' ')"
+O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; slay -s STOP crossnode-agent; ./cnprobe eintr-stat /net/self/tmp/cnx/d/b 60000 > sa.txt 2>&1 & A=\$!; ./cnprobe eintr-stat /net/self/tmp/cnx/ok 300 > sb.txt 2>&1 & B=\$!; wait \$B; wait \$A; slay -s CONT crossnode-agent; echo A; cat sa.txt; echo B; cat sb.txt")
+echo "$O" | sed 's/^/  /'
+SA=$(echo "$O" | sed -n '/^A$/,/^B$/p' | grep op=); SB=$(echo "$O" | sed -n '/^B$/,$p' | grep op=)
+[ "$(field rc "$SB")" = EINTR ] && le "$(field ms "$SB")" $((300 + SLACK_MS)) && [ "$(field rc "$SA")" = EHOSTDOWN ]
+check "21e two stats wait together; a signal to one interrupts only that one, the other ends with EHOSTDOWN" $? "signalled: $SB / other: $SA"
+q "$AGENT" >/dev/null; sleep 2
+O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; i=0; while [ \$i -lt 400 ]; do ./cnprobe stat /net/self/tmp/cnx/d/b >/dev/null; i=\$((i + 1)); done; echo threads=\$(pidin -P crossnode-agent | wc -l); ./cnprobe fstat /net/self/tmp/cnx/d/b | cut -d' ' -f1-2")
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q 'op=fstat rc=EOK'
+check "21d 400 stats in a row leave the service working" $? "$(echo "$O" | head -1)"
 
 echo
 echo "== crossnode-net log"

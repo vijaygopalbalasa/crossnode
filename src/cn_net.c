@@ -13,12 +13,13 @@
  * Only root, or members of the group given with -g, may use /net/<name>. Replies from the peer are
  * checked against what was asked before any client sees them.
  *
- * Gate 1 limits, stated plainly: stat() answers from a placeholder, directory listing is not
- * forwarded yet, lseek, pread and pwrite answer ESPIPE or ENOSYS, there is one peer per process and
- * no authentication.
+ * stat() and fstat() are answered by the peer; a directory reads as dirent records built from the peer's
+ * entry list. Limits, stated plainly: lseek works only on directories (files answer ESPIPE), there is no
+ * pread or pwrite, one peer per process, and no authentication yet.
  */
 struct cn_ocb;
 #define IOFUNC_OCB_T struct cn_ocb
+#include <dirent.h>
 #include <sys/iofunc.h>
 #include <sys/dispatch.h>
 #include <sys/neutrino.h>
@@ -38,6 +39,7 @@ struct cn_ocb;
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,13 +51,18 @@ struct cn_ocb;
 #define CN_RETRY_MS    1000   /* after a failure, new calls fail at once for this long */
 #define NPEND           128   /* calls waiting on the peer at the same time */
 
-enum ocb_state { OCB_LOCAL = 0, OCB_OPENING, OCB_OPEN };
+/* OCB_LOCAL: answered here (the mount root's own attributes). OCB_STATPATH: a stat() by name, which
+ * arrives as a connect message combined with the stat and a close; the path waits for the stat. */
+enum ocb_state { OCB_LOCAL = 0, OCB_OPENING, OCB_OPEN, OCB_STATPATH };
 
 struct cn_ocb {
     iofunc_ocb_t hdr;         /* must be first */
     int state;
     int32_t rh;               /* the peer's handle, -1 if none */
     uint32_t gen;             /* connection generation the handle belongs to */
+    char *path;               /* OCB_STATPATH: the name to stat, relative to the share root */
+    int isdir;                /* the peer said the opened object is a directory */
+    uint32_t dpos;            /* directories: index of the next entry to hand out */
 };
 
 struct pend {
@@ -63,13 +70,19 @@ struct pend {
     int op;
     uint32_t seq;
     rcvid_t rcvid;
+    pid_t cpid;               /* the waiting caller's process, thread and connection: an unblock pulse names */
+    int ctid, cscoid;         /* a caller by an id that differs from rcvid inside a combined message (observed) */
     int err;
     int32_t val;
     uint32_t gen;
-    uint32_t req;             /* bytes asked for (READ, DEVCTL) or sent (WRITE) */
+    uint32_t req;             /* bytes asked for (READ, DEVCTL, READDIR) or sent (WRITE) */
+    uint16_t rflags;          /* flags of the reply */
+    uint32_t cookie;          /* READDIR: index of the first entry asked for */
+    uint32_t cap;             /* READDIR: bytes the caller's buffer holds */
+    io_stat_t sm;             /* STAT: the caller's stat message, which says in what format to answer */
     unsigned char *data;
     uint32_t dlen;
-    struct cn_ocb *ocb;       /* OPEN only: the OCB bound to the waiting client */
+    struct cn_ocb *ocb;       /* OPEN: the OCB bound to the waiting client; READDIR: the directory's OCB */
     struct _msg_info info;    /* OPEN only: that client's connection, to unbind on failure */
 };
 
@@ -130,6 +143,12 @@ static struct cn_ocb *ocb_new(void)
     return o;
 }
 
+static void ocb_destroy(struct cn_ocb *o)
+{
+    free(o->path);
+    free(o);
+}
+
 static IOFUNC_OCB_T *cn_ocb_calloc(resmgr_context_t *ctp, IOFUNC_ATTR_T *attr)
 {
     (void)ctp;
@@ -139,7 +158,7 @@ static IOFUNC_OCB_T *cn_ocb_calloc(resmgr_context_t *ctp, IOFUNC_ATTR_T *attr)
 
 static void cn_ocb_free(IOFUNC_OCB_T *ocb)
 {
-    free(ocb);
+    ocb_destroy(ocb);
 }
 
 /* ---- I/O thread side (all called with G.mtx held) ---------------------------------------------- */
@@ -230,19 +249,60 @@ static struct pend *find_seq_locked(uint32_t seq)
     return NULL;
 }
 
+static int stat_valid(const unsigned char *p)
+{
+    struct cn_stat st;
+    memcpy(&st, p, sizeof st);
+    switch (st.mode & S_IFMT) {
+    case S_IFREG: case S_IFDIR: case S_IFCHR: case S_IFBLK: case S_IFIFO: case S_IFLNK: case S_IFSOCK:
+        break;
+    default:
+        return 0;
+    }
+    return st.size < ((uint64_t)1 << 62);
+}
+
+/* Entries must be whole, in bounds, with a usable name, and add up to the count the header gives. */
+static int dents_valid(const unsigned char *p, uint32_t len, int32_t count)
+{
+    uint32_t off = 0;
+    int32_t n = 0;
+    while (off < len) {
+        struct cn_dent d;
+        if (len - off < sizeof d)
+            return 0;
+        memcpy(&d, p + off, sizeof d);
+        if (d.namelen == 0 || d.namelen > CN_MAX_NAME || d.reserved != 0)
+            return 0;
+        size_t sz = CN_DENT_SIZE(d.namelen);
+        if (len - off < sz)
+            return 0;
+        const unsigned char *name = p + off + sizeof d;
+        for (uint32_t i = 0; i < d.namelen; i++) {
+            if (name[i] == '\0' || name[i] == '/')
+                return 0;
+        }
+        off += (uint32_t)sz;
+        n++;
+    }
+    return off == len && n == count;
+}
+
 /* A reply must match its request: same operation, no more bytes than asked, a sane count. */
-static int reply_valid(const struct pend *e, const struct cn_hdr *h)
+static int reply_valid(const struct pend *e, const struct cn_hdr *h, const unsigned char *p)
 {
     if (h->op != (uint16_t)(e->op | CN_REPLY) || h->a < 0)
         return 0;
     if (h->a != 0)
         return h->len == 0;
     switch (e->op) {
-    case CN_OP_OPEN:   return h->len == 0 && h->b >= 0 && h->b < CN_MAX_HANDLES;
-    case CN_OP_READ:   return h->len <= e->req && h->b == (int32_t)h->len;
-    case CN_OP_WRITE:  return h->len == 0 && h->b >= 0 && (uint32_t)h->b <= e->req;
-    case CN_OP_DEVCTL: return h->len == 0 || h->len == e->req;
-    default:           return 0;
+    case CN_OP_OPEN:    return h->len == 0 && h->b >= 0 && h->b < CN_MAX_HANDLES && (h->flags & ~CN_F_DIR) == 0;
+    case CN_OP_READ:    return h->len <= e->req && h->b == (int32_t)h->len;
+    case CN_OP_WRITE:   return h->len == 0 && h->b >= 0 && (uint32_t)h->b <= e->req;
+    case CN_OP_DEVCTL:  return h->len == 0 || h->len == e->req;
+    case CN_OP_STAT:    return h->len == sizeof(struct cn_stat) && stat_valid(p);
+    case CN_OP_READDIR: return h->len <= e->req && h->b >= 0 && dents_valid(p, h->len, h->b);
+    default:            return 0;
     }
 }
 
@@ -259,7 +319,7 @@ static int handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
             queue_close_locked(h->b);
         return 0;
     }
-    if (!reply_valid(e, h))
+    if (!reply_valid(e, h, p))
         return -1;
     if (e->cancelled) {
         if (e->op == CN_OP_OPEN && h->a == 0)
@@ -270,6 +330,7 @@ static int handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
     }
     e->err = h->a;
     e->val = h->b;
+    e->rflags = h->flags;
     e->gen = G.gen;
     if (h->len) {
         e->data = malloc(h->len);
@@ -428,8 +489,14 @@ static void wake_io(void)
  * Queue one request. gen_ocb, when given, must belong to the live connection; open_ocb is the OCB
  * an OPEN binds. Returns _RESMGR_NOREPLY when the client now waits on the pending table, or an errno.
  */
+struct aux {
+    const io_stat_t *sm;      /* STAT: the caller's message */
+    uint32_t cap;             /* READDIR: the caller's buffer size */
+};
+
 static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct cn_ocb *open_ocb,
-                  int32_t handle, int32_t a, int32_t b, const void *payload, uint32_t plen, uint32_t req)
+                  int32_t handle, int32_t a, int32_t b, const void *payload, uint32_t plen, uint32_t req,
+                  const struct aux *x)
 {
     pthread_mutex_lock(&G.mtx);
     if (gen_ocb != NULL && gen_ocb->gen != G.gen) {
@@ -461,7 +528,16 @@ static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct 
     e->op = op;
     e->seq = ++G.seq;
     e->rcvid = ctp->rcvid;
+    e->cpid = ctp->info.pid;
+    e->ctid = ctp->info.tid;
+    e->cscoid = ctp->info.scoid;
     e->req = req;
+    e->cookie = (uint32_t)a;
+    if (x != NULL) {
+        e->cap = x->cap;
+        if (x->sm != NULL)
+            e->sm = *x->sm;
+    }
     if (open_ocb != NULL) {
         e->ocb = open_ocb;
         e->info = ctp->info;
@@ -486,11 +562,12 @@ static void drop_opening_ocb(resmgr_context_t *ctp, const struct _msg_info *info
     ctp->info = *info;
     if (resmgr_unbind(ctp) != 0)
         vlog("unbind after a failed open: %s\n", strerror(errno));
-    iofunc_attr_lock(&file_attr);
+    iofunc_attr_t *attr = ocb->hdr.attr;
+    iofunc_attr_lock(attr);
     (void)iofunc_ocb_detach(ctp, &ocb->hdr);
-    iofunc_attr_unlock(&file_attr);
+    iofunc_attr_unlock(attr);
     ctp->info = keep;
-    free(ocb);
+    ocb_destroy(ocb);
 }
 
 static void complete(resmgr_context_t *ctp, struct pend *e)
@@ -500,6 +577,7 @@ static void complete(resmgr_context_t *ctp, struct pend *e)
         if (e->err == EOK) {
             e->ocb->rh = e->val;
             e->ocb->gen = e->gen;
+            e->ocb->isdir = (e->rflags & CN_F_DIR) != 0;
             e->ocb->state = OCB_OPEN;
             MsgReply(e->rcvid, EOK, NULL, 0);
         } else {
@@ -532,6 +610,92 @@ static void complete(resmgr_context_t *ctp, struct pend *e)
         SETIOV(&iov[0], &r, sizeof r);
         SETIOV(&iov[1], e->data, e->dlen);
         MsgReplyv(e->rcvid, EOK, iov, e->dlen ? 2 : 1);
+        break;
+    }
+    case CN_OP_STAT: {
+        if (e->err != EOK) {
+            MsgError(e->rcvid, e->err);
+            break;
+        }
+        /* Let the library format the answer the way this caller asked (it knows the stat layouts); the
+         * attributes themselves are the peer's. */
+        struct cn_stat cs;
+        memcpy(&cs, e->data, sizeof cs);
+        iofunc_attr_t a;
+        iofunc_attr_init(&a, (mode_t)cs.mode, NULL, NULL);
+        a.mount = &cn_mount;
+        a.mode = (mode_t)cs.mode;
+        a.uid = (uid_t)cs.uid;
+        a.gid = (gid_t)cs.gid;
+        a.nlink = (nlink_t)cs.nlink;
+        a.rdev = (dev_t)cs.rdev;
+        a.nbytes = (off_t)cs.size;
+        a.inode = (ino_t)cs.ino;
+        a.atime = (time_t)cs.atime;
+        a.mtime = (time_t)cs.mtime;
+        a.ctime = (time_t)cs.ctime;
+        a.mtime_ns = a.atime_ns = a.ctime_ns = 0;
+        a.flags = 0;                    /* nothing is dirty: report the peer's times as they are */
+        iofunc_ocb_t fake;
+        memset(&fake, 0, sizeof fake);
+        fake.attr = &a;
+        /* The library formats the answer in the layout the caller asked for (it reads that from the saved
+         * request) and leaves the layout in the context's status, which is the reply status. It writes the
+         * context's iov array, so the context needs room for one. */
+        union {
+            resmgr_context_t c;
+            unsigned char room[sizeof(resmgr_context_t) + 2 * sizeof(iov_t)];
+        } sc;
+        memset(&sc, 0, sizeof sc);
+        memcpy(&sc, ctp, sizeof(resmgr_context_t));
+        int r = iofunc_stat_default(&sc.c, &e->sm, &fake);
+        if (r == _RESMGR_NPARTS(1))
+            MsgReplyv(e->rcvid, sc.c.status, sc.c.iov, 1);
+        else
+            MsgError(e->rcvid, r > 0 ? r : EIO);
+        break;
+    }
+    case CN_OP_READDIR: {
+        if (e->err != EOK) {
+            MsgError(e->rcvid, e->err);
+            break;
+        }
+        /* Turn the peer's neutral entries into this system's dirent records, as many as the caller's
+         * buffer holds; the rest are asked for again by the next read. */
+        unsigned char *buf = malloc(e->cap ? e->cap : 1);
+        if (buf == NULL) {
+            MsgError(e->rcvid, ENOMEM);
+            break;
+        }
+        size_t used = 0, off = 0;
+        uint32_t taken = 0;
+        while (off < e->dlen) {
+            struct cn_dent d;
+            memcpy(&d, e->data + off, sizeof d);
+            size_t reclen = dirent_calc_reclen((size_t)d.namelen + 1);
+            if (used + reclen > e->cap)
+                break;
+            struct dirent *de = (struct dirent *)(void *)(buf + used);
+            memset(de, 0, reclen);
+            de->d_ino = (ino_t)d.ino;
+            de->d_offset = (off_t)e->cookie + (off_t)taken + 1;
+            de->d_reclen = (int16_t)reclen;
+            de->d_namelen = (int16_t)d.namelen;
+            memcpy(de->d_name, e->data + off + sizeof d, d.namelen);
+            used += reclen;
+            off += CN_DENT_SIZE(d.namelen);
+            taken++;
+        }
+        if (e->val > 0 && taken == 0) {
+            MsgError(e->rcvid, EINVAL);     /* the first entry does not fit in the caller's buffer */
+        } else {
+            pthread_mutex_lock(&G.mtx);
+            if (e->ocb != NULL && e->ocb->dpos == e->cookie)
+                e->ocb->dpos += taken;
+            pthread_mutex_unlock(&G.mtx);
+            MsgReply(e->rcvid, (long)used, buf, used);
+        }
+        free(buf);
         break;
     }
     default:
@@ -577,16 +741,24 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
     struct pend *e = NULL;
     struct cn_ocb *ocb = NULL;
     struct _msg_info info;
+    rcvid_t reply_to = rcvid;
     int op = 0;
+    /* Inside a combined message (stat by name) the handler's rcvid is not the one an unblock pulse carries
+     * (observed), so a caller is also found by the process, thread and connection the pulse's info names
+     * (observed to be the caller's own). A thread has one call outstanding, so this is unambiguous. */
+    const struct _msg_info *who = &ctp->info;
     pthread_mutex_lock(&G.mtx);
     for (int i = 0; i < NPEND; i++) {
-        if (G.pend[i].used && !G.pend[i].cancelled && G.pend[i].rcvid == rcvid) {
-            e = &G.pend[i];
+        struct pend *p = &G.pend[i];
+        if (p->used && !p->cancelled && !p->done &&
+            (p->rcvid == rcvid || (p->cpid == who->pid && p->ctid == who->tid && p->cscoid == who->scoid))) {
+            e = p;
             break;
         }
     }
     if (e != NULL) {
         e->cancelled = 1;
+        reply_to = e->rcvid;            /* the id the caller is actually blocked on */
         op = e->op;
         ocb = e->ocb;
         e->ocb = NULL;
@@ -618,7 +790,7 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
             vlog("unbind after an interrupted open: %s\n", strerror(errno));
         ctp->info = keep;
     }
-    MsgError(rcvid, EINTR);
+    MsgError(reply_to, EINTR);
     wake_io();
 }
 
@@ -656,46 +828,81 @@ static int cn_open(resmgr_context_t *ctp, io_open_t *msg, iofunc_attr_t *handle,
 {
     (void)handle;
     const char *path = msg->connect.path;
-    if (path[0] == '\0')
-        return iofunc_open_default(ctp, msg, &dir_attr, extra);   /* /net/<name> itself */
+    int plain = msg->connect.subtype == _IO_CONNECT_OPEN;
+    /* The mount root's own attributes are answered here, so they show the access policy and work with
+     * the peer down; opening it to list it is forwarded like any other open. */
+    if (path[0] == '\0' && !plain)
+        return iofunc_open_default(ctp, msg, &dir_attr, extra);
+    if (plain || msg->connect.subtype == _IO_CONNECT_COMBINE || msg->connect.subtype == _IO_CONNECT_COMBINE_CLOSE) {
+        /* fall through */
+    } else {
+        return ENOSYS;                  /* unlink, rename, mknod, readlink, link: nothing is forwarded */
+    }
     int allowed = check_client(ctp, msg->connect.ioflag);
     if (allowed != EOK)
         return allowed;
+    size_t plen = strlen(path);
+    if (plen > CN_MAX_PATH)
+        return ENAMETOOLONG;
 
     struct cn_ocb *ocb = ocb_new();
     if (ocb == NULL)
         return ENOMEM;
-    if (msg->connect.subtype != _IO_CONNECT_OPEN) {
-        /* stat() and friends arrive combined with their open; gate 1 answers from a placeholder. */
-        iofunc_attr_lock(&file_attr);
+    if (!plain) {
+        /* stat() and friends arrive as this connect combined with the operation and a close. The OCB
+         * only remembers the name; the stat handler asks the peer. */
+        ocb->path = strdup(path);
+        if (ocb->path == NULL) {
+            ocb_destroy(ocb);
+            return ENOMEM;
+        }
+        ocb->state = OCB_STATPATH;
+            iofunc_attr_lock(&file_attr);
         int st = iofunc_ocb_attach(ctp, msg, &ocb->hdr, &file_attr, &iof);
         iofunc_attr_unlock(&file_attr);
         if (st != EOK)
-            free(ocb);
+            ocb_destroy(ocb);
         return st;
-    }
-    size_t plen = strlen(path);
-    if (plen > CN_MAX_PATH) {
-        free(ocb);
-        return ENAMETOOLONG;
     }
     unsigned io = msg->connect.ioflag;
     int rd = (io & _IO_FLAG_RD) != 0, wr = (io & _IO_FLAG_WR) != 0;
     int oflag = (rd && wr) ? O_RDWR : (wr ? O_WRONLY : O_RDONLY);
     oflag |= (int)(io & (O_APPEND | O_NONBLOCK));
+    /* opendir() asks for a directory: attach to the directory attribute so the library accepts it, and
+     * have the peer refuse with ENOTDIR if the object is not one. */
+    int want_dir = (io & O_DIRECTORY) != 0 || (msg->connect.eflag & _IO_CONNECT_EFLAG_DIR) != 0;
+    if (want_dir)
+        oflag |= CN_OFLAG_DIR;
+    iofunc_attr_t *attr = want_dir ? &dir_attr : &file_attr;
 
     ocb->state = OCB_OPENING;
-    iofunc_attr_lock(&file_attr);
-    int st = iofunc_ocb_attach(ctp, msg, &ocb->hdr, &file_attr, &iof);
-    iofunc_attr_unlock(&file_attr);
+    iofunc_attr_lock(attr);
+    int st = iofunc_ocb_attach(ctp, msg, &ocb->hdr, attr, &iof);
+    iofunc_attr_unlock(attr);
     if (st != EOK) {
-        free(ocb);
+        ocb_destroy(ocb);
         return st;
     }
-    st = submit(ctp, CN_OP_OPEN, NULL, ocb, -1, oflag, 0, path, (uint32_t)plen, 0);
+    st = submit(ctp, CN_OP_OPEN, NULL, ocb, -1, oflag, 0, path, (uint32_t)plen, 0, NULL);
     if (st != _RESMGR_NOREPLY)
         drop_opening_ocb(ctp, &ctp->info, ocb);
     return st;
+}
+
+/* stat() by name or fstat() on an open descriptor: the peer's attributes, through the peer's own checks. */
+static int cn_stat(resmgr_context_t *ctp, io_stat_t *msg, struct cn_ocb *ocb)
+{
+    struct aux x = { .sm = msg, .cap = 0 };
+    switch (ocb->state) {
+    case OCB_LOCAL:
+        return iofunc_stat_default(ctp, msg, &ocb->hdr);
+    case OCB_STATPATH:
+        return submit(ctp, CN_OP_STAT, NULL, NULL, -1, 0, 0, ocb->path, (uint32_t)strlen(ocb->path), 0, &x);
+    case OCB_OPEN:
+        return submit(ctp, CN_OP_STAT, ocb, NULL, ocb->rh, 0, 0, NULL, 0, 0, &x);
+    default:
+        return EBADF;
+    }
 }
 
 static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
@@ -703,14 +910,23 @@ static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
     int st = iofunc_read_verify(ctp, msg, &ocb->hdr, NULL);
     if (st != EOK)
         return st;
-    if ((msg->i.xtype & _IO_XTYPE_MASK) != _IO_XTYPE_NONE)
+    unsigned xt = msg->i.xtype & _IO_XTYPE_MASK;
+    if (xt != _IO_XTYPE_NONE && !(xt == _IO_XTYPE_READDIR && ocb->isdir))
         return ENOSYS;
     if (ocb->state != OCB_OPEN)
         return ocb->hdr.attr == &dir_attr ? ENOSYS : EBADF;
     uint64_t n = _IO_READ_GET_NBYTES(msg);
+    if (ocb->isdir) {
+        /* A directory reads as dirent records, built from the peer's entry list. */
+        struct aux x = { .cap = n > 32768 ? 32768 : (uint32_t)n };
+        uint32_t ask = x.cap > CN_MAX_DATA ? CN_MAX_DATA : x.cap;
+        if (ask == 0)
+            return EOK;
+        return submit(ctp, CN_OP_READDIR, ocb, ocb, ocb->rh, (int32_t)ocb->dpos, (int32_t)ask, NULL, 0, ask, &x);
+    }
     if (n > CN_MAX_DATA)
         n = CN_MAX_DATA;
-    return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0, (uint32_t)n);
+    return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0, (uint32_t)n, NULL);
 }
 
 static int cn_write(resmgr_context_t *ctp, io_write_t *msg, struct cn_ocb *ocb)
@@ -734,7 +950,7 @@ static int cn_write(resmgr_context_t *ctp, io_write_t *msg, struct cn_ocb *ocb)
         free(buf);
         return EFAULT;
     }
-    st = submit(ctp, CN_OP_WRITE, ocb, NULL, ocb->rh, 0, 0, buf, (uint32_t)n, (uint32_t)n);
+    st = submit(ctp, CN_OP_WRITE, ocb, NULL, ocb->rh, 0, 0, buf, (uint32_t)n, (uint32_t)n, NULL);
     free(buf);
     return st;
 }
@@ -762,36 +978,45 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
         }
         inlen = n;
     }
-    int st = submit(ctp, CN_OP_DEVCTL, ocb, NULL, ocb->rh, (int32_t)dcmd, (int32_t)n, in, inlen, n);
+    int st = submit(ctp, CN_OP_DEVCTL, ocb, NULL, ocb->rh, (int32_t)dcmd, (int32_t)n, in, inlen, n, NULL);
     free(in);
     return st;
 }
 
-/* Offsets live on the peer and are not forwarded yet: say so instead of moving a local copy. */
+/* Offsets live on the peer and are not forwarded: say so instead of moving a local copy. A directory is
+ * the exception, because its position is only an entry index that this side keeps (rewinddir, seekdir). */
 static int cn_lseek(resmgr_context_t *ctp, io_lseek_t *msg, struct cn_ocb *ocb)
 {
-    (void)ctp;
-    (void)msg;
-    (void)ocb;
-    return ESPIPE;
+    if (ocb->state != OCB_OPEN || !ocb->isdir)
+        return ESPIPE;
+    int64_t pos;
+    switch (msg->i.whence) {
+    case SEEK_SET: pos = (int64_t)msg->i.offset; break;
+    case SEEK_CUR: pos = (int64_t)ocb->dpos + (int64_t)msg->i.offset; break;
+    default:       return ESPIPE;
+    }
+    if (pos < 0 || pos > 0x7fffffff)
+        return EINVAL;
+    ocb->dpos = (uint32_t)pos;
+    msg->o = (uint64_t)pos;
+    return _RESMGR_PTR(ctp, &msg->o, sizeof msg->o);
 }
 
 static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *ocb)
 {
     pthread_mutex_lock(&G.mtx);
-    if (ocb->state == OCB_OPENING) {
-        for (int i = 0; i < NPEND; i++) {
-            struct pend *e = &G.pend[i];
-            if (e->used && e->ocb == ocb) {
-                e->ocb = NULL;
-                e->cancelled = 1;
-                if (e->done && e->err == EOK)
-                    queue_close_locked(e->val);
-            }
+    /* No pending call may keep a pointer to this OCB (an open it was waiting on, a directory read). */
+    for (int i = 0; i < NPEND; i++) {
+        struct pend *e = &G.pend[i];
+        if (e->used && e->ocb == ocb) {
+            e->ocb = NULL;
+            e->cancelled = 1;
+            if (e->op == CN_OP_OPEN && e->done && e->err == EOK)
+                queue_close_locked(e->val);
         }
-    } else if (ocb->state == OCB_OPEN && ocb->gen == G.gen && G.state == C_UP) {
-        queue_close_locked(ocb->rh);    /* fire and forget: close never waits on the peer */
     }
+    if (ocb->state == OCB_OPEN && ocb->gen == G.gen && G.state == C_UP)
+        queue_close_locked(ocb->rh);    /* fire and forget: close never waits on the peer */
     pthread_mutex_unlock(&G.mtx);
     wake_io();
     return iofunc_close_ocb_default(ctp, reserved, &ocb->hdr);
@@ -872,6 +1097,7 @@ int main(int argc, char **argv)
     iof.devctl = cn_devctl;
     iof.close_ocb = cn_close_ocb;
     iof.lseek = cn_lseek;
+    iof.stat = cn_stat;
     iof.unblock = io_unblock;
     /* One dispatch thread, so no attribute locking; this also keeps the library away from an OCB
      * that an unblock handler has just freed. Metadata changes are not forwarded yet. */

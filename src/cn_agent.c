@@ -20,10 +20,14 @@
  * redirect it to a file opened later. In-flight requests, connections, and connections per peer
  * address are capped, and every refusal is logged.
  *
- * Gate 1 limit, stated plainly: no peer authentication yet, so bind it to a private link address.
+ * stat and directory listing go through the same resolver as open (resolve()). A directory above a share
+ * (a proper ancestor of an export, or the root) is virtual: it lists only the way to the shares.
+ *
+ * Limit, stated plainly: no peer authentication yet, so bind it to a private link address.
  */
 #include <arpa/inet.h>
 #include <devctl.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -39,6 +43,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cn_proto.h"
@@ -74,6 +79,8 @@ struct conn {
     int jobs;
     int slot;                 /* index in the slot table */
     int fds[CN_MAX_HANDLES];
+    char *vpath[CN_MAX_HANDLES];   /* set when the handle is a virtual directory: its path in the share */
+    pthread_mutex_t dir_mtx;       /* one directory read at a time: a directory descriptor has one offset */
     struct jobslot js[MAX_JOBS];
     char peer[64];
 };
@@ -125,6 +132,7 @@ static void conn_put(struct conn *c)
         slot_used[c->slot] = 0;
         pthread_mutex_unlock(&conns_mtx);
         pthread_mutex_destroy(&c->mtx);
+        pthread_mutex_destroy(&c->dir_mtx);
         free(c);
     }
 }
@@ -190,11 +198,11 @@ static int write_full(int fd, const void *buf, size_t n)
     return 0;
 }
 
-static void send_reply(struct conn *c, const struct cn_hdr *req, int32_t err, int32_t val,
-                       const void *data, uint32_t len)
+static void send_reply_f(struct conn *c, const struct cn_hdr *req, int32_t err, int32_t val,
+                         const void *data, uint32_t len, uint16_t flags)
 {
     struct cn_hdr r = {
-        .magic = CN_MAGIC, .op = (uint16_t)(req->op | CN_REPLY), .flags = 0, .seq = req->seq,
+        .magic = CN_MAGIC, .op = (uint16_t)(req->op | CN_REPLY), .flags = flags, .seq = req->seq,
         .handle = req->handle, .a = err, .b = val, .len = len,
     };
     unsigned char *buf = malloc(sizeof r + len);
@@ -212,11 +220,15 @@ static void send_reply(struct conn *c, const struct cn_hdr *req, int32_t err, in
     free(buf);
 }
 
-/* A path is allowed when it has no empty, "." or ".." component and sits at or under an export. */
-static int path_allowed(const char *p, char **list)
+static void send_reply(struct conn *c, const struct cn_hdr *req, int32_t err, int32_t val,
+                       const void *data, uint32_t len)
 {
-    if (p[0] == '\0' || p[0] == '/')
-        return 0;
+    send_reply_f(c, req, err, val, data, len, 0);
+}
+
+/* No empty, "." or ".." component: the path cannot climb out of, or slip around, a share. */
+static int path_clean(const char *p)
+{
     for (const char *s = p; *s != '\0';) {
         const char *e = strchr(s, '/');
         size_t n = e ? (size_t)(e - s) : strlen(s);
@@ -226,6 +238,14 @@ static int path_allowed(const char *p, char **list)
         if (*s == '/')
             s++;
     }
+    return 1;
+}
+
+/* A path is allowed when it is clean and sits at or under an export. */
+static int path_allowed(const char *p, char **list)
+{
+    if (p[0] == '\0' || p[0] == '/' || !path_clean(p))
+        return 0;
     for (int i = 0; i < nexports; i++) {
         size_t n = strlen(list[i]);
         if (strncmp(p, list[i], n) == 0 && (p[n] == '\0' || p[n] == '/'))
@@ -234,36 +254,47 @@ static int path_allowed(const char *p, char **list)
     return 0;
 }
 
-/* A private duplicate of the handle's descriptor; the job closes it when done. */
-static int get_fd(struct conn *c, int32_t h)
+/* A virtual directory is the root, or a directory that only leads to shares: a proper ancestor of an
+ * export. It lists just the way to the shares, never what else lives beside them. */
+static int path_virtual(const char *p)
 {
-    int fd = -1;
-    pthread_mutex_lock(&c->mtx);
-    if (!c->dead && h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0)
-        fd = dup(c->fds[h]);
-    pthread_mutex_unlock(&c->mtx);
-    return fd;
+    if (p[0] == '\0')
+        return nexports > 0;
+    if (p[0] == '/' || !path_clean(p))
+        return 0;
+    size_t n = strlen(p);
+    for (int i = 0; i < nexports; i++) {
+        if (strncmp(exports[i], p, n) == 0 && exports[i][n] == '/')
+            return 1;
+    }
+    return 0;
 }
 
-static void do_open(struct job *j)
+/*
+ * The one place a request's path is resolved and contained, for open, stat and listing alike.
+ * Returns 0 and fills real (a resolved path inside a share), or sets *virt for a virtual directory,
+ * or returns the errno the caller must answer. Names outside every share answer EACCES.
+ */
+static int resolve(const unsigned char *rel, uint32_t len, char *path, char *real, int *virt)
 {
-    struct conn *c = j->c;
-    const struct cn_hdr *h = &j->h;
-    char path[CN_MAX_PATH + 2];
-    if (h->len == 0 || h->len > CN_MAX_PATH) {
-        send_reply(c, h, ENAMETOOLONG, -1, NULL, 0);
-        return;
-    }
+    *virt = 0;
+    if (len > CN_MAX_PATH)
+        return ENAMETOOLONG;
     path[0] = '/';
-    memcpy(path + 1, j->payload, h->len);
-    path[h->len + 1] = '\0';
-    if (strlen(path + 1) != h->len || !path_allowed(path + 1, exports)) {
+    if (len)
+        memcpy(path + 1, rel, len);
+    path[len + 1] = '\0';
+    if (strlen(path + 1) != len)
+        return EACCES;
+    if (!path_allowed(path + 1, exports)) {
+        if (path_virtual(path + 1)) {
+            *virt = 1;
+            return 0;
+        }
         vlog("refused %s\n", path);
-        send_reply(c, h, EACCES, -1, NULL, 0);
-        return;
+        return EACCES;
     }
     /* Resolve links first: the real target must still be inside an export. */
-    char real[PATH_MAX];
     if (realpath(path, real) == NULL) {
         /* ENOENT only when the name itself is absent from a directory inside the share; a link
          * that dangles may point anywhere, so it is refused like any other name outside. */
@@ -278,36 +309,117 @@ static void do_open(struct job *j)
             if (realpath(dir, rdir) != NULL && path_allowed(rdir + 1, rexports))
                 e = ENOENT;
         }
-        send_reply(c, h, e, -1, NULL, 0);
-        return;
+        return e;
     }
     if (!path_allowed(real + 1, rexports)) {
         vlog("refused %s (resolves to %s)\n", path, real);
-        send_reply(c, h, EACCES, -1, NULL, 0);
+        return EACCES;
+    }
+    return 0;
+}
+
+/* A private duplicate of the handle's descriptor; the job closes it when done. */
+static int get_fd(struct conn *c, int32_t h)
+{
+    int fd = -1;
+    pthread_mutex_lock(&c->mtx);
+    /* A virtual directory's descriptor is a placeholder: reading it would show the real "/". */
+    if (!c->dead && h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0 && c->vpath[h] == NULL)
+        fd = dup(c->fds[h]);
+    pthread_mutex_unlock(&c->mtx);
+    return fd;
+}
+
+/* Give back a handle slot's descriptor and virtual path; c->mtx held. */
+static void handle_release_locked(struct conn *c, int i)
+{
+    if (c->fds[i] >= 0)
+        close(c->fds[i]);
+    c->fds[i] = -1;
+    free(c->vpath[i]);
+    c->vpath[i] = NULL;
+}
+
+static void do_open(struct job *j)
+{
+    struct conn *c = j->c;
+    const struct cn_hdr *h = &j->h;
+    char path[CN_MAX_PATH + 2], real[PATH_MAX];
+    int virt;
+    int e = resolve(j->payload, h->len, path, real, &virt);
+    if (e != 0) {
+        send_reply(c, h, e, -1, NULL, 0);
         return;
     }
-    /* Only access mode, non-blocking and append travel; nothing is ever created or truncated. */
-    int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY | O_NOFOLLOW;
-    if (job_cancelled(j)) {
-        send_reply(c, h, EINTR, -1, NULL, 0);
-        return;
-    }
-    int fd = open(real, oflag);
-    if (fd < 0) {
-        send_reply(c, h, errno, -1, NULL, 0);
-        return;
-    }
-    /* Ask the descriptor what it actually opened; a component swapped after realpath() fails here. */
-    char got[PATH_MAX];
-    struct _fdinfo fi;
-    got[0] = '\0';
-    int gl = iofdinfo(fd, 0, &fi, got, (int)sizeof got);
-    got[sizeof got - 1] = '\0';
-    if (gl < 0 || got[0] != '/' || !path_allowed(got + 1, rexports)) {
-        vlog("refused %s (the descriptor %s)\n", real, gl < 0 ? "could not be checked" : "points elsewhere");
-        close(fd);
-        send_reply(c, h, EACCES, -1, NULL, 0);
-        return;
+    int fd, isdir = 0;
+    char *vp = NULL;
+    if (virt) {
+        /* A directory that only leads to shares: read-only, and nothing to open on the real file system. */
+        if ((h->a & O_ACCMODE) != O_RDONLY) {
+            send_reply(c, h, EACCES, -1, NULL, 0);
+            return;
+        }
+        vp = strdup(path + 1);
+        fd = open("/", O_RDONLY | O_NOCTTY);      /* only holds the handle slot */
+        isdir = 1;
+        if (vp == NULL || fd < 0) {
+            free(vp);
+            if (fd >= 0)
+                close(fd);
+            send_reply(c, h, ENOMEM, -1, NULL, 0);
+            return;
+        }
+    } else {
+        /* Only access mode, non-blocking and append travel; nothing is ever created or truncated. */
+        int oflag = (h->a & (O_ACCMODE | O_NONBLOCK | O_APPEND)) | O_NOCTTY | O_NOFOLLOW;
+        if (job_cancelled(j)) {
+            send_reply(c, h, EINTR, -1, NULL, 0);
+            return;
+        }
+        fd = open(real, oflag);
+        if (fd < 0) {
+            send_reply(c, h, errno, -1, NULL, 0);
+            return;
+        }
+        /* Ask the descriptor what it actually opened; a component swapped after realpath() fails here. */
+        char got[PATH_MAX];
+        struct _fdinfo fi;
+        got[0] = '\0';
+        int gl = iofdinfo(fd, 0, &fi, got, (int)sizeof got);
+        got[sizeof got - 1] = '\0';
+        size_t gn = strlen(got);
+        if (gn > 1 && got[gn - 1] == '/')
+            got[gn - 1] = '\0';           /* a directory is reported with a trailing slash */
+        if (gl < 0 || got[0] != '/' || !path_allowed(got + 1, rexports)) {
+            vlog("refused %s (the descriptor %s)\n", real, gl < 0 ? "could not be checked" : "points elsewhere");
+            close(fd);
+            send_reply(c, h, EACCES, -1, NULL, 0);
+            return;
+        }
+        struct stat st;
+        isdir = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
+        if ((h->a & CN_OFLAG_DIR) && !isdir) {
+            close(fd);
+            send_reply(c, h, ENOTDIR, -1, NULL, 0);
+            return;
+        }
+        if (isdir) {
+            /* iofdinfo() cannot check a descriptor opened with O_DIRECTORY (observed: ENOSYS), and
+             * fdopendir() needs one. So the checked descriptor stays a witness, and the one kept is a
+             * second open that must be the very same directory. */
+            int fd2 = open(real, (oflag & ~O_ACCMODE) | O_RDONLY | O_DIRECTORY);
+            struct stat s2;
+            if (fd2 < 0 || fstat(fd2, &s2) != 0 || s2.st_dev != st.st_dev || s2.st_ino != st.st_ino) {
+                int e2 = fd2 < 0 ? errno : EACCES;
+                if (fd2 >= 0)
+                    close(fd2);
+                close(fd);
+                send_reply(c, h, e2, -1, NULL, 0);
+                return;
+            }
+            close(fd);
+            fd = fd2;
+        }
     }
     int slot = -1;
     pthread_mutex_lock(&c->mtx);
@@ -315,6 +427,7 @@ static void do_open(struct job *j)
         for (int i = 0; i < CN_MAX_HANDLES; i++) {
             if (c->fds[i] < 0) {
                 c->fds[i] = fd;
+                c->vpath[i] = vp;
                 slot = i;
                 break;
             }
@@ -323,11 +436,239 @@ static void do_open(struct job *j)
     pthread_mutex_unlock(&c->mtx);
     if (slot < 0) {
         close(fd);
+        free(vp);
         send_reply(c, h, EMFILE, -1, NULL, 0);
         return;
     }
-    vlog("open %s -> handle %d\n", path, slot);
-    send_reply(c, h, 0, slot, NULL, 0);
+    vlog("open %s -> handle %d%s\n", path, slot, virt ? " (virtual directory)" : "");
+    send_reply_f(c, h, 0, slot, NULL, 0, isdir ? CN_F_DIR : 0);
+}
+
+static uint64_t path_ino(const char *p)       /* a stable made-up inode for a virtual directory */
+{
+    uint64_t x = 1469598103934665603ull;
+    for (; *p != '\0'; p++)
+        x = (x ^ (unsigned char)*p) * 1099511628211ull;
+    return x | 1u;
+}
+
+static time_t started_at;
+
+static void stat_from_native(struct cn_stat *o, const struct stat *st)
+{
+    memset(o, 0, sizeof *o);
+    o->ino = (uint64_t)st->st_ino;
+    o->size = st->st_size < 0 ? 0 : (uint64_t)st->st_size;
+    o->atime = (int64_t)st->st_atime;
+    o->mtime = (int64_t)st->st_mtime;
+    o->ctime = (int64_t)st->st_ctime;
+    o->mode = (uint32_t)st->st_mode;
+    o->uid = (uint32_t)st->st_uid;
+    o->gid = (uint32_t)st->st_gid;
+    o->nlink = (uint32_t)st->st_nlink;
+    o->rdev = (uint32_t)st->st_rdev;
+    o->blksize = (uint32_t)st->st_blksize;
+}
+
+static void stat_virtual(struct cn_stat *o, const char *vpath)
+{
+    memset(o, 0, sizeof *o);
+    o->ino = path_ino(vpath);
+    o->atime = o->mtime = o->ctime = (int64_t)started_at;
+    o->mode = S_IFDIR | 0555;               /* read-only, and nothing but the way to the shares */
+    o->nlink = 2;
+    o->blksize = 4096;
+}
+
+/* With c->mtx held: the descriptor and virtual path behind a handle. The caller owns both results. */
+static int get_handle(struct conn *c, int32_t h, int *fd, char **vp)
+{
+    *fd = -1;
+    *vp = NULL;
+    pthread_mutex_lock(&c->mtx);
+    int ok = !c->dead && h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0;
+    if (ok) {
+        *fd = dup(c->fds[h]);
+        if (c->vpath[h] != NULL)
+            *vp = strdup(c->vpath[h]);
+        if (*fd < 0 || (c->vpath[h] != NULL && *vp == NULL)) {
+            if (*fd >= 0)
+                close(*fd);
+            *fd = -1;
+            free(*vp);
+            *vp = NULL;
+            ok = 0;
+        }
+    }
+    pthread_mutex_unlock(&c->mtx);
+    return ok ? 0 : -1;
+}
+
+static void do_stat(struct job *j)
+{
+    const struct cn_hdr *h = &j->h;
+    struct cn_stat out;
+    struct stat st;
+    if (h->handle >= 0) {
+        char *vp;
+        if (get_handle(j->c, h->handle, &j->fd, &vp) != 0) {
+            send_reply(j->c, h, EBADF, 0, NULL, 0);
+            return;
+        }
+        if (vp != NULL) {
+            stat_virtual(&out, vp);
+            free(vp);
+        } else if (fstat(j->fd, &st) != 0) {
+            send_reply(j->c, h, errno, 0, NULL, 0);
+            return;
+        } else {
+            stat_from_native(&out, &st);
+        }
+        send_reply(j->c, h, 0, 0, &out, sizeof out);
+        return;
+    }
+    char path[CN_MAX_PATH + 2], real[PATH_MAX];
+    int virt;
+    int e = resolve(j->payload, h->len, path, real, &virt);
+    if (e != 0) {
+        send_reply(j->c, h, e, 0, NULL, 0);
+        return;
+    }
+    if (virt) {
+        stat_virtual(&out, path + 1);
+    } else {
+        /* The attributes are read by name, not through a descriptor (opening a device only to stat it
+         * would run its open handler), so look again afterwards: the name must still resolve to the
+         * same place. A component swapped in between is caught only if it is still swapped. */
+        char again[PATH_MAX];
+        if (stat(real, &st) != 0) {
+            send_reply(j->c, h, errno, 0, NULL, 0);
+            return;
+        }
+        if (realpath(path, again) == NULL || strcmp(again, real) != 0) {
+            send_reply(j->c, h, EACCES, 0, NULL, 0);
+            return;
+        }
+        stat_from_native(&out, &st);
+    }
+    send_reply(j->c, h, 0, 0, &out, sizeof out);
+}
+
+struct dent_list {
+    unsigned char *buf;
+    size_t used, max;
+    uint32_t count;
+};
+
+/* Append one entry if it fits; returns 0 when it does not. */
+static int dent_add(struct dent_list *l, uint64_t ino, const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0 || n > CN_MAX_NAME || strchr(name, '/') != NULL)
+        return 1;                               /* cannot be sent: leave it out */
+    size_t sz = CN_DENT_SIZE(n);
+    if (l->used + sz > l->max)
+        return 0;
+    struct cn_dent d = { .ino = ino, .namelen = (uint32_t)n };
+    memset(l->buf + l->used, 0, sz);
+    memcpy(l->buf + l->used, &d, sizeof d);
+    memcpy(l->buf + l->used + sizeof d, name, n);
+    l->used += sz;
+    l->count++;
+    return 1;
+}
+
+static void do_readdir(struct job *j)
+{
+    const struct cn_hdr *h = &j->h;
+    if (h->a < 0 || h->b < 0 || (uint32_t)h->b > CN_MAX_DATA) {
+        send_reply(j->c, h, EINVAL, 0, NULL, 0);
+        return;
+    }
+    char *vp;
+    if (get_handle(j->c, h->handle, &j->fd, &vp) != 0) {
+        send_reply(j->c, h, EBADF, 0, NULL, 0);
+        return;
+    }
+    struct dent_list l = { .buf = calloc(1, (size_t)h->b + 1), .max = (size_t)h->b };
+    if (l.buf == NULL) {
+        free(vp);
+        send_reply(j->c, h, ENOMEM, 0, NULL, 0);
+        return;
+    }
+    j->buf = l.buf;
+    uint32_t want = (uint32_t)h->a, idx = 0;
+    int full = 0, err = 0;
+    if (vp != NULL) {
+        /* "." and "..", then each distinct next component of an export below this directory. */
+        size_t n = strlen(vp);
+        const char *seen[MAX_EXPORTS];
+        int nseen = 0;
+        for (int step = -2; step < nexports && !full; step++) {
+            char name[CN_MAX_NAME + 1], full_path[CN_MAX_PATH + 2];
+            uint64_t ino;
+            if (step < 0) {
+                snprintf(name, sizeof name, "%s", step == -2 ? "." : "..");
+                ino = path_ino(vp);
+            } else {
+                const char *e = exports[step];
+                if (n > 0 && !(strncmp(e, vp, n) == 0 && e[n] == '/'))
+                    continue;
+                const char *rest = n > 0 ? e + n + 1 : e;
+                const char *slash = strchr(rest, '/');
+                size_t cl = slash ? (size_t)(slash - rest) : strlen(rest);
+                if (cl == 0 || cl > CN_MAX_NAME)
+                    continue;
+                memcpy(name, rest, cl);
+                name[cl] = '\0';
+                int dup = 0;
+                for (int k = 0; k < nseen; k++) {
+                    if (strncmp(seen[k], rest, cl) == 0 && (seen[k][cl] == '\0' || seen[k][cl] == '/'))
+                        dup = 1;
+                }
+                if (dup)
+                    continue;
+                seen[nseen++] = rest;
+                snprintf(full_path, sizeof full_path, "/%.*s", (int)(rest - e) + (int)cl, e);
+                struct stat st;
+                if (stat(full_path, &st) != 0)
+                    continue;                  /* a share that is not there is not listed */
+                ino = (uint64_t)st.st_ino;
+            }
+            if (idx++ < want)
+                continue;
+            if (!dent_add(&l, ino, name))
+                full = 1;
+        }
+    } else {
+        pthread_mutex_lock(&j->c->dir_mtx);
+        DIR *d = fdopendir(j->fd);
+        if (d == NULL) {
+            err = errno;
+        } else {
+            j->fd = -1;                         /* closedir() closes it */
+            rewinddir(d);
+            struct dirent *de;
+            errno = 0;
+            while (!full && (de = readdir(d)) != NULL) {
+                if (idx++ < want)
+                    continue;
+                if (!dent_add(&l, (uint64_t)de->d_ino, de->d_name))
+                    full = 1;
+            }
+            if (!full && errno != 0)
+                err = errno;
+            closedir(d);
+        }
+        pthread_mutex_unlock(&j->c->dir_mtx);
+    }
+    free(vp);
+    if (err != 0)
+        send_reply(j->c, h, err, 0, NULL, 0);
+    else if (full && l.count == 0)
+        send_reply(j->c, h, EINVAL, 0, NULL, 0);    /* not even one entry fits in what was asked for */
+    else
+        send_reply(j->c, h, 0, (int32_t)l.count, l.buf, (uint32_t)l.used);
 }
 
 static void do_read(struct job *j)
@@ -397,8 +738,7 @@ static void do_close(struct conn *c, int32_t h)
 {
     pthread_mutex_lock(&c->mtx);
     if (h >= 0 && h < CN_MAX_HANDLES && c->fds[h] >= 0) {
-        close(c->fds[h]);
-        c->fds[h] = -1;
+        handle_release_locked(c, h);
         for (int i = 0; i < MAX_JOBS; i++) {
             if (c->js[i].used && c->js[i].handle == h)
                 cancel_job_locked(c, i);
@@ -447,6 +787,8 @@ static void *worker(void *arg)
     case CN_OP_READ:   do_read(j);   break;
     case CN_OP_WRITE:  do_write(j);  break;
     case CN_OP_DEVCTL: do_devctl(j); break;
+    case CN_OP_STAT:   do_stat(j);   break;
+    case CN_OP_READDIR: do_readdir(j); break;
     default:           send_reply(j->c, &j->h, ENOSYS, 0, NULL, 0); break;
     }
     job_end(j);
@@ -554,12 +896,8 @@ static void *reader(void *arg)
         fprintf(stderr, "crossnode-agent: %d request(s) from %s did not stop; their device calls ignore signals\n",
                 left, c->peer);
     pthread_mutex_lock(&c->mtx);
-    for (int i = 0; i < CN_MAX_HANDLES; i++) {
-        if (c->fds[i] >= 0) {
-            close(c->fds[i]);
-            c->fds[i] = -1;
-        }
-    }
+    for (int i = 0; i < CN_MAX_HANDLES; i++)
+        handle_release_locked(c, i);
     shutdown(c->sock, SHUT_RDWR);
     pthread_mutex_unlock(&c->mtx);
     vlog("peer %s gone\n", c->peer);
@@ -615,6 +953,7 @@ int main(int argc, char **argv)
         rexports[i] = strdup(realpath(given, real) != NULL ? real + 1 : exports[i]);
     }
     signal(SIGPIPE, SIG_IGN);
+    started_at = time(NULL);
     struct sigaction si;
     memset(&si, 0, sizeof si);
     si.sa_handler = on_interrupt;           /* no SA_RESTART: the device call returns EINTR */
@@ -691,6 +1030,7 @@ int main(int argc, char **argv)
         c->slot = slot;
         c->refs = 1;
         pthread_mutex_init(&c->mtx, NULL);
+        pthread_mutex_init(&c->dir_mtx, NULL);
         for (int i = 0; i < CN_MAX_HANDLES; i++)
             c->fds[i] = -1;
         snprintf(c->peer, sizeof c->peer, "%s:%d", inet_ntoa(pa.sin_addr), ntohs(pa.sin_port));

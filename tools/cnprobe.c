@@ -12,14 +12,19 @@
  *   cnprobe seek PATH                       lseek on an open fd
  *   cnprobe readn PATH N                    one read of N bytes; prints the count returned
  *   cnprobe conns ADDRESS PORT N            open N TCP connections, report how many stay open
+ *   cnprobe stat PATH | fstat PATH         stat() a path, or open it and fstat() the descriptor
+ *   cnprobe ls PATH | lsr PATH             list a directory (lsr: list, rewinddir, list again)
+ *   cnprobe eintr-stat PATH ALARM_MS        stat() with a signal arriving after ALARM_MS
  *   cnprobe now                            print this machine's monotonic clock in ms
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -56,6 +61,7 @@ static const char *ename(int e)
     case EAGAIN:       return "EAGAIN";
     case ENXIO:        return "ENXIO";
     case ESPIPE:       return "ESPIPE";
+    case ENOTDIR:      return "ENOTDIR";
     default:           return "EOTHER";
     }
 }
@@ -211,6 +217,68 @@ int main(int argc, char **argv)
         printf("op=open-with-signal rc=%s ms=%.0f\n", ename(e), now_ms() - t0);
         if (fd >= 0)
             close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "stat") == 0 || strcmp(cmd, "fstat") == 0) {
+        struct stat st;
+        double t0 = now_ms();
+        int rc, fd = -1;
+        if (cmd[0] == 'f') {
+            fd = open(path, O_RDONLY);
+            if (fd < 0) {
+                printf("op=%s rc=%s ms=%.0f\n", cmd, ename(errno), now_ms() - t0);
+                return 0;
+            }
+            rc = fstat(fd, &st);
+        } else {
+            rc = stat(path, &st);
+        }
+        int e = rc != 0 ? errno : EOK;
+        if (rc != 0)
+            printf("op=%s rc=%s ms=%.0f\n", cmd, ename(e), now_ms() - t0);
+        else
+            printf("op=%s rc=EOK mode=%o size=%lld uid=%d gid=%d nlink=%d mtime=%lld rdev=%d ms=%.0f\n", cmd,
+                   (unsigned)st.st_mode, (long long)st.st_size, (int)st.st_uid, (int)st.st_gid,
+                   (int)st.st_nlink, (long long)st.st_mtime, (int)st.st_rdev, now_ms() - t0);
+        if (fd >= 0)
+            close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "ls") == 0 || strcmp(cmd, "lsr") == 0) {
+        double t0 = now_ms();
+        DIR *d = opendir(path);
+        if (d == NULL) {
+            printf("op=%s rc=%s ms=%.0f\n", cmd, ename(errno), now_ms() - t0);
+            return 0;
+        }
+        for (int pass = 0; pass < (cmd[2] == 'r' ? 2 : 1); pass++) {
+            int n = 0;
+            struct dirent *de;
+            errno = 0;
+            while ((de = readdir(d)) != NULL) {
+                printf("ent=%s\n", de->d_name);
+                n++;
+            }
+            printf("op=%s pass=%d rc=%s n=%d ms=%.0f\n", cmd, pass, errno ? ename(errno) : "EOK", n, now_ms() - t0);
+            rewinddir(d);
+        }
+        closedir(d);
+        return 0;
+    }
+    if (strcmp(cmd, "eintr-stat") == 0) {
+        if (argc < 4)
+            return usage();
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_alarm;
+        sigaction(SIGALRM, &sa, NULL);
+        long ms = atol(argv[3]);
+        struct itimerval it = { { 0, 0 }, { ms / 1000, (ms % 1000) * 1000 } };
+        struct stat st;
+        double t0 = now_ms();
+        setitimer(ITIMER_REAL, &it, NULL);
+        int rc = stat(path, &st);
+        printf("op=stat-with-signal rc=%s ms=%.0f\n", rc == 0 ? "EOK" : ename(errno), now_ms() - t0);
         return 0;
     }
     if (strcmp(cmd, "seek") == 0) {

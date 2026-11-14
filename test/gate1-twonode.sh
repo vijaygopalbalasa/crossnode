@@ -111,6 +111,21 @@ le "$(field interrupt_ms "$O")" $SLACK_MS && [ "$N1" = "$N0" ]
 check "2c-2 Ctrl-C returns at once and nodey's worker ends" $? "$(field interrupt_ms "$O") ms, threads $N0 -> $N1"
 
 echo
+echo "== 2d. nodex lists and stats nodey's paths"
+O=$(qx 'ls /net/nodey/dev; ls /net/nodey' | tr '\n' ' ')
+echo "  ls /net/nodey/dev, ls /net/nodey: $O"
+[ "$O" = "hello ser1 dev tmp " ]
+check "2d-1 the stock ls on nodex shows nodey's shared devices and the top of its share list" $? "$O"
+R=$(qx 'cd /tmp/cn; ./cnprobe stat /net/nodey/tmp/cnx/big'); L=$(qy 'cd /tmp/cn; ./cnprobe stat /tmp/cnx/big')
+echo "  through /net: $R"; echo "  on nodey:     $L"
+[ "$(field size "$R")" = 204800 ] && [ "$(field mode "$R")" = "$(field mode "$L")" ] && [ "$(field mtime "$R")" = "$(field mtime "$L")" ]
+check "2d-2 stat through /net/nodey gives the file's size, mode and modification time as nodey has them" $? "$R"
+O=$(qx 'ls -l /net/nodey/dev')
+echo "$O" | sed 's/^/  ls -l: /'
+[ "$(echo "$O" | grep -E -c '^c.* (hello|ser1)$')" = 2 ]
+check "2d-3 ls -l on nodex lists nodey's shared devices with their attributes" $? "$(echo "$O" | grep -c .) lines"
+
+echo
 echo "== 3. nodey freezes: a signal reaches a waiting caller on nodex"
 qx "cd /tmp/cn; ./cnprobe get $P >/dev/null; (./cnprobe eintr $P 300 1500 > e3.txt 2>&1 &)"
 sleep 1
@@ -173,6 +188,12 @@ FIRST=$(echo "$O" | sed -n 1p); SECOND=$(echo "$O" | sed -n 2p)
 check "6a the open fails with EHOSTDOWN within the connect limit" $? "$FIRST"
 [ "$(field rc "$SECOND")" = EHOSTDOWN ] && le "$(field ms "$SECOND")" 100
 check "6b a second open right after fails at once" $? "$SECOND"
+
+O=$(qx "cd /tmp/cn; ./cnprobe ls /net/nodey/dev; ./cnprobe stat /net/nodey/dev/hello")
+echo "$O" | sed 's/^/  /'
+L1=$(echo "$O" | grep 'op=ls'); L2=$(echo "$O" | grep 'op=stat')
+[ "$(field rc "$L1")" = EHOSTDOWN ] && [ "$(field rc "$L2")" = EHOSTDOWN ] && le "$(field ms "$L1")" 100 && le "$(field ms "$L2")" 100
+check "6c listing and stat of a dead node fail at once with EHOSTDOWN" $? "$L1; $L2"
 
 echo
 echo "== 7. nodey boots again; nodex needs no restart"

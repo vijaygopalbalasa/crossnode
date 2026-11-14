@@ -33,16 +33,18 @@ What does not work yet is listed too.
 | The peer reboots and `/net/<name>` works again with no restart on the using machine | two-node suite |
 | Shares: only listed paths; links are resolved and must stay inside a share; names outside a share all answer `EACCES` | loopback suite |
 | Only root, or members of the group given with `-g`, may use `/net/<name>` | `on -u` checks |
+| `ls`, `ls -l`, `stat` and `fstat` on a peer's paths; a directory above a share lists only the way to the shares | stock `ls` in the suites (checks 19 to 21, 2d) |
+| A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | checks 21a, 21e |
 | Replies that break the protocol never reach a program | `test/fake-agent.py`, a deliberately broken agent |
 
-Evidence: `evidence/gate1-loopback-*.txt` (32 checks, one machine over loopback) and
-`evidence/gate1-twonode-*.txt` (15 checks, two machines on a direct link). Each transcript names the commit it
+Evidence: `evidence/gate1-loopback-*.txt` (58 checks, one machine over loopback) and
+`evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
 ran on. The times in them are behaviour bounds on emulated machines, not performance figures.
 
 ## Not done yet
 
-- `stat()` on a remote path answers from a placeholder; directory listing is not forwarded.
-- `lseek`, `pread` and `pwrite` answer `ESPIPE` or `ENOSYS` rather than pretending.
+- `lseek` on a file, `pread` and `pwrite` answer `ESPIPE` or `ENOSYS` rather than pretending (a directory can be rewound).
+- `stat` follows links, so `ls -l` shows a link inside a share as the file it points to.
 - No `mmap`, shared memory, or server-to-client events (`select`, `ionotify`).
 - Programs that find a server by name (`name_open`) rather than by path are not covered.
 - One peer per `crossnode-net` process.
@@ -112,8 +114,8 @@ Wire format: `src/cn_proto.h` (a 28-byte header and a payload; both ends little-
 
 ```
 test/twonode-up.sh IMAGES_DIR             # boot nodex and nodey in QEMU with a direct link
-test/gate1-loopback.sh 2222               # 32 checks on one machine
-test/gate1-twonode.sh IMAGES_DIR          # 15 checks across the two machines
+test/gate1-loopback.sh 2222               # 58 checks on one machine
+test/gate1-twonode.sh IMAGES_DIR          # 19 checks across the two machines
 ```
 
 Each suite refuses to run on a stale build, pushes the binaries to the guests over SSH, and saves its

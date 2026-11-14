@@ -22,7 +22,14 @@ enum cn_op {
     CN_OP_DEVCTL = 5,   /* handle; a: dcmd; b: byte count; payload: input bytes */
     CN_OP_CLOSE  = 6,   /* handle; never answered */
     CN_OP_CANCEL = 7,   /* a: the seq of a request whose caller gave up; never answered */
+    CN_OP_STAT   = 8,   /* handle >= 0: fstat of that handle; handle < 0: payload is a path (may be empty = root).
+                           Reply payload: struct cn_stat */
+    CN_OP_READDIR = 9,  /* handle of a directory; a: index of the first entry wanted; b: most payload bytes.
+                           Reply payload: b entries (struct cn_dent + name, padded to 8); b == 0 is the end */
 };
+
+#define CN_OFLAG_DIR    0x40000000      /* in the flags of an OPEN request: fail with ENOTDIR unless a directory */
+#define CN_F_DIR        0x0001u         /* in the flags of an OPEN reply: the object is a directory */
 
 #define CN_REPLY        0x8000u         /* set in op on every reply */
 
@@ -38,5 +45,35 @@ struct cn_hdr {
 };
 
 _Static_assert(sizeof(struct cn_hdr) == 28, "the wire header is 28 bytes");
+
+/* The attributes of one object, in fixed-width fields: never a raw struct stat. */
+struct cn_stat {
+    uint64_t ino;
+    uint64_t size;
+    int64_t  atime;     /* seconds */
+    int64_t  mtime;
+    int64_t  ctime;
+    uint32_t mode;      /* S_IFMT bits and permissions, in the usual POSIX values */
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t nlink;
+    uint32_t rdev;
+    uint32_t blksize;
+};
+
+_Static_assert(sizeof(struct cn_stat) == 64, "the wire stat is 64 bytes");
+
+/* One directory entry in a READDIR reply: this header, then namelen name bytes (no NUL), then zero
+ * padding up to a multiple of 8. */
+struct cn_dent {
+    uint64_t ino;
+    uint32_t namelen;   /* 1 to CN_MAX_NAME */
+    uint32_t reserved;  /* 0 */
+};
+
+_Static_assert(sizeof(struct cn_dent) == 16, "the wire dirent header is 16 bytes");
+
+#define CN_MAX_NAME     255u            /* longest entry name */
+#define CN_DENT_SIZE(namelen) (sizeof(struct cn_dent) + (((size_t)(namelen) + 7u) & ~(size_t)7u))
 
 #endif
