@@ -38,7 +38,7 @@ What does not work yet is listed too.
 | A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | checks 21a, 21e |
 | Replies that break the protocol never reach a program | `test/fake-agent.py`, a deliberately broken agent |
 
-Evidence: `evidence/gate1-loopback-*.txt` (66 checks, one machine over loopback) and
+Evidence: `evidence/gate1-loopback-*.txt` (69 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
 ran on. The times in them are behaviour bounds on emulated machines, not performance figures.
 
@@ -124,7 +124,7 @@ Wire format: `src/cn_proto.h` (a 28-byte header and a payload; both ends little-
 
 ```
 test/twonode-up.sh IMAGES_DIR             # boot nodex and nodey in QEMU with a direct link
-test/gate1-loopback.sh 2222               # 66 checks on one machine
+test/gate1-loopback.sh 2222               # 69 checks on one machine
 test/gate1-twonode.sh IMAGES_DIR          # 19 checks across the two machines
 ```
 
