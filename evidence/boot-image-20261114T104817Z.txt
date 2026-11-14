@@ -1,0 +1,17 @@
+== Crossnode boot image check, 20261114T104817Z, build 1719573
+front started
+central started
+front: 30 lines of console, startup complete
+central: 29 lines of console, startup complete
+front:   QNX front 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+central: QNX central 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+  front processes:   307219 /system/bin/hellodev 
+  front processes:   307220 /system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 
+PASS  1 front started hellodev and crossnode-agent by itself at boot  [ 307219 /system/bin/hellodev ; 307220 /system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 ;]
+PASS  2 central started crossnode-net by itself at boot  [ 307219 /system/bin/crossnode-net -k /data/etc/crossnode.key -g 1000 -n front -c 10.9.0.2 ]
+  on central: ls /net/front/dev; cat /net/front/dev/hello -> hello hello from front 
+PASS  3 central lists front's shared device and reads it, with no command typed on either node  [hello hello from front ]
+PASS  4 the key file in the image is readable by root only  [-rw-------]
+PASS  5 a path outside front's share list is refused from central  [cat: /net/front/etc/passwd: Permission denied]
+
+== RESULT: 5 passed, 0 failed

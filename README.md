@@ -87,6 +87,15 @@ Both programs need `-k KEYFILE` (the same 16 or more random bytes on both machin
 port. `crossnode-net -n NAME -c ADDRESS:PORT` mounts the peer at `/net/NAME`; `-g GID` lets that group use it
 besides root; `-m DIR` changes `/net`.
 
+## Boot image
+
+`image/build-image.sh` builds two QNX 8.0 QEMU images with `mkqnximage` that start Crossnode at boot, so a
+pair comes up already connected: `front` (a stand-in sensor at `/dev/hello` and the agent) and `central`
+(`crossnode-net`, so `/net/front` exists). A random shared key is generated once and copied into each image as
+`/data/etc/crossnode.key`, mode 600. `image/run-pair.sh` boots the pair on a direct link, and
+`test/boot-image.sh` checks that, with no command typed, central lists and reads front's device
+(`evidence/boot-image-*.txt`). The images stay on the build machine; nothing from QNX is in this repository.
+
 ## How it works
 
 ```
