@@ -231,7 +231,7 @@ echo "== 17. Connection caps"
 O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; ./cnprobe conns 127.0.0.1 7777 6; grep -c 'too many from that address' agent.log; true")
 echo "$O" | sed 's/^/  /'
 [ "$(field kept "$O")" = 4 ]
-check "17 at most 4 connections still in the handshake are held at once (4 of 6 kept; crossnode-net's own authenticated connection is not counted)" $? "$(echo "$O" | head -1)"
+check "17 at most 4 connections are still in the handshake after the probes (the longest-waiting are dropped for newer ones)" $? "$(echo "$O" | head -1)"
 
 echo
 echo "== 18. Replies that break the protocol are refused"
@@ -391,10 +391,10 @@ q "cd /tmp/cn; ./cnprobe trickle 127.0.0.1 7777 6 > tr.txt 2>&1 & sleep 0.7; i=0
 O=$(q 'cd /tmp/cn; cat tr.txt tk-open.txt')
 echo "$O" | sed 's/^/  /'
 TR=$(echo "$O" | grep op=trickle); TO=$(echo "$O" | grep op=open)
-[ "$(field held "$TR")" = 4 ] && [ "$(field instant "$TR")" = 2 ] && le "$(field held_max_ms "$TR")" $((2000 + SLACK_MS + 300))
-check "23a six trickling strangers: four are held and dropped at about 2 s in total, the other two are refused at once" $? "$TR"
+[ "$(field never "$TR")" = 0 ] && le "$(field held_max_ms "$TR")" $((2000 + SLACK_MS + 300))
+check "23a six trickling strangers: every one is dropped by about 2 s in total (none is held longer by trickling)" $? "$TR"
 [ "$(field rc "$TO")" = EOK ]
-check "23b an authenticated peer connects while the trickling strangers are held" $? "$TO"
+check "23b an authenticated peer connects while the trickling strangers fill the handshake places (the longest-waiting stranger makes room)" $? "$TO"
 q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 

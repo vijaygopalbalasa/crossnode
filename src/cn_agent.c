@@ -71,6 +71,9 @@ static struct in_addr slot_addr[MAX_CONNS];
 static int slot_used[MAX_CONNS];
 static int slot_unauth[MAX_CONNS];      /* still in the handshake: counts against MAX_UNAUTH, not against a peer address */
 static int unauth_count;
+static uint64_t slot_since[MAX_CONNS];  /* when a slot was taken, for dropping the longest-waiting stranger */
+struct conn;
+static struct conn *slot_conn[MAX_CONNS];
 
 struct jobslot {
     int used;
@@ -88,6 +91,7 @@ struct conn {
     int refs;
     int jobs;
     int slot;                 /* index in the slot table */
+    volatile int evict;       /* a newer connection needs this stranger's place: give up the handshake */
     int fds[CN_MAX_HANDLES];
     char *vpath[CN_MAX_HANDLES];   /* set when the handle is a virtual directory: its path in the share */
     pthread_mutex_t dir_mtx;       /* one directory read at a time: a directory descriptor has one offset */
@@ -140,6 +144,7 @@ static void conn_put(struct conn *c)
         close(c->sock);
         pthread_mutex_lock(&conns_mtx);
         slot_used[c->slot] = 0;
+        slot_conn[c->slot] = NULL;
         if (slot_unauth[c->slot]) {
             slot_unauth[c->slot] = 0;
             unauth_count--;
@@ -204,18 +209,20 @@ static uint64_t mono_ms(void)
 
 /* Like read_full, but everything must arrive before one absolute deadline: a stranger who sends a byte every
  * second gains nothing. */
-static int read_by(int fd, void *buf, size_t n, uint64_t deadline)
+static int read_by(int fd, void *buf, size_t n, uint64_t deadline, volatile int *stop)
 {
     unsigned char *p = buf;
     while (n > 0) {
         uint64_t now = mono_ms();
-        if (now >= deadline)
+        if (now >= deadline || *stop)
             return -1;
         struct pollfd pf = { .fd = fd, .events = POLLIN };
-        int pr = poll(&pf, 1, (int)(deadline - now));
+        int pr = poll(&pf, 1, (int)(deadline - now > 100 ? 100 : deadline - now));
         if (pr < 0 && errno == EINTR)
             continue;
-        if (pr <= 0)
+        if (pr == 0)
+            continue;                   /* a slice passed: look at the deadline and the stop flag again */
+        if (pr < 0)
             return -1;
         ssize_t r = recv(fd, p, n, MSG_DONTWAIT);
         if (r > 0) {
@@ -923,9 +930,9 @@ static int handshake(struct conn *c)
     unsigned char out[sizeof h + CN_MAC_LEN];
     memcpy(out, &h, sizeof h);
     memcpy(out + sizeof h, na, sizeof na);
-    int ok = write_full(c->sock, out, sizeof h + sizeof na) == 0 && read_by(c->sock, &h, sizeof h, deadline) == 0 &&
+    int ok = write_full(c->sock, out, sizeof h + sizeof na) == 0 && read_by(c->sock, &h, sizeof h, deadline, &c->evict) == 0 &&
              h.magic == CN_MAGIC && h.op == CN_OP_AUTH && h.len == sizeof req &&
-             read_by(c->sock, req, sizeof req, deadline) == 0;
+             read_by(c->sock, req, sizeof req, deadline, &c->evict) == 0;
     if (ok) {
         cn_auth_mac(key, keylen, 'C', na, req, want);
         ok = cn_ct_equal(want, req + CN_NONCE_LEN, CN_MAC_LEN);
@@ -936,6 +943,8 @@ static int handshake(struct conn *c)
     }
     /* A peer now: stop counting it as a stranger, and hold it to the per-address cap. */
     int too_many = 0;
+    if (c->evict)
+        return -1;
     pthread_mutex_lock(&conns_mtx);
     int same = 0;
     for (int i = 0; i < MAX_CONNS; i++)
@@ -1142,6 +1151,21 @@ int main(int argc, char **argv)
         }
         int slot = -1, same = 0;
         pthread_mutex_lock(&conns_mtx);
+        if (keylen && unauth_count >= MAX_UNAUTH) {
+            /* A real peer finishes the handshake in milliseconds, a stranger holds on for the full two
+             * seconds. So the newcomer is let in and the longest-waiting stranger is told to go. */
+            int old = -1;
+            for (int i = 0; i < MAX_CONNS; i++) {
+                if (slot_used[i] && slot_unauth[i] && slot_conn[i] != NULL && (old < 0 || slot_since[i] < slot_since[old]))
+                    old = i;
+            }
+            if (old >= 0) {
+                slot_conn[old]->evict = 1;
+                slot_unauth[old] = 0;
+                unauth_count--;
+                fprintf(stderr, "crossnode-agent: dropped the longest-waiting unauthenticated connection (too many in the handshake)\n");
+            }
+        }
         for (int i = 0; i < MAX_CONNS; i++) {
             if (slot_used[i] && !slot_unauth[i] && slot_addr[i].s_addr == pa.sin_addr.s_addr)
                 same++;
@@ -1152,6 +1176,8 @@ int main(int argc, char **argv)
             slot = -1;
         if (slot >= 0) {
             slot_used[slot] = 1;
+            slot_conn[slot] = NULL;
+            slot_since[slot] = mono_ms();
             slot_addr[slot] = pa.sin_addr;
             if (keylen) {
                 slot_unauth[slot] = 1;
@@ -1175,11 +1201,18 @@ int main(int argc, char **argv)
             close(s);
             pthread_mutex_lock(&conns_mtx);
             slot_used[slot] = 0;
+            if (slot_unauth[slot]) {
+                slot_unauth[slot] = 0;
+                unauth_count--;
+            }
             pthread_mutex_unlock(&conns_mtx);
             continue;
         }
         c->sock = s;
         c->slot = slot;
+        pthread_mutex_lock(&conns_mtx);
+        slot_conn[slot] = c;
+        pthread_mutex_unlock(&conns_mtx);
         c->refs = 1;
         pthread_mutex_init(&c->mtx, NULL);
         pthread_mutex_init(&c->dir_mtx, NULL);
