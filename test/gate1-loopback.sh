@@ -230,8 +230,8 @@ echo
 echo "== 17. Connection caps"
 O=$(q "cd /tmp/cn; ./cnprobe get $P >/dev/null; ./cnprobe conns 127.0.0.1 7777 6; grep -c 'too many from that address' agent.log; true")
 echo "$O" | sed 's/^/  /'
-[ "$(field kept "$O")" = 4 ]
-check "17 at most 4 connections are still in the handshake after the probes (the longest-waiting are dropped for newer ones)" $? "$(echo "$O" | head -1)"
+[ "$(field kept "$O")" = 2 ]
+check "17 one address holds at most 2 connections in the handshake (6 probes: the older ones are dropped for newer ones, 2 stay)" $? "$(echo "$O" | head -1)"
 
 echo
 echo "== 18. Replies that break the protocol are refused"
