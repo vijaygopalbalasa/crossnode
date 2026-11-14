@@ -438,12 +438,16 @@ int main(int argc, char **argv)
         }
         pause_ms(500);
         for (int i = 0; i < n; i++) {
-            char b;
+            char b[256];
             if (fds[i] < 0)
                 continue;
-            ssize_t r = recv(fds[i], &b, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (r > 0 || (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
-                open_ok++;              /* still open: the agent kept it (a keyed agent has sent its challenge) */
+            /* Read what the agent sent (a keyed agent's challenge); still open if it then has nothing more
+             * to say, closed if the stream ends. */
+            ssize_t r;
+            while ((r = recv(fds[i], b, sizeof b, MSG_DONTWAIT)) > 0)
+                ;
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                open_ok++;
             close(fds[i]);
         }
         printf("op=conns tried=%d kept=%d\n", n, open_ok);
