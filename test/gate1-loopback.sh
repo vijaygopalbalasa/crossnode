@@ -240,7 +240,7 @@ FAKE=$!
 sleep 1
 q 'cd /tmp/cn && (./crossnode-net -v -I -n evil -c 10.0.2.2:7799 > evil.log 2>&1 &)'
 sleep 1
-O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x; sleep 1.2; ./cnprobe stat /net/evil/x; sleep 1.2; ./cnprobe ls /net/evil/dir")
+O=$(q "cd /tmp/cn; ./cnprobe readn /net/evil/x 10; sleep 1.2; ./cnprobe get /net/evil/x; sleep 2; ./cnprobe stat /net/evil/x; sleep 2; ./cnprobe ls /net/evil/dir; sleep 1")
 kill $FAKE 2>/dev/null
 echo "$O" | sed 's/^/  /'
 echo "  fake agent:"; sed 's/^/    /' "$ROOT/evidence/.fake-agent.log"; rm -f "$ROOT/evidence/.fake-agent.log"
