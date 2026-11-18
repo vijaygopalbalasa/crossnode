@@ -134,4 +134,4 @@ accept SSH logins (the stock template leaves out `sshd-auth`).
 
 ## Licence
 
-To be chosen before publishing. This repository contains no QNX files.
+MIT (see `LICENSE`). This repository contains no QNX files: building it needs your own QNX SDP 8.0.
