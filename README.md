@@ -11,9 +11,10 @@ nodex# stty -a < /net/nodey/dev/ser1      # the same output as running stty on n
 QNX 7 had Qnet: every machine's `/dev` and files appeared under `/net/<node>/`, and an unmodified program could
 open, read, write and devctl a device on another machine. QNX 8.0 removed Qnet together with io-pkt and lists
 its alternative as "N/A". Crossnode brings the path-based part back for QNX 8.0, as two small user-space
-programs, secure by default: a machine shares only the paths it lists, only root (or one named group) may use a
-peer's paths, and when a peer dies every waiting caller gets a clean error within a stated limit instead of
-hanging.
+programs, authenticated and share-listed by default: both ends must prove they hold a shared key, a machine shares
+only the paths it lists, only root (or one named group) may use a peer's paths, and when a peer dies every waiting
+caller gets a clean error within a stated limit instead of hanging. Both programs can also run as a non-root user
+under a QNX security policy that limits each one to what it needs.
 
 Status: gate 1 of the build (November 2026). What works is listed below, with the test run that shows it.
 What does not work yet is listed too.
@@ -23,7 +24,8 @@ What does not work yet is listed too.
 Each row names the checks that show it. Check numbers are the ones printed in the transcripts: two-node
 (`evidence/gate1-twonode-*.txt`, two QNX 8.0 machines on a direct link), loopback (`evidence/gate1-loopback-*.txt`,
 one machine) and boot image (`evidence/boot-image-*.txt`). The values quoted are from the runs
-`gate1-twonode-20261118T201732Z`, `gate1-loopback-20261118T201529Z` and `boot-image-20261118T201902Z`.
+`gate1-twonode-20261118T201732Z`, `gate1-loopback-20261118T201529Z`, `boot-image-20261118T203710Z` (the default
+pair) and `boot-image-20261118T204113Z` (the confined pair).
 
 | Behaviour | Checks | What the transcript shows |
 |---|---|---|
@@ -45,6 +47,7 @@ one machine) and boot image (`evidence/boot-image-*.txt`). The values quoted are
 | A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | loopback 21a to 21e | two waiting stats: the signalled one gets `EINTR`, the other `EHOSTDOWN` |
 | Replies that break the protocol never reach a program | loopback 18a to 18d | from `test/fake-agent.py`, a deliberately broken agent |
 | A pair built with `image/build-image.sh` boots already connected, with the key readable by root only | boot image 1 to 4 | `hello from front` on central with no command typed; key `-rw-------` |
+| Built confined, both services run as uid 70 under their own security types and an immutable policy: the agent may attach no path, `crossnode-net` may attach only `/net/front`, and root cannot start anything else under their types | boot image 6 to 11 (confined pair) | `allow_attach crossnode_net_t /net/front;`; `on: Operation not permitted` |
 
 Evidence: `evidence/gate1-loopback-*.txt` (69 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
@@ -58,6 +61,9 @@ ran on. The times in them are behaviour bounds on emulated machines, not perform
 - Programs that find a server by name (`name_open`) rather than by path are not covered.
 - One peer per `crossnode-net` process.
 - Authentication proves both ends hold a shared key; the traffic after it is not encrypted or integrity-protected, so use a protected link.
+- The loopback and two-node suites run the services as root on plain test machines; the confined build under an
+  enforced security policy is shown on the boot-image pair (checks 6 to 11). The policy is recorded by running the
+  demo, so a use the recording did not see is denied until it is recorded too.
 - Built and tested for x86_64 under QEMU. The base SDP has no QEMU startup for aarch64, so a mixed pair is not shown.
 
 ## Requirements
@@ -103,6 +109,32 @@ pair comes up already connected: `front` (a stand-in sensor at `/dev/hello` and 
 `/data/etc/crossnode.key`, mode 600. `image/run-pair.sh` boots the pair on a direct link, and
 `test/boot-image.sh` checks that, with no command typed, central lists and reads front's device
 (`evidence/boot-image-*.txt`). The images stay on the build machine; nothing from QNX is in this repository.
+
+## Confined: non-root, under a QNX security policy
+
+`image/build-image.sh` can build the same pair so that both services run as the non-root user `crossnode`
+(uid 70), each under its own security type, with the policy enforced by the kernel:
+
+1. `CN_SECPOL=open image/build-image.sh ...` builds images in which `secpolgenerate` records every privilege the
+   running system uses.
+2. `image/record-policy.sh PROJECTS_DIR` boots that pair, runs the demo and the checks (including a power cut of
+   front and its reboot), and saves each node's recorded policy.
+3. `CN_SECPOL=secure CN_POLICY=PROJECTS_DIR/<role>-policy.txt image/build-image.sh ...` builds the enforcing pair.
+   The policy is compiled into the boot image and cannot be changed while the system runs.
+
+What the recorded and enforced policy gives the Crossnode types (`image/crossnode-types.secpol`):
+
+| Type | Runs | May attach | May connect to | Other abilities |
+|---|---|---|---|---|
+| `crossnode_net_t` | `crossnode-net` on central, uid 70 | `/net/front` only | the network stack, pipe, random | path space, a public channel |
+| `crossnode_agent_t` | `crossnode-agent` on front, uid 70 | nothing | the shared device (`hellodev_t`), the network stack, random | none beyond running as non-root |
+
+Every ability not listed is denied. The policy also decides which session types may open `/net/front` at all, on
+top of Crossnode's own root-or-group check. `test/boot-image.sh` checks all of this on the running pair (checks 6
+to 11): both services run as uid 70 under their types, both nodes run an immutable policy, the agent's type may
+attach no path, `crossnode-net`'s type may attach exactly `/net/front`, and root cannot start another program
+under `crossnode-net`'s type. Each of these checks was run once against a case where it must fail (the
+recording pair, or another type's rules) and failed.
 
 ## How it works
 

@@ -1,0 +1,39 @@
+# Security policy rules for the Crossnode types, as recorded by secpolgenerate on the demo pair
+# (image/record-policy.sh) and then enforced with CN_SECPOL=secure. Only the Crossnode types are shown: the full
+# policies also hold the rules for the system's own services and are recorded on your own build, not kept here.
+# The type hellodev_t is the stand-in sensor at /dev/hello. Every ability not listed is denied.
+
+# --- front (crossnode-agent, uid 70; hellodev as root) ---
+# === Rules for type crossnode_agent_t ============
+allow crossnode_agent_t self:ability {
+    nonroot
+    prot_exec
+    map_fixed
+    channel_connect:random_t,io_sock_t,hellodev_t
+    network/jailroot
+};
+# === Rules for type hellodev_t ============
+allow_attach hellodev_t {
+    /dev/hello
+};
+allow hellodev_t self:ability {
+    pathspace
+    prot_exec
+    map_fixed
+    public_channel
+};
+
+# --- central (crossnode-net, uid 70) ---
+# === Rules for type crossnode_net_t ============
+allow_attach crossnode_net_t {
+    /net/front
+};
+allow crossnode_net_t self:ability {
+    nonroot
+    pathspace
+    prot_exec
+    map_fixed
+    public_channel
+    channel_connect:random_t,pipe_t,io_sock_t
+    network/jailroot
+};
