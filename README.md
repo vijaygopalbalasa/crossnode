@@ -20,23 +20,31 @@ What does not work yet is listed too.
 
 ## What works today
 
-| Behaviour | Shown by |
-|---|---|
-| `open`, `read`, `write` and `devctl` on a peer's path, from unmodified programs | `cat`, `stty -a` and `cnprobe` in the suites |
-| Generic `devctl`: data goes and comes back by the command's direction bits; the info value travels | identical results locally and through `/net` |
-| A stock QNX tool through `/net` gives byte-identical output | `stty -a` on a remote serial port |
-| 200 KB each way across the link, byte-exact | `cksum` both sides |
-| A read that waits on a live peer keeps waiting, while other callers are served | `cat /net/nodey/dev/ser1` for 10 s |
-| Both ends must prove they hold a shared key (HMAC-SHA256 challenge, no key on the wire) before anything is served; no key, wrong key, or an agent that cannot prove it are refused | checks 22a to 22f, `test/auth-vectors.c` (RFC 4231 vectors) |
-| A peer that dies or goes silent fails every waiting call with `EHOSTDOWN` within the 2 s liveness limit | QEMU of the peer killed (power cut) or stopped (frozen) |
-| A signal (Ctrl-C) to a waiting caller returns `EINTR` at once, and the work on the peer is stopped | `cnprobe eintr`, `eintr-open` |
-| `close` and process exit never wait on the peer | timed in the suites |
-| The peer reboots and `/net/<name>` works again with no restart on the using machine | two-node suite |
-| Shares: only listed paths; links are resolved and must stay inside a share; names outside a share all answer `EACCES` | loopback suite |
-| Only root, or members of the group given with `-g`, may use `/net/<name>` | `on -u` checks |
-| `ls`, `ls -l`, `stat` and `fstat` on a peer's paths; a directory above a share lists only the way to the shares | stock `ls` in the suites (checks 19 to 21, 2d) |
-| A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | checks 21a, 21e |
-| Replies that break the protocol never reach a program | `test/fake-agent.py`, a deliberately broken agent |
+Each row names the checks that show it. Check numbers are the ones printed in the transcripts: two-node
+(`evidence/gate1-twonode-*.txt`, two QNX 8.0 machines on a direct link), loopback (`evidence/gate1-loopback-*.txt`,
+one machine) and boot image (`evidence/boot-image-*.txt`). The values quoted are from the runs
+`gate1-twonode-20261118T201732Z`, `gate1-loopback-20261118T201529Z` and `boot-image-20261118T201902Z`.
+
+| Behaviour | Checks | What the transcript shows |
+|---|---|---|
+| Unmodified programs `open`, `read`, `write` and `devctl` a device on the other machine | two-node 1, 2; loopback 1, 2 | nodey sees the value nodex set (`info=7 value=42`); `stty -a` through `/net` gives the same 13 lines as on nodey |
+| Generic `devctl`: data goes and comes back by the command's direction bits; the info value travels | loopback 1 | `cat` and `devctl` set, add and get give identical results locally and through `/net` |
+| 200 KB each way across the link, byte-exact | two-node 2b; loopback 15a, 15b | the same `cksum` on both sides |
+| A read that waits on a live peer keeps waiting, while other callers are served | two-node 2c-1; loopback 16a, 16b | another caller is answered in 4 ms during a 10 s wait |
+| A peer that loses power or freezes fails every waiting call with `EHOSTDOWN` within the 2 s liveness limit | two-node 4, 5a; loopback 5 | frozen: `call_ms=1954`; power cut: `call_ms=1951` (bound 2000+200 ms) |
+| A peer whose agent is killed fails waiting calls at once | loopback 4, 7 | `EHOSTDOWN`, 18 ms after the kill |
+| A dead peer fails a new open within the 1.5 s connect limit, and the next one at once | two-node 6a to 6c; loopback 6a, 6b | `ms=1518`, then `ms=0` |
+| A signal (Ctrl-C) to a waiting caller returns `EINTR` at once, and the work on the peer is stopped | two-node 2c-2, 3, 3b; loopback 10, 14a, 14b, 16c to 16e | 10 ms; the agent's thread count goes 3, 4, 3 as the work starts and is stopped |
+| `close` and process exit never wait on the peer | two-node 5b, 5c; loopback 8a, 8b, 9 | close 1 ms, exit 1 ms with the peer powered off |
+| The peer reboots and `/net/<name>` works again, with no restart on the using machine | two-node 7 | `op=get rc=EOK` after the reboot |
+| Only listed paths are shared; links are resolved and must stay inside a share; names outside all answer `EACCES` | loopback 3, 3b to 3e, 19f, 20e; boot image 5 | `cat: /net/front/etc/passwd: Permission denied` |
+| Only root, or members of the group given with `-g`, may use `/net/<name>` | loopback 12a, 12b | any other user is refused before anything is forwarded |
+| Both ends must prove they hold a shared key (HMAC-SHA256 challenge, no key on the wire); no key, a wrong key, or an agent that cannot prove it are refused, and each refusal is logged | loopback 22a to 22f; `test/auth-vectors.c` (RFC 4231 vectors) | `rc=EHOSTDOWN` for each refused case; a key file others can read is refused |
+| Strangers cannot hold the handshake: at most 2 handshakes wait per address, each for about 2 s, and authenticated peers still get in (at most 4 per address) | loopback 17, 23a, 23b, 24a to 24c | six trickling strangers: none is held longer than 2052 ms |
+| `ls`, `ls -l`, `stat` and `fstat` on a peer's paths match the peer's own; a directory above a share lists only the way to the shares | two-node 2d-1 to 2d-3; loopback 19a to 19h, 20a to 20h | the stock `ls -l` prints the same through `/net` as locally |
+| A waiting `stat` blocks nobody else, and a signal interrupts only the caller it was sent to | loopback 21a to 21e | two waiting stats: the signalled one gets `EINTR`, the other `EHOSTDOWN` |
+| Replies that break the protocol never reach a program | loopback 18a to 18d | from `test/fake-agent.py`, a deliberately broken agent |
+| A pair built with `image/build-image.sh` boots already connected, with the key readable by root only | boot image 1 to 4 | `hello from front` on central with no command typed; key `-rw-------` |
 
 Evidence: `evidence/gate1-loopback-*.txt` (69 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
