@@ -1,7 +1,8 @@
 # Evidence: every claim and the checks that show it
 
 All transcripts below ran at commit `aa53a3c`; later commits changed only documentation and comments (the
-README, this file, the demo's captions and comment lines elsewhere); no code or test changed. Check numbers are the ones printed in the transcripts under `evidence/`: loopback (one machine),
+README, this file, the diagram and comment lines elsewhere) and the demo script, whose captions changed and which now
+stamps the power cut with central's clock (one `date` over SSH); no code or test changed. Check numbers are the ones printed in the transcripts under `evidence/`: loopback (one machine),
 two-node (two plain test machines on a direct link), boot image (the pair built by `image/build-image.sh`) and zonal
 (three machines). Runs: `gate1-loopback-20261119T021328Z` (71 of 71), `gate1-loopback-mutation-20261119T021618Z` (crossnode-net built to skip the frame check: 25a and 25b fail),
 `gate1-twonode-20261119T021933Z` (19 of 19), `boot-image-20261119T022324Z` (default pair, 5 of 5), `boot-image-20261119T023406Z` (confined and enforced pair, 13 of 13), `zonal-20261119T024608Z`
