@@ -1,0 +1,116 @@
+== Crossnode gate 1, two nodes, 20261119T224029Z
+nodex: QNX nodex 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+nodey: QNX nodey 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+link:   inet 10.9.0.1 netmask 0xffffff00 broadcast 10.9.0.255
+ inet 169.254.251.67 netmask 0xffff0000 broadcast 169.254.255.255 <->  inet 10.9.0.2 netmask 0xffffff00 broadcast 10.9.0.255
+ inet 169.254.37.125 netmask 0xffff0000 broadcast 169.254.255.255
+build: ef5198f
+
+== 1. nodex uses nodey's device through /net/nodey
+on nodex, through /net/nodey:
+  hello from nodey
+  op=set rc=EOK info=0 value=41
+  op=add rc=EOK info=0 value=42
+  op=get rc=EOK info=7 value=42
+on nodey, locally:
+  hello from nodey
+  op=get rc=EOK info=7 value=42
+PASS  1 the answer comes from nodey, and nodey sees the value nodex set  [op=get rc=EOK info=7 value=42]
+
+== 2. stty on nodex against nodey's serial port
+PASS  2 stty -a through /net/nodey matches stty -a run on nodey  [13 lines]
+
+== 2b. 200 KB each way across the link
+  read:  nodey file 37953409 204800, through /net on nodex 37953409 204800
+  write: nodex file 1883945039 204800, landed on nodey 1883945039 204800
+PASS  2b-read a 200 KB read across the link is byte-exact  [37953409 204800]
+PASS  2b-write a 200 KB write across the link is byte-exact  [1883945039 204800]
+
+== 2c. nodey is alive but its serial port has no input
+  still_waiting=yes
+  op=get rc=EOK info=7 value=42 ms=7
+  interrupt_ms=58
+  nodey agent threads (pidin lines): before 3, after 3
+PASS  2c-1 the read waits 10 s on a live peer while another caller is served  [op=get rc=EOK info=7 value=42 ms=7]
+PASS  2c-2 Ctrl-C returns at once and nodey's worker ends  [58 ms, threads 3 -> 3]
+
+== 2d. nodex lists and stats nodey's paths
+  ls /net/nodey/dev, ls /net/nodey: hello ser1 ser2 dev tmp 
+PASS  2d-1 the stock ls on nodex shows nodey's shared devices and the top of its share list  [hello ser1 ser2 dev tmp ]
+  through /net: op=stat rc=EOK mode=100644 size=204800 uid=0 gid=0 nlink=1 mtime=1795128043 rdev=0 ms=6
+  on nodey:     op=stat rc=EOK mode=100644 size=204800 uid=0 gid=0 nlink=1 mtime=1795128043 rdev=0 ms=1
+PASS  2d-2 stat through /net/nodey gives the file's size, mode and modification time as nodey has them  [op=stat rc=EOK mode=100644 size=204800 uid=0 gid=0 nlink=1 mtime=1795128043 rdev=0 ms=6]
+  ls -l: total 0
+  ls -l: crw-rw-rw-  1 root root 0,   1 2026-11-19 22:40 hello
+  ls -l: crw-rw-rw-  1 root root 3,   1 2026-11-19 21:46 ser1
+  ls -l: crw-rw-rw-  1 root root 3,   2 2026-11-19 21:47 ser2
+PASS  2d-3 ls -l on nodex lists nodey's shared devices with their attributes  [4 lines]
+
+== 3. nodey freezes: a signal reaches a waiting caller on nodex
+  op=get-with-signal rc=EINTR ms=303
+PASS  3 the call returns EINTR when the signal arrives  [op=get-with-signal rc=EINTR ms=303]
+  op=open-with-signal rc=EINTR ms=305
+PASS  3b an open waiting on the frozen node returns EINTR when the signal arrives  [op=open-with-signal rc=EINTR ms=305]
+
+== 4. nodey freezes: a waiting call on nodex fails within the liveness limit
+  result=stopped rc=EHOSTDOWN call_ms=1977 t_end=38420470  (host saw it 2610 ms after the freeze, polling included)
+PASS  4 EHOSTDOWN within the liveness limit  [call_ms=1977, bound 2000+200 ms]
+
+== 5. nodey loses power while nodex has three callers on it
+  waiting call:  result=stopped rc=EHOSTDOWN call_ms=1958 t_end=38429868  (host saw it 2224 ms after the power cut, polling included)
+  idle fd:       op=get-before rc=EOK value=42
+  idle fd:       op=get-after rc=EHOSTDOWN ms=0
+  idle fd:       op=close rc=EOK ms=0
+  holding exit:  op=exit-with-open-fd opened=y ms=6
+PASS  5a the waiting call gets EHOSTDOWN within the liveness limit  [call_ms=1958]
+PASS  5b a call on an idle fd fails at once, and close returns at once  [op=get-after rc=EHOSTDOWN ms=0; op=close rc=EOK ms=0]
+PASS  5c a process holding an fd exits at once  [op=exit-with-open-fd opened=y ms=6]
+
+== 6. New opens while nodey is off
+  op=open rc=EHOSTDOWN ms=1521
+  op=open rc=EHOSTDOWN ms=1
+PASS  6a the open fails with EHOSTDOWN within the connect limit  [op=open rc=EHOSTDOWN ms=1521]
+PASS  6b a second open right after fails at once  [op=open rc=EHOSTDOWN ms=1]
+  op=ls rc=EHOSTDOWN ms=1526
+  op=stat rc=EHOSTDOWN ms=1
+PASS  6c listing a dead node fails with EHOSTDOWN within the connect limit, and a stat right after fails at once  [op=ls rc=EHOSTDOWN ms=1526; op=stat rc=EHOSTDOWN ms=1]
+
+== 7. nodey boots again; nodex needs no restart
+  nodey started (pid 94253)
+  nodey:
+  	inet 10.9.0.2 netmask 0xffffff00 broadcast 10.9.0.255
+  	status: active
+  hello from nodey
+  op=get rc=EOK info=7 value=0 ms=4
+PASS  7 /net/nodey works again within 10 s of its agent starting  [op=get rc=EOK info=7 value=0 ms=4]
+
+== 8. select on nodey's serial port, from nodex
+  nodex# cnprobe select /net/nodey/dev/ser2 1500 (nothing typed) -> op=select rc=EOK ready=0
+PASS  8a with nothing on the line, select on /net/nodey/dev/ser2 times out with nothing ready  [op=select rc=EOK ready=0]
+  nodex# cnprobe select /net/nodey/dev/ser2 10000 (a line typed on nodey's ser2 after 3 s) -> op=select rc=EOK ready=1 read=EOK data=typed-on-nodey-ser2_
+PASS  8b select waits on nodey's serial port and wakes when a line is typed there; the read returns that line  [op=select rc=EOK ready=1 read=EOK data=typed-on-nodey-ser2_]
+  nodex# 20 programs select on /net/nodey/dev/ser2 at once, then a devctl -> eagain=4 timedout=16 op=get rc=EOK info=7 value=0 
+PASS  8c at most 16 select waiters per link: the 17th to 20th get EAGAIN at once, the 16 others time out normally, and an ordinary call is still answered  [eagain=4 timedout=16]
+  nodex# serialwatch /net/nodey/dev/ser2 115200 4: /net/nodey/dev/ser2: set to 115200 baud; waiting for lines
+  nodex# serialwatch /net/nodey/dev/ser2 115200 4: /net/nodey/dev/ser2: a-line-for-serialwatch
+  nodex# serialwatch /net/nodey/dev/ser2 115200 4: /net/nodey/dev/ser2: quiet for 8 s, done
+  nodey# stty -a < /dev/ser2 (after it ran) -> baud=115200
+PASS  8d an ordinary POSIX program (tcsetattr, select, read; no Crossnode code) sets nodey's serial port to 115200 baud and prints the line typed there  [1 line, nodey reports baud=115200]
+  nodex# cnprobe select /net/nodey/dev/ser2 25000 (a line typed after 13 s) -> op=select rc=EOK ready=1 read=EOK data=typed-after-13-s_
+PASS  8e a select still wakes when the line comes after the agent's 10 s wait has ended (crossnode-net asks again while someone waits)  [op=select rc=EOK ready=1 read=EOK data=typed-after-13-s_]
+  nodex# select waiting while nodey's agent is killed -> op=select rc=EOK ready=1 read=EHOSTDOWN data=
+PASS  8f a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN  [op=select rc=EOK ready=1 read=EHOSTDOWN data=]
+
+== crossnode-net log on nodex
+  crossnode-net: /net/nodey -> 10.9.0.2:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[nodey]: peer up
+  crossnode-net[nodey]: peer down: no answer within the liveness limit
+  crossnode-net[nodey]: peer up
+  crossnode-net[nodey]: peer down: no answer within the liveness limit
+  crossnode-net[nodey]: peer down: connect timed out
+  crossnode-net[nodey]: peer down: connect timed out
+  crossnode-net[nodey]: peer up
+  crossnode-net[nodey]: peer down: the peer closed the connection
+
+== RESULT: 25 passed, 0 failed
+transcript: evidence/gate1-twonode-20261119T224029Z.txt

@@ -1,0 +1,15 @@
+commit: ef5198f  host: Darwin arm64  cc: Apple clang version 17.0.0 (clang-1700.6.3.2)
+PASS sha256 empty
+PASS sha256 abc
+PASS sha256 two blocks (448 bits)
+PASS sha256 one million 'a' in uneven pieces
+PASS rfc4231 case 1
+PASS rfc4231 case 2
+PASS rfc4231 case 6 (key longer than a block)
+PASS ct_equal same
+PASS ct_equal differs
+PASS client and agent proofs differ
+PASS frame tag changes with the counter (a replay is caught)
+PASS frame tag changes with one payload bit
+PASS sha256 context is wiped after final
+ALL PASSED

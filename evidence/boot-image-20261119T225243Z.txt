@@ -1,0 +1,36 @@
+== Crossnode boot image check, 20261119T225243Z, build ef5198f
+front started
+central started
+front: 31 lines of console, startup complete
+central: 30 lines of console, startup complete
+front:   QNX front 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+central: QNX central 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+  front processes:   405523 /system/bin/hellodev 
+  front processes:   405524 /system/bin/crossnode-agent -r 30 -P 30 -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 
+PASS  1 front started hellodev and crossnode-agent by itself at boot  [ 405523 /system/bin/hellodev ; 405524 /system/bin/crossnode-agent -r 30 -P 30 -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 ;]
+PASS  2 central started crossnode-net by itself at boot (a supervisor and one process for front)  [ 405523 /system/bin/crossnode-net -f /data/etc/crossnode.conf -r 30 -g 1000 
+ 421909 /system/bin/crossnode-net -f /data/etc/crossnode.conf -r 30 -g 1000 ]
+  on central: ls /net/front/dev; cat /net/front/dev/hello -> hello hello from front 
+PASS  3 central lists front's shared device and reads it, with no command typed on either node  [hello hello from front ]
+  expected: secure; detected: confined services yes, security policy enforced yes
+PASS  4 the key file belongs to the service user (uid 70) and no one else may read it  [-rw------- 70 70]
+PASS  5 a path outside front's share list is refused from central  [cat: /net/front/etc/passwd: Permission denied]
+PASS  6 front's crossnode-agent runs as uid 70 under its own security type  [crossnode_agent_ 70]
+PASS  7 central's crossnode-net runs as uid 70 under its own security type  [crossnode_net_t 70]
+PASS  8 front's test device runs as uid 71 under its own security type  [hellodev_t 71]
+PASS  9 both nodes run under a security policy that cannot be changed while they run  [front: policy id:e0d3be5b (immutable); central: policy id:e67d08ce (immutable)]
+  root tries secpolpush: policy id:e0d3be5b (immutable) secpolpush: failed to push policy policy id:e0d3be5b (immutable) 
+  root tries secpolpush: policy id:e67d08ce (immutable) secpolpush: failed to push policy policy id:e67d08ce (immutable) 
+PASS  10 root's attempt to load a security policy is refused on both, and the policy id stays the same  [2 of 2 refused]
+  front policy: crossnode_agent_t  crc:34a80aee
+  front policy:     PROT_EXEC allow root non-root inherit lock
+  front policy:     MAP_FIXED allow root non-root inherit lock
+  front policy:     CHANNEL_CONNECT allow root non-root subrange 14-15 (hellodev_t,io_sock_t)
+  front policy:     CHANNEL_CONNECT allow root non-root inherit lock subrange 24-24 (random_t)
+  front policy:     network/jailroot allow root non-root inherit lock
+  front policy:     EOL deny root non-root inherit lock
+PASS  11 the agent's type may not attach any path or offer a public channel; every ability not listed is denied  [7 policy lines]
+PASS  12 crossnode-net's type may attach exactly one path, /net/front  [allow_attach crossnode_net_t /net/front;]
+PASS  13 root cannot start programs under crossnode-net's type (two tried: hellodev and true); only the boot image does  [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted (/bin/true) ls: /dev/cnx-probe: No such file or directory ]
+
+== RESULT: 13 passed, 0 failed

@@ -1,27 +1,27 @@
 # Evidence: every claim and the checks that show it
 
-All transcripts below ran at commit `24e8610`; later commits change only documentation and comments. Check numbers
+All transcripts below ran at commit `e1f9836`; later commits change only documentation and comments. Check numbers
 are the ones printed in the transcripts under `evidence/`: loopback (one machine), two-node (two plain test machines
 on a direct link), priority (the same two machines), boot image (the pair built by `image/build-image.sh`) and zonal
 (three machines). Runs:
 
-- `gate1-loopback-20261119T144602Z` (81 of 81); `gate1-loopback-mutation-20261119T144831Z` (`crossnode-net` and
+- `gate1-loopback-20261119T223434Z` (81 of 81); `gate1-loopback-mutation-20261119T223737Z` (`crossnode-net` and
   `crossnode-agent` built to skip the frame check: 25a, 25b, 25c and 25d fail).
-- `gate1-twonode-20261119T145100Z` (24 of 24); `gate1-twonode-mutation-liveness-20261119T145249Z` (no liveness limit:
-  4, 5a and 5b fail); `gate1-twonode-mutation-notify-20261119T145603Z` (no `select` forwarding: 8b to 8f fail).
-- `priority-20261119T145756Z` (4 of 4); `priority-mutation-20261119T145900Z` (priority not carried: check 2 fails);
-  `priority-mutation-central-20261119T145958Z` (`crossnode-net` started without `-r`: check 4 fails). Checks 2 and 4 are timed inside the caller's machine against a 1000 ms bound, and the transcript records `io-sock` at priority 21 on both machines. At an earlier
+- `gate1-twonode-20261119T224029Z` (25 of 25); `gate1-twonode-mutation-liveness-20261119T224311Z` (no liveness limit:
+  4, 5a and 5b fail); `gate1-twonode-mutation-notify-20261119T224630Z` (no `select` forwarding: 8b to 8f fail).
+- `priority-20261119T224902Z` (4 of 4); `priority-mutation-20261119T225000Z` (priority not carried: check 2 fails);
+  `priority-mutation-central-20261119T225058Z` (`crossnode-net` started without `-r`: check 4 fails). Checks 2 and 4 are timed inside the caller's machine against a 1000 ms bound, and the transcript records `io-sock` at priority 21 on both machines. At an earlier
   commit, one priority run in a release sequence failed check 4 once while four reruns passed; that transcript,
   `evidence/history/priority-20261119T110726Z`, is kept. The cause was not found (a lost frame on the emulated link
   while both CPUs are busy would make TCP wait to resend).
-- `boot-image-20261119T150055Z` (default pair, 5 of 5), `boot-image-20261119T150114Z` (confined, policy recording,
-  8 of 8), `boot-image-20261119T150133Z` (confined and enforced, 13 of 13).
-- `zonal-20261119T150155Z` (confined and enforced, 16 of 16); `zonal-mutation-20261119T150242Z` (`CN_MUTATE=1`:
-  checks 10 to 17 fail); `zonal-mutation-confinement-20261119T150351Z` (secure checks against a set built without the
+- `boot-image-20261119T225158Z` (default pair, 5 of 5), `boot-image-20261119T225219Z` (confined, policy recording,
+  8 of 8), `boot-image-20261119T225243Z` (confined and enforced, 13 of 13).
+- `zonal-20261119T225306Z` (confined and enforced, 16 of 16); `zonal-mutation-20261119T225402Z` (`CN_MUTATE=1`:
+  checks 10 to 17 fail); `zonal-mutation-confinement-20261119T225551Z` (secure checks against a set built without the
   policy: checks 4 to 8 fail).
-- `zonal-20261119T151118Z` (17 of 17): the same checks run by `scripts/zonal-from-scratch.sh` from an empty folder
+- `zonal-20261119T230606Z` (17 of 17): the same checks run by `scripts/zonal-from-scratch.sh` from an empty folder
   (build, record the policy, enforce it, check, demo).
-- `auth-vectors-24e8610` (SHA-256 against the FIPS 180-4 examples, HMAC-SHA256 against RFC 4231, the frame tag).
+- `auth-vectors-e1f9836` (SHA-256 against the FIPS 180-4 examples, HMAC-SHA256 against RFC 4231, the frame tag).
 
 Earlier runs, including the submitted version's (`aa53a3c`), are in `evidence/history/`.
 

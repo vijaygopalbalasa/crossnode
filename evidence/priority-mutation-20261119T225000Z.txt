@@ -1,0 +1,11 @@
+commit: ef5198f
+nodex runs crossnode-net-noprio
+nodex starts crossnode-net -r 30
+PASS  1 with nodey idle, a priority 30 call is answered  [op=get rc=EOK info=7 value=0]
+io-sock on nodex: 21r; on nodey: 21r
+  hogs running on nodey while the priority 30 call was made: 2
+FAIL  2 while priority 12 hogs hold nodey's CPUs, a priority 30 call is answered within 1000 ms  [rc=, outside the bound, 2 hogs running]
+  hogs running on nodey while the priority 5 call was made: 2
+PASS  3 control: a priority 5 call waits until the hogs stop (at least 3000 ms), so the hogs do hold the CPUs  [rc=EOK, after the hogs stopped, 2 hogs running]
+PASS  4 while priority 12 hogs hold nodex's CPUs (the caller's own machine), a priority 30 call is answered within 1000 ms  [rc=EOK, inside the bound]
+== RESULT: 3 passed, 1 failed

@@ -101,17 +101,17 @@ boards, not a sensor's real-time data path.
 
 | What | One line from the transcripts (check, run) |
 |---|---|
-| Unmodified programs read, write and devctl a device on another machine; `stty -a` through `/net` prints the same 13 lines as on the other machine | PASS 2 [cabin-temp(sim) value=23 C t=11 \| rear-radar(sim) value=123 cm t=11], `zonal-20261119T150155Z`<br>PASS 2 [13 lines], `gate1-twonode-20261119T145100Z` |
-| The caller's priority travels: with priority 12 work on both CPUs of either machine, a priority 30 call is answered within the bound; a build that does not carry the priority fails | PASS 2 [rc=EOK, inside the bound], PASS 4 [rc=EOK, inside the bound], `priority-20261119T145756Z`<br>FAIL 2 [rc=EOK, outside the bound], `priority-mutation-20261119T145900Z` |
-| A peer that loses power: the waiting call fails with `EHOSTDOWN` after about 2 s of silence (test bound 2000 + 200 ms), and the other zone keeps answering | PASS 10 [12 readings, then result=stopped rc=EHOSTDOWN (time cut), bound 2000+200 ms], `zonal-20261119T150155Z`<br>PASS 11 [3 readings and hello], `zonal-20261119T150155Z` |
-| The peer boots again and its path works with nothing restarted; its status file tells what happened | PASS 14 [pids before: 430096 446485 446486  after: 430096 446485 446486], PASS 15 [connects 2;drops 1;last down no answer within the liveness limit;], `zonal-20261119T150155Z` |
-| `select` on another machine's serial port wakes when a line is typed there; at most 16 waiters per link; a build that does not forward it fails | PASS 8b [op=select rc=EOK ready=1 read=EOK data=typed-on-nodey-ser2_], PASS 8c [eagain=4 timedout=16], `gate1-twonode-20261119T145100Z`<br>FAIL 8b [op=select rc=EOK ready=0], `gate1-twonode-mutation-notify-20261119T145603Z` |
-| Every frame after the handshake carries an integrity tag: a reply or a request changed on the wire is refused; a build that skips the check fails | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 (time cut); flips=1 integrity=1], `gate1-loopback-20261119T144602Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 (time cut); flips=1 integrity=0], `gate1-loopback-mutation-20261119T144831Z` |
-| Confined: non-root programs under their own security types; the policy is immutable, root's `secpolpush` is refused, and root cannot start a program under crossnode-net's type | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossnode_agent_ 70], `zonal-20261119T150155Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T150155Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted ...], `boot-image-20261119T150133Z` |
-| A key per link, central's links from one file, and only listed paths are shared | PASS 9 [checksums front 3631666464, rear 1329987501, central 3631666464 and 1329987501], PASS 16 [2 processes; peers in the file: front rear], `zonal-20261119T150155Z`<br>PASS 3 [cat: /net/self/etc/passwd: Permission denied], `gate1-loopback-20261119T144602Z` |
+| Unmodified programs read, write and devctl a device on another machine; `stty -a` through `/net` prints the same 13 lines as on the other machine | PASS 2 [cabin-temp(sim) value=21 C t=13 \| rear-radar(sim) value=109 cm t=13], `zonal-20261119T225306Z`<br>PASS 2 [13 lines], `gate1-twonode-20261119T224029Z` |
+| The caller's priority travels: with priority 12 work on both CPUs of either machine, a priority 30 call is answered within the bound; a build that does not carry the priority fails | PASS 2 [rc=EOK, inside the bound], PASS 4 [rc=EOK, inside the bound], `priority-20261119T224902Z`<br>FAIL 2 [rc=EOK, outside the bound], `priority-mutation-20261119T225000Z` |
+| A peer that loses power: the waiting call fails with `EHOSTDOWN` after about 2 s of silence (test bound 2000 + 200 ms), and the other zone keeps answering | PASS 10 [12 readings, then result=stopped rc=EHOSTDOWN (time cut), bound 2000+200 ms], `zonal-20261119T225306Z`<br>PASS 11 [3 readings and hello], `zonal-20261119T225306Z` |
+| The peer boots again and its path works with nothing restarted; its status file tells what happened | PASS 14 [pids before: 430096 446485 446486  after: 430096 446485 446486], PASS 15 [connects 2;drops 1;last down no answer within the liveness limit;], `zonal-20261119T225306Z` |
+| `select` on another machine's serial port wakes when a line is typed there; at most 16 waiters per link; a build that does not forward it fails | PASS 8b [op=select rc=EOK ready=1 read=EOK data=typed-on-nodey-ser2_], PASS 8c [eagain=4 timedout=16], `gate1-twonode-20261119T224029Z`<br>FAIL 8b [op=select rc=EOK ready=0], `gate1-twonode-mutation-notify-20261119T224630Z` |
+| Every frame after the handshake carries an integrity tag: a reply or a request changed on the wire is refused; a build that skips the check fails | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 (time cut); flips=1 integrity=1], `gate1-loopback-20261119T223434Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 (time cut); flips=1 integrity=0], `gate1-loopback-mutation-20261119T223737Z` |
+| Confined: non-root programs under their own security types; the policy is immutable, root's `secpolpush` is refused, and root cannot start a program under crossnode-net's type | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossnode_agent_ 70], `zonal-20261119T225306Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T225306Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted ...], `boot-image-20261119T225243Z` |
+| A key per link, central's links from one file, and only listed paths are shared | PASS 9 [checksums front 3631666464, rear 1329987501, central 3631666464 and 1329987501], PASS 16 [3 processes; peers in the file: front rear], `zonal-20261119T225306Z`<br>PASS 3 [cat: /net/self/etc/passwd: Permission denied], `gate1-loopback-20261119T223434Z` |
 
 Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md). All transcripts directly in
-`evidence/` ran at commit `24e8610` (earlier runs, including the first submission's, are in `evidence/history/`); each
+`evidence/` ran at commit `e1f9836` (earlier runs, including the first submission's, are in `evidence/history/`); each
 names its commit. Every important check has a deliberately broken build or run that fails it: the frame check
 (loopback 25a to 25d), priority carrying (priority 2), the I/O thread's priority (priority 4), the liveness limit
 (two-node 4, 5a, 5b), `select` forwarding (two-node 8b to 8f), the power cut (zonal 10 to 17) and confinement (zonal 4 to 8). The times are pass or fail
@@ -156,11 +156,11 @@ and `demo/zonal-demo.sh` then run commands on central over SSH from the host. Re
 it; the read fails with `EHOSTDOWN` after about 2 s of silence, front keeps answering, and when rear boots again
 central reads it with the same `crossnode-net` processes.
 
-On the enforced set all 16 checks pass (`evidence/zonal-20261119T150155Z.txt`). Two deliberately broken runs show the checks can
+On the enforced set all 16 checks pass (`evidence/zonal-20261119T225306Z.txt`). Two deliberately broken runs show the checks can
 fail: `CN_MUTATE=1` cuts front instead of rear, leaves rear down and kills central's services, on the open
-(policy-recording) set where root may do that, and checks 10 to 17 fail (`evidence/zonal-mutation-20261119T150242Z.txt`);
+(policy-recording) set where root may do that, and checks 10 to 17 fail (`evidence/zonal-mutation-20261119T225402Z.txt`);
 `CN_MUTATE=confinement` runs the secure checks against a set built without the policy, and checks 4 to 8 fail
-(`evidence/zonal-mutation-confinement-20261119T150351Z.txt`). The demo shows the failure with a plain `cat` loop, which prints "Host is down".
+(`evidence/zonal-mutation-confinement-20261119T225551Z.txt`). The demo shows the failure with a plain `cat` loop, which prints "Host is down".
 
 ## Reproduce
 
