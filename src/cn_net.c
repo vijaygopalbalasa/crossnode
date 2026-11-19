@@ -1341,6 +1341,17 @@ static int cn_notify(resmgr_context_t *ctp, io_notify_t *msg, struct cn_ocb *ocb
     int trig = _NOTIFY_COND_OUTPUT;
     if (ocb->ready)
         trig |= _NOTIFY_COND_INPUT;
+    pthread_mutex_lock(&G.mtx);
+    int down = ocb->gen != G.gen || G.state != C_UP;
+    int out = 0;
+    for (int i = 0; i < NPEND; i++)
+        if (G.pend[i].used && !G.pend[i].done && G.pend[i].op == CN_OP_NOTIFY)
+            out++;
+    pthread_mutex_unlock(&G.mtx);
+    if (down)
+        trig |= _NOTIFY_COND_INPUT;     /* the link is gone: the read will say why, so do not let the caller wait */
+    else if (!(trig & _NOTIFY_COND_INPUT) && !ocb->armed && (msg->i.flags & _NOTIFY_COND_INPUT) && out >= CN_MAX_NOTIFY)
+        return EAGAIN;                  /* enough waiters already: keep the room ordinary calls need */
     int armed = 0;
     int st = iofunc_notify(ctp, msg, ocb->notify, trig, NULL, &armed);
     if (armed && !ocb->armed && !(trig & _NOTIFY_COND_INPUT) && notify_peer(ocb) == 0)

@@ -39,6 +39,9 @@ enum cn_op {
 
 #define CN_REPLY        0x8000u         /* set in op on every reply */
 
+#define CN_MAX_NOTIFY   16              /* NOTIFY requests out at once per link: select waiters never take the room
+                                         * that ordinary calls need (both ends enforce it) */
+
 struct cn_hdr {
     uint32_t magic;
     uint16_t op;

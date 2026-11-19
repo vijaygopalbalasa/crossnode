@@ -103,6 +103,7 @@ struct jobslot {
     uint32_t seq;
     int32_t handle;
     int cancel;               /* cancellation asked for */
+    int notify;               /* a NOTIFY wait, counted against CN_MAX_NOTIFY */
     int tid_ok;
     pthread_t tid;
 };
@@ -937,8 +938,17 @@ static void *worker(void *arg)
 
 static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
 {
-    int js = -1;
+    int js = -1, waits = 0;
     pthread_mutex_lock(&c->mtx);
+    for (int i = 0; i < MAX_JOBS; i++)
+        if (c->js[i].used && c->js[i].notify)
+            waits++;
+    if (h->op == CN_OP_NOTIFY && waits >= CN_MAX_NOTIFY) {
+        pthread_mutex_unlock(&c->mtx);
+        send_reply(c, h, EAGAIN, 0, NULL, 0);   /* select waits never take the room ordinary requests need */
+        free(p);
+        return;
+    }
     if (c->jobs < MAX_JOBS) {
         for (int i = 0; i < MAX_JOBS; i++) {
             if (!c->js[i].used) {
@@ -960,7 +970,7 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
     j->payload = p;
     j->fd = -1;
     pthread_mutex_lock(&c->mtx);
-    c->js[js] = (struct jobslot){ .used = 1, .seq = h->seq, .handle = h->handle };
+    c->js[js] = (struct jobslot){ .used = 1, .seq = h->seq, .handle = h->handle, .notify = h->op == CN_OP_NOTIFY };
     c->jobs++;
     c->refs++;
     pthread_mutex_unlock(&c->mtx);

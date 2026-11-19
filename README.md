@@ -84,7 +84,7 @@ boards, not a sensor's real-time data path.
 | The caller's priority, as the kernel gave it to the receiving thread (`ctp->info.priority`), sent with the request and used for the worker on the other machine (`PTHREAD_EXPLICIT_SCHED`), capped by `-P` | `src/cn_net.c`, `submit`; `src/cn_agent.c`, job start | priority 1 to 4 |
 | A file answered by the resource manager itself, never forwarded (`/net/<peer>/.status`) | `src/cn_net.c`, `cn_open`, `status_text` | loopback 25c, 26a to 26d, zonal 15 |
 | A stale unblock pulse told apart from a live one (`MsgInfo`, `_NTO_MI_UNBLOCK_REQ`) | `src/cn_net.c`, `cancel_waiting` | loopback 21a to 21e, two-node 3, 3b |
-| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8c |
+| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8d |
 | Path containment (`realpath`), then the opened descriptor is asked where it points (`iofdinfo`) | `src/cn_agent.c`, `resolve`, `do_open` | loopback 3, 3b to 3e |
 | A blocked device call interrupted with a targeted signal (`pthread_kill`) | `src/cn_agent.c`, `cancel_job_locked` | loopback 16d, 16e, two-node 2c-2 |
 | Security policy: one type per program, recorded with `secpolgenerate`, compiled into the boot image and enforced (`on -T`, `mkqnximage --secpol --policy`, `secpol -Q`) | `image/build-image.sh`, `image/record-policy.sh` | zonal 4 to 8, boot image 6 to 13 |
@@ -269,7 +269,9 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - `lseek`, `pread` and `pwrite` on a file answer `ESPIPE` or `ENOSYS` rather than pretending (a directory can be
   rewound).
 - No `mmap` or shared memory. `select`, `poll` and `ionotify` cover input only (output always reads as ready, since a
-  write waits on the peer anyway). Programs that find a server by name (`name_open`) rather than by path are not
+  write waits on the peer anyway). At most 16 opens per link can wait for input at once (`CN_MAX_NOTIFY`, enforced at
+  both ends); the next `select` fails with `EAGAIN` instead of taking room ordinary calls need. A wait stays out at
+  the peer until input comes or the descriptor is closed. Programs that find a server by name (`name_open`) rather than by path are not
   covered.
 - The loopback and two-node suites run the services as root on plain test machines; the confined, enforced build is
   shown on the boot-image pair and the zonal set. The policy is recorded from the demo, so a use the recording did
@@ -284,8 +286,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 test/twonode-up.sh IMAGES_DIR                           # boot two plain test machines (nodex, nodey) with a direct link
 test/gate1-loopback.sh 2222                             # 79 checks on one machine
 CN_MUTATE=1 test/gate1-loopback.sh 2222                 # builds that skip the frame check: 25a to 25d fail
-test/gate1-twonode.sh IMAGES_DIR                        # 22 checks across the two machines
-CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b and 8c fail
+test/gate1-twonode.sh IMAGES_DIR                        # 23 checks across the two machines
+CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b, 8c and 8d fail
 CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR     # a crossnode-net without the liveness limit: 4, 5a and 5b fail
 test/priority.sh IMAGES_DIR                             # 4 checks: the caller's priority on both machines
 CN_MUTATE=1|central test/priority.sh IMAGES_DIR         # priority not carried: 2 fails; no -r on the caller's side: 4 fails
