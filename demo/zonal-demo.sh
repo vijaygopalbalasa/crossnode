@@ -26,7 +26,7 @@ sleep 6
 for i in $(seq 1 10); do ssh_to $CENTRAL 'ls /net/front/dev /net/rear/dev' >/dev/null 2>&1 && break; sleep 2; done
 run $CENTRAL central 'uname -sr; ls /net'
 say "Nothing was typed after power-on. From here, commands run on central over SSH from the host"
-say "Central's links come from one file: one process per zone, each holding only its own key"
+say "Central's links come from one file: a supervisor and one process per zone, each reading only its own key"
 run $CENTRAL central 'cat /data/etc/crossnode.conf'
 run $CENTRAL central 'ls /net/front/dev /net/rear/dev'
 run $CENTRAL central 'cat /net/front/dev/temp /net/rear/dev/radar'

@@ -85,13 +85,13 @@ pause
 say "An ordinary program, written the Qnet way (open, tcsetattr, select, read; no Crossnode code), on nodey's second serial port"
 SER2=$IMG/nodey/output/ser2.sock
 qy 'for i in 1 2 3 4 5; do /tmp/cn/cnprobe select /dev/ser2 300 | grep -q ready=1 || break; done' >/dev/null 2>&1   # drop anything left on the line
-printf '\033[1;36mnodex#\033[0m %s\n' 'serialwatch /net/nodey/dev/ser2 115200 3'; pause 0.6
+printf '\033[1;36mnodex#\033[0m %s\n' 'serialwatch /net/nodey/dev/ser2 115200 8'; pause 0.6
 python3 -I -c 'import socket,sys,time
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(4)
 sys.stdout.write("\033[1;35mhost$\033[0m typing into nodey'"'"'s ser2 (a QEMU socket): hello from the serial line\n"); sys.stdout.flush()
 for c in "hello from the serial line\n": s.send(c.encode()); time.sleep(0.06)
 time.sleep(1); s.close()' "$SER2" &
-qx '/tmp/cn/serialwatch /net/nodey/dev/ser2 115200 3'
+qx '/tmp/cn/serialwatch /net/nodey/dev/ser2 115200 8'
 wait
 run y 'stty -a < /dev/ser2 | tail -1'
 pause
@@ -113,7 +113,7 @@ say "The link's own status file, answered on nodex"
 run x 'cat /net/nodey/.status'
 say "Now fill both of nodey's CPUs with priority 12 work for 8 s, and call in from nodex at priority 30 and at 5"
 qx 'cd /tmp/cn; rm -f order.txt; (on -p 30 sh -c "sleep 2; ./cnprobe get /net/nodey/dev/hello > /dev/null; echo \"priority 30 call: answered\" >> order.txt" > /dev/null 2>&1 < /dev/null &); (on -p 5 sh -c "sleep 2; ./cnprobe get /net/nodey/dev/hello > /dev/null; echo \"priority 5 call: answered\" >> order.txt" > /dev/null 2>&1 < /dev/null &); (on -p 40 sh -c "sleep 5; echo \"(nodey: the priority 12 work is still running)\" >> order.txt" > /dev/null 2>&1 < /dev/null &)'
-qy "rm -f /tmp/cn/snap.txt; (on -p 40 sh -c 'sleep 4; pidin | grep -E \" (5|12)r \"' > /tmp/cn/snap.txt 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+8)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 < /dev/null &"
+qy "rm -f /tmp/cn/snap.txt; (on -p 40 sh -c 'sleep 4; pidin | grep -E \" (5|12)r \" | grep -v procnto' > /tmp/cn/snap.txt 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+8)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 < /dev/null &"
 sleep 12
 say "nodey, seen from a priority 40 snapshot taken while the work ran: the two priority 12 loops, and the priority 5 call's worker waiting behind them"
 run y 'cat /tmp/cn/snap.txt'
