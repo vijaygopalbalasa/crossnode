@@ -1,7 +1,7 @@
 # Evidence: every claim and the checks that show it
 
-All transcripts below ran at commit `aa53a3c`; later commits changed only the README, this file and the
-demo's captions. Check numbers are the ones printed in the transcripts under `evidence/`: loopback (one machine),
+All transcripts below ran at commit `aa53a3c`; later commits changed only documentation and comments (the
+README, this file, the demo's captions and comment lines elsewhere); no code or test changed. Check numbers are the ones printed in the transcripts under `evidence/`: loopback (one machine),
 two-node (two plain test machines on a direct link), boot image (the pair built by `image/build-image.sh`) and zonal
 (three machines). Runs: `gate1-loopback-20261119T021328Z` (71 of 71), `gate1-loopback-mutation-20261119T021618Z` (crossnode-net built to skip the frame check: 25a and 25b fail),
 `gate1-twonode-20261119T021933Z` (19 of 19), `boot-image-20261119T022324Z` (default pair, 5 of 5), `boot-image-20261119T023406Z` (confined and enforced pair, 13 of 13), `zonal-20261119T024608Z`
@@ -38,7 +38,7 @@ guest.
 | Replies that break the protocol never reach a program | loopback 18a to 18d | from `test/fake-agent.py`, a deliberately broken agent |
 | A pair or a zonal set built with `image/build-image.sh` boots already connected | boot image 1 to 3; zonal 1, 2 | `hello from front` on central with nothing typed after power-on |
 | Confined: the Crossnode programs run as uid 70 and the sensors as uid 71, each under its own security type | boot image 6 to 8; zonal 4, 5 | `crossnode_net_t 70`, `crossnode_agent_t 70`, `hellodev_t 71`, `zonesensor_t 71` |
-| Every machine runs a policy that cannot be changed while it runs, and root's attempt to load another is refused | boot image 9, 10; zonal 6, 7 | `secpol -Q` prints `(immutable)`; `secpolpush` fails with `Operation not permitted` and the policy id is the same after |
+| Every machine runs a policy that cannot be changed while it runs | boot image 9, 10; zonal 6, 7 | `secpol -Q` prints `(immutable)`; root's `secpolpush`, which reloads `/proc/boot/secpol.bin`, prints `failed to push policy`, and the policy id is the same after |
 | The agent's type may attach no path and offer no public channel; every ability not listed is denied | boot image 11 | its capability list has no `PATHSPACE` and ends in `EOL deny` |
 | `crossnode-net`'s type may attach exactly its `/net` paths | boot image 12; zonal 8 | `allow_attach crossnode_net_t /net/front;` and, in the zonal set, `/net/rear` |
 | Root cannot start programs under `crossnode-net`'s type | boot image 13 | two attempts (a test device and `true`): `on: Operation not permitted` both times |

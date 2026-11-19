@@ -34,6 +34,13 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 Crossnode has no AI component. It is infrastructure: the point is a non-obvious use of QNX's own resource manager,
 message passing, boot image and security policy features to bring back something QNX 8.0 lost.
 
+Who it is for: a QNX 7 system whose programs reach a device on another board through Qnet's `/net/<node>/` paths (a
+supervisor on one board reading a sensor driver on another, for example) has no listed alternative on QNX 8.0, so
+each such program would have to be rewritten against sockets. Crossnode keeps them unchanged, because on QNX every
+open, read and devctl is already a message to whichever server owns the path, and a user-space server can own a path
+that stands for another machine. It is not a real-time transport: requests go over TCP, and a lost peer is noticed
+after 2 s of silence. What it bounds is failure: a caller gets an error within a stated time instead of hanging.
+
 ![Three QNX 8.0 machines: front and rear zones share simulated sensors, central reads them by path](docs/architecture.svg)
 
 ## Where QNX is used
@@ -61,13 +68,14 @@ message passing, boot image and security policy features to bring back something
 | Unmodified programs read, write and devctl a device on another machine; `stty -a` through `/net` prints the same 13 lines as on the other machine | PASS 2 [cabin-temp(sim) value=19 C t=15 / rear-radar(sim) value=88 cm t=16], `zonal-20261119T024608Z`<br>PASS 2 [13 lines], `gate1-twonode-20261119T021933Z` |
 | A peer that loses power: the waiting call fails with `EHOSTDOWN` after about 2 s of silence (test bound 2000 + 200 ms), and the other zone keeps answering | PASS 10 [12 readings, then result=stopped rc=EHOSTDOWN call_ms=1755 t_end=43421, bound 2000+200 ms], `zonal-20261119T024608Z`<br>PASS 11 [3 readings and hello], `zonal-20261119T024608Z` |
 | The peer boots again and its path works with nothing restarted on the using machine | PASS 14 [pids before: 413714 438292  after: 413714 438292], `zonal-20261119T024608Z` |
-| Every frame after the handshake carries an integrity tag: a frame changed or replayed on the wire is refused; a build that skips the check fails this check | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 flips=1 integrity=1], `gate1-loopback-20261119T021328Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 flips=1 integrity=0], `gate1-loopback-mutation-20261119T021618Z` |
-| Confined: non-root programs under their own security types; root cannot load another policy or start programs under these types | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossn...], `zonal-20261119T024608Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T024608Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted (/bin/tr...], `boot-image-20261119T023406Z` |
+| Every frame after the handshake carries an integrity tag: a reply changed or replayed on the wire is refused (requests are tagged and checked the same way in `src/cn_agent.c`, `reader`; no test changes one yet); a build that skips the check fails this check | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 flips=1 integrity=1], `gate1-loopback-20261119T021328Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 flips=1 integrity=0], `gate1-loopback-mutation-20261119T021618Z` |
+| Confined: non-root programs under their own security types; the policy is immutable, root's `secpolpush` is refused, and root cannot start a program under crossnode-net's type | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossn...], `zonal-20261119T024608Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T024608Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted (/bin/tr...], `boot-image-20261119T023406Z` |
 | A key per link, and only listed paths are shared | PASS 9 [checksums front 4223641969, rear 3478472649, central 4223641969 and 3478472649], `zonal-20261119T024608Z`<br>PASS 3 [cat: /net/self/etc/passwd: Permission denied], `gate1-loopback-20261119T021328Z` |
 
-Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md). All transcripts in `evidence/`
-ran at commit `aa53a3c`; each names its commit. Each failure and integrity check also has a deliberately broken run
-that fails it. The times are pass or fail against bounds stated in the tests, for this code on emulated machines, not
+Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md). All transcripts directly in
+`evidence/` ran at commit `aa53a3c` (earlier runs are in `evidence/history/`); each names its commit. The power-cut
+checks (zonal 10 to 14), the confinement checks (zonal 4 to 8) and the integrity checks (loopback 25a, 25b) each have
+a deliberately broken run that fails them. The times are pass or fail against bounds stated in the tests, for this code on emulated machines, not
 performance figures for QNX.
 
 ## Why not Qnet, NFS, SSHFS or plain sockets?
@@ -86,8 +94,8 @@ With `CN_SECPOL`, `image/build-image.sh` runs both Crossnode programs as the use
 simulated sensors as `sensor` (uid 71), each under its own security type. `CN_SECPOL=open` builds images where
 `secpolgenerate` records what the running system uses; `image/record-policy.sh` boots them, runs the demo and the
 checks (including a power cut and a reboot) and saves each machine's policy; `CN_SECPOL=secure` compiles that policy
-into the boot image. There it is enforced: root's attempt to load another policy is refused and the policy id stays
-the same (zonal 7, boot image 10). The rules were recorded from the demo, not hand-designed or minimised. What they
+into the boot image. There it is enforced and immutable: `secpol -Q` prints `(immutable)`, and root's `secpolpush`
+(which reloads `/proc/boot/secpol.bin`) is refused (zonal 6 and 7, boot image 9 and 10). The rules were recorded from the demo, not hand-designed or minimised. What they
 give the Crossnode and sensor types (`image/crossnode-types-zones.secpol`):
 
 | Type | Runs as | May attach | May connect to | Other abilities granted (recorded) |
@@ -151,7 +159,7 @@ cat /net/front/dev/hello
 ```
 
 Both programs need `-k KEYFILE` (the same 16 or more random bytes at both ends of a link, mode 600, for example
-`head -c 32 /dev/urandom > /etc/crossnode-front.key`) or, for a throwaway test, `-I` on both, which has no handshake
+`(umask 077; head -c 32 /dev/urandom > /etc/crossnode-front.key)`) or, for a throwaway test, `-I` on both, which has no handshake
 and no frame tags. `crossnode-agent -e PATH` shares PATH and everything under it; `-l` and `-p` choose the listening
 address and port. `crossnode-net -n NAME -c ADDRESS:PORT` mounts the peer at `/net/NAME`; `-g GID` lets that group
 use it besides root; `-m DIR` changes `/net`.
@@ -192,8 +200,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - The handshake caps (2 waiting handshakes per address, 4 authenticated connections per address) can drop a
   legitimate handshake from an address that is also flooding.
 - `crossnode-net` has one dispatch thread per process and one peer per process (central runs one per zone).
-- For a directory, the second check compares device and inode of a second open, not `iofdinfo`, because `iofdinfo`
-  cannot check a descriptor opened with `O_DIRECTORY` (observed: `ENOSYS`).
+- For a directory, the second check compares device and inode of a second open made with `O_DIRECTORY` (the
+  descriptor `fdopendir` needs), not `iofdinfo`.
 - A device or FIFO is checked by name before and after a second resolve, not through an opened descriptor (opening
   it would run its open handler), so a path swapped in between is narrowed but not ruled out.
 - `stat` follows links, so `ls -l` shows a link inside a share as the file it points to.
@@ -204,7 +212,9 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - The loopback and two-node suites run the services as root on plain test machines; the confined, enforced build is
   shown on the boot-image pair and the zonal set. The policy is recorded from the demo, so a use the recording did
   not see is denied until it is recorded too.
-- Built and tested for x86_64 under QEMU. The base SDP has no QEMU startup for aarch64, so a mixed pair is not shown.
+- The caller's priority does not travel: on the sharing machine a request runs at `crossnode-agent`'s own priority,
+  whatever the caller's priority on the using machine.
+- Built and tested for x86_64 under QEMU; a mixed x86_64 and aarch64 pair is not shown.
 
 ## Tests
 

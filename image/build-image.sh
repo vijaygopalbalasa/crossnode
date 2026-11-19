@@ -25,8 +25,8 @@ ROLE=${2:?role front, rear or central}
 MK=${3:?path to the patched mkqnximage}
 PUB=${4:-}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-# mkqnximage merges its start-up snippets in name order; under en_US.UTF-8 "~30" sorts before "50" and the system
-# start-up would run before the policy generator (observed). The C locale gives the intended order.
+# mkqnximage merges its start-up snippets in name order; the C locale makes that order the same on every build
+# host.
 export LC_ALL=C
 SECPOL=${CN_SECPOL:-no}
 LAYOUT=${CN_LAYOUT:-pair}
@@ -115,9 +115,8 @@ DAT
         fi
     fi
 } > $S/post_start.custom
-# The SDP's preprocessor runs under emulation in our build container and sometimes crashes; mkqnximage then
-# carries on and writes an empty generated file (observed: an empty startup.sh, so the image could not start).
-# Fail instead, after removing the files it generated, so the next run makes them again.
+# Check that no generated file is empty, and that the compiler reported no internal error, before trusting the
+# build; if either happens, remove the generated files and fail, so the next run makes them again.
 set -o pipefail
 "$MK" --build 2>&1 | tee output/build-image.log
 BAD=$(find output/build -maxdepth 1 -type f -size 0 ! -name qemu_options)

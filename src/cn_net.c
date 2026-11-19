@@ -73,7 +73,7 @@ struct pend {
     uint32_t seq;
     rcvid_t rcvid;
     pid_t cpid;               /* the waiting caller's process, thread and connection: an unblock pulse names */
-    int ctid, cscoid;         /* a caller by an id that differs from rcvid inside a combined message (observed) */
+    int ctid, cscoid;         /* so a caller is found by these as well as by rcvid (see cancel_waiting) */
     int err;
     int32_t val;
     uint32_t gen;
@@ -894,9 +894,9 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
     struct _msg_info info;
     rcvid_t reply_to = rcvid;
     int op = 0;
-    /* Inside a combined message (stat by name) the handler's rcvid is not the one an unblock pulse carries
-     * (observed), so a caller is also found by the process, thread and connection the pulse's info names
-     * (observed to be the caller's own). A thread has one call outstanding, so this is unambiguous. */
+    /* An unblock pulse can come for a caller inside a combined message (stat by name), so a caller is found
+     * by the process, thread and connection the pulse's info names, not only by rcvid. A thread has one call
+     * outstanding, so this is unambiguous. */
     const struct _msg_info *who = &ctp->info;
     pthread_mutex_lock(&G.mtx);
     for (int i = 0; i < NPEND; i++) {
@@ -932,8 +932,8 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
         return;
     if (op == CN_OP_OPEN && ocb != NULL) {
         /* The library holds the binding while an unblock is handled and closes the OCB itself when
-         * it lets go (seen in a crash dump: _resmgr_put_binding -> iofunc_close_ocb). So only the
-         * client mapping is removed here; freeing the OCB as well would free it twice. */
+         * it lets go. So only the client mapping is removed here; freeing the OCB as well would free
+         * it twice. */
         ocb->state = OCB_LOCAL;
         struct _msg_info keep = ctp->info;
         ctp->info = info;

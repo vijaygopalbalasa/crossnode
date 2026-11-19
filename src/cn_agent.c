@@ -9,9 +9,9 @@
  * (its caller got a signal), when the peer closes the handle, and when the connection ends, so a
  * read that would never return cannot pin a job, a connection or a peer slot. The signal is sent
  * again until the worker is done, which closes the window where it lands just before the call.
- * (pthread_cancel is not used: in our tests on QNX 8.0, x86_64 under QEMU, a thread cancelled while
- * blocked in read() ended at the first cancellation point inside its cleanup handler, even after the
- * handler disabled cancellation, so the handler could not release anything.)
+ * (pthread_cancel is not used: a signal makes the blocked call return EINTR, so the worker gives back its
+ * descriptor and job slot in ordinary code after the call, with no cancellation cleanup handler involved.)
+ *
  *
  * Every open is resolved with realpath() and must land inside an export; then the descriptor itself
  * is asked where it points (iofdinfo), so swapping a path component between the check and the open
@@ -23,9 +23,9 @@
  * stat and directory listing go through the same resolver as open (resolve()). A directory above a share
  * (a proper ancestor of an export, or the root) is virtual: it lists only the way to the shares.
  *
- * Every connection starts with a handshake (cn_auth.h): the agent sends a nonce and serves nothing until the peer
- * proves it holds the shared key (-k). -I turns this off. Limit, stated plainly: authentication only; the traffic
- * after the handshake is neither encrypted nor integrity-protected, so use a protected link.
+ * Every connection starts with a handshake (cn_auth.h): the agent serves nothing until the peer proves it holds the
+ * shared key (-k); -I turns this off. After it, every frame both ways carries an HMAC-SHA256 tag (cn_frame_tag), and
+ * a frame that fails it drops the connection. Limit, stated plainly: the traffic is not encrypted.
  */
 #include <arpa/inet.h>
 #include <devctl.h>
@@ -468,9 +468,9 @@ static void do_open(struct job *j)
             return;
         }
         if (isdir) {
-            /* iofdinfo() cannot check a descriptor opened with O_DIRECTORY (observed: ENOSYS), and
-             * fdopendir() needs one. So the checked descriptor stays a witness, and the one kept is a
-             * second open that must be the very same directory. */
+            /* For a directory the descriptor kept is a second open made with O_DIRECTORY (the kind
+             * fdopendir() needs); the checked descriptor stays a witness, and the second open must be the
+             * very same directory (same device and inode). */
             int fd2 = open(real, (oflag & ~O_ACCMODE) | O_RDONLY | O_DIRECTORY);
             struct stat s2;
             if (fd2 < 0 || fstat(fd2, &s2) != 0 || s2.st_dev != st.st_dev || s2.st_ino != st.st_ino) {

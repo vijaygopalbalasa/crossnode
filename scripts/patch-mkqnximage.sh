@@ -1,9 +1,9 @@
 #!/bin/bash
 # Make a private copy of QNX SDP 8.0's mkqnximage whose QEMU images can be reached over SSH.
 #
-# The stock template starts sshd but leaves out sshd-auth, which OpenSSH 10 needs, so every login
-# is reset during key exchange. The copy adds the binary and points sshd at it. QNX's installed
-# files are not changed, and nothing from the SDP is stored in this repo.
+# OpenSSH 10 runs authentication in a separate sshd-auth binary. The copy adds it to the image and
+# points sshd at it. QNX's installed files are not changed, and nothing from the SDP is stored in
+# this repo.
 #
 # Usage (inside a shell where qnxsdp-env.sh was sourced): scripts/patch-mkqnximage.sh DEST_DIR
 # Then build images with DEST_DIR/mkqnximage instead of mkqnximage.
