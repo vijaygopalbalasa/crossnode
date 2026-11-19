@@ -235,6 +235,12 @@ cc -o /tmp/auth-vectors test/auth-vectors.c && /tmp/auth-vectors   # HMAC-SHA256
 Each suite pushes or boots the current build, saves its transcript under `evidence/`, and names the commit it ran on.
 All scripts that reach the machines need `CN_SSH_KEY`.
 
+## Tutorial
+
+[docs/codelab-confine-a-service.md](docs/codelab-confine-a-service.md) walks through the security-policy part on its own:
+run one QNX 8.0 resource manager as a non-root user under its own type, record its policy from real use, enforce it
+from the boot image, and check that the checks fail on an image without it. Every step was run on QEMU.
+
 ## Licence
 
 MIT (see `LICENSE`). This repository contains no QNX files: building it needs your own QNX SDP 8.0.
