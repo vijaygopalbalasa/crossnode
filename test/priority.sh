@@ -4,8 +4,14 @@
 # nodey shares /dev/hello. Two CPU hogs at priority 12 then run on nodey for 8 s, one per CPU, so nothing below
 # priority 12 runs there until they stop. On nodex, a caller at priority 30 asks for /net/nodey/dev/hello: with the
 # priority carried, nodey's worker runs at 30 and answers while the hogs run. A caller at priority 5 asks the same
-# thing and must wait for the hogs, which shows the hogs really do hold the CPUs. With CN_MUTATE=1, nodex runs
-# crossnode-net-noprio, which does not carry the priority; then check 2 must FAIL.
+# thing and must wait for the hogs, which shows the hogs really do hold the CPUs. Check 4 puts the hogs on nodex
+# instead: crossnode-net there runs its I/O thread at 30 (-r), so the priority 30 caller still gets its answer.
+#
+# Mutations: CN_MUTATE=1 runs crossnode-net-noprio on nodex, which does not carry the priority: check 2 must FAIL.
+# CN_MUTATE=central starts crossnode-net on nodex without -r: check 4 must FAIL.
+#
+# Ceiling: the network stack (io-sock) runs at priority 21 in these images, so work above 21 on either machine can
+# still hold up the link; the hogs here are at 12.
 #
 # Usage: test/priority.sh IMAGES_DIR
 set -u
@@ -15,7 +21,7 @@ BIN=$ROOT/build/x86_64
 KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 MUTATE=${CN_MUTATE:-0}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-NAME=priority; [ "$MUTATE" = 1 ] && NAME=priority-mutation
+NAME=priority; [ "$MUTATE" = 1 ] && NAME=priority-mutation; [ "$MUTATE" = central ] && NAME=priority-mutation-central
 OUT=$ROOT/evidence/$NAME-$STAMP.txt
 mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
@@ -56,7 +62,9 @@ push qx
 # caller's priority (-P, here up to 63).
 qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -r 30 -P 63 -k /tmp/cn/key -e /dev/hello -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
 sleep 1
-qx "cd /tmp/cn && (./$NET -k /tmp/cn/key -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)"
+NETPRIO="-r 30"; [ "$MUTATE" = central ] && NETPRIO=""
+echo "nodex starts crossnode-net ${NETPRIO:-without -r}"
+qx "cd /tmp/cn && (./$NET $NETPRIO -k /tmp/cn/key -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)"
 for i in $(seq 1 20); do qx '/tmp/cn/cnprobe get /net/nodey/dev/hello' 2>/dev/null | grep -q rc=EOK && break; sleep 0.5; done
 
 O=$(qx 'on -p 30 /tmp/cn/cnprobe get /net/nodey/dev/hello')
@@ -80,6 +88,16 @@ MS=$(echo "$O" | sed -n 's/.*total_ms=\([0-9]*\).*/\1/p')
 echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ]
 check "3 control: a priority 5 call waits until the hogs stop (at least ${SLOW_MS} ms), so the hogs do hold the CPUs" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ] && echo after || echo before) the hogs stopped"
 sleep $((HOG_S + 2))
+
+# 4: the hogs on nodex, where the caller is. sshd on nodex runs below the hogs, so the whole measurement runs on
+# nodex inside one shell started at priority 30, and the host only reads the result afterwards.
+qx "cd /tmp/cn; rm -f c4.txt; (on -p 30 sh -c 'sleep 2; a=\$(./cnprobe now); r=\$(./cnprobe get /net/nodey/dev/hello); b=\$(./cnprobe now); echo \"\$r total_ms=\$((b - a))\" > c4.txt' > /dev/null 2>&1 &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+$HOG_S)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 &"
+sleep $((HOG_S + 3))
+O=$(qx 'cat /tmp/cn/c4.txt 2>/dev/null')
+MS=$(echo "$O" | sed -n 's/.*total_ms=\([0-9]*\).*/\1/p')
+echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ]
+check "4 while priority 12 hogs hold nodex's CPUs (the caller's own machine), a priority 30 call is answered within ${FAST_MS} ms" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ] && echo inside || echo outside) the bound"
+sleep 2
 
 qx 'slay -f -s KILL crossnode-net crossnode-net-noprio >/dev/null 2>&1; true'
 qy 'slay -f -s KILL hellodev crossnode-agent >/dev/null 2>&1; true'

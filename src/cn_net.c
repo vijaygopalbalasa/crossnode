@@ -54,8 +54,12 @@ struct cn_ocb;
 #define NPEND           128   /* calls waiting on the peer at the same time */
 
 /* OCB_LOCAL: answered here (the mount root's own attributes). OCB_STATPATH: a stat() by name, which
- * arrives as a connect message combined with the stat and a close; the path waits for the stat. */
-enum ocb_state { OCB_LOCAL = 0, OCB_OPENING, OCB_OPEN, OCB_STATPATH };
+ * arrives as a connect message combined with the stat and a close; the path waits for the stat.
+ * OCB_STATUS: DIR/NAME/.status, the link's own state, written by this process and never forwarded. */
+enum ocb_state { OCB_LOCAL = 0, OCB_OPENING, OCB_OPEN, OCB_STATPATH, OCB_STATUS };
+
+#define CN_STATUS_NAME ".status"
+
 
 struct cn_ocb {
     iofunc_ocb_t hdr;         /* must be first */
@@ -65,6 +69,8 @@ struct cn_ocb {
     char *path;               /* OCB_STATPATH: the name to stat, relative to the share root */
     int isdir;                /* the peer said the opened object is a directory */
     uint32_t dpos;            /* directories: index of the next entry to hand out */
+    char *text;               /* OCB_STATUS: the snapshot taken at open, so one read sees one moment */
+    size_t tlen;
 };
 
 struct pend {
@@ -119,9 +125,14 @@ static struct {
     unsigned char authout[sizeof(struct cn_hdr) + CN_NONCE_LEN + CN_MAC_LEN];
     size_t authlen;
     const char *why;                 /* set when a frame is refused: the reason for the log */
+    /* For DIR/NAME/.status only; nothing else reads these. */
+    uint64_t up_at, down_at;         /* when the link last came up, last went down */
+    unsigned ups, drops, refused;    /* times up, times dropped after being up or authenticating, frames refused */
+    char last_drop[128], last_refused[128];
 } G = { .mtx = PTHREAD_MUTEX_INITIALIZER, .sock = -1 };
 
-static iofunc_attr_t dir_attr, file_attr;
+static iofunc_attr_t dir_attr, file_attr, status_attr;
+static char peer_text[64];               /* ADDRESS:PORT as given with -c, for .status */
 static iofunc_mount_t cn_mount;
 static iofunc_funcs_t cn_ocb_funcs;
 static resmgr_connect_funcs_t cf;
@@ -129,6 +140,7 @@ static resmgr_io_funcs_t iof;
 static const char *name;
 static int verbose;
 static gid_t allowed_gid = (gid_t)-1;   /* -g: this group may use the path as well as root */
+static int io_prio;                      /* -r: the I/O thread's priority; 0 = this process's own */
 
 static void vlog(const char *fmt, ...)
 {
@@ -159,6 +171,7 @@ static struct cn_ocb *ocb_new(void)
 static void ocb_destroy(struct cn_ocb *o)
 {
     free(o->path);
+    free(o->text);
     free(o);
 }
 
@@ -232,6 +245,14 @@ static void teardown_locked(const char *why)
         vlog("peer down: authentication failed (%s)\n", why);
     else if (G.state != C_DOWN)
         vlog("peer down: %s\n", why);
+    if (G.state == C_UP || G.state == C_AUTH) {
+        G.drops++;
+        snprintf(G.last_drop, sizeof G.last_drop, "%s%s", G.state == C_AUTH ? "authentication failed: " : "", why);
+    } else if (G.state == C_CONNECTING) {
+        snprintf(G.last_drop, sizeof G.last_drop, "could not connect: %s", why);
+    }
+    if (G.state != C_DOWN)
+        G.down_at = now_ms();
     G.authlen = 0;
     G.auth_stage = 0;
     G.state = C_DOWN;
@@ -260,7 +281,8 @@ static void up_locked(void)
         G.ctx = G.crx = 0;
     }
     G.state = C_UP;
-    G.last_rx = G.last_ping = now_ms();
+    G.last_rx = G.last_ping = G.up_at = now_ms();
+    G.ups++;
     vlog("peer up\n");
 }
 
@@ -437,6 +459,13 @@ static int handle_frame_locked(const struct cn_hdr *h, const unsigned char *p)
     return 0;
 }
 
+static void refuse_locked(const char *why)
+{
+    G.refused++;
+    snprintf(G.last_refused, sizeof G.last_refused, "%s", why);
+    teardown_locked(why);
+}
+
 static void io_read_locked(void)
 {
     for (;;) {
@@ -458,7 +487,7 @@ static void io_read_locked(void)
             struct cn_hdr h;
             memcpy(&h, G.rx + off, sizeof h);
             if (h.magic != CN_MAGIC || !(h.op & CN_REPLY) || h.len > CN_MAX_DATA) {
-                teardown_locked("protocol error");
+                refuse_locked("protocol error");
                 return;
             }
             size_t tag = G.state == C_UP && G.keylen ? CN_TAG_LEN : 0;   /* the handshake frames carry none */
@@ -469,14 +498,14 @@ static void io_read_locked(void)
                 cn_frame_tag(G.krx, G.crx++, G.rx + off, G.rx + off + sizeof h, h.len, want);
 #ifndef CN_NO_VERIFY
                 if (!cn_ct_equal(want, G.rx + off + sizeof h + h.len, CN_TAG_LEN)) {
-                    teardown_locked("a frame failed its integrity check (changed, replayed or out of order)");
+                    refuse_locked("a frame failed its integrity check (changed, replayed or out of order)");
                     return;
                 }
 #endif
             }
             int was_auth = G.state == C_AUTH;
             if (handle_frame_locked(&h, G.rx + off + sizeof h) != 0) {
-                teardown_locked(G.why ? G.why : was_auth ? "the agent's answer was wrong" : "a reply did not match its request");
+                refuse_locked(G.why ? G.why : was_auth ? "the agent's answer was wrong" : "a reply did not match its request");
                 G.why = NULL;
                 return;
             }
@@ -558,9 +587,12 @@ static void *io_thread(void *arg)
         if (G.state == C_AUTH && t >= G.connect_deadline)
             teardown_locked("timed out");
         if (G.state == C_UP) {
+#ifndef CN_NO_LIVENESS
             if (t - G.last_rx >= CN_DEAD_MS) {
                 teardown_locked("no answer within the liveness limit");
-            } else if (t - G.last_ping >= CN_PING_MS) {
+            } else
+#endif
+            if (t - G.last_ping >= CN_PING_MS) {
                 struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_PING, .seq = ++G.seq, .handle = -1 };
                 (void)out_append(&h, NULL, 0);
                 G.last_ping = t;
@@ -583,7 +615,12 @@ static void *io_thread(void *arg)
         if (G.state == C_UP) {
             int64_t dead = (int64_t)(G.last_rx + CN_DEAD_MS) - (int64_t)t;
             int64_t ping = (int64_t)(G.last_ping + CN_PING_MS) - (int64_t)t;
+#ifndef CN_NO_LIVENESS
             wait = dead < ping ? dead : ping;
+#else
+            (void)dead;
+            wait = ping;
+#endif
         }
         if (wait < 0)
             wait = 0;
@@ -913,15 +950,21 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
         }
     }
     if (e != NULL) {
+        /* A pulse can be stale: if the call it was for was answered and the same thread's next call was
+         * received before the pulse, the match above is that next call. Let a caller go only if the kernel
+         * says it asked to be (or is gone). */
+        struct _msg_info mi;
+        if (MsgInfo(e->rcvid, &mi) == 0 && !(mi.flags & _NTO_MI_UNBLOCK_REQ)) {
+            pthread_mutex_unlock(&G.mtx);
+            return;
+        }
         e->cancelled = 1;
         reply_to = e->rcvid;            /* the id the caller is actually blocked on */
         op = e->op;
         ocb = e->ocb;
         e->ocb = NULL;
         info = e->info;
-        if (e->done && op == CN_OP_OPEN && e->err == EOK)
-            queue_close_locked(e->val);
-        if (!e->done && G.state == C_UP) {
+        if (G.state == C_UP) {
             /* Tell the peer to stop the work too, so a device call that never returns is let go. */
             struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_CANCEL, .seq = ++G.seq, .handle = -1,
                                 .a = (int32_t)e->seq };
@@ -965,6 +1008,53 @@ static int connect_unblock(resmgr_context_t *ctp, io_pulse_t *msg, iofunc_attr_t
     return _RESMGR_NOREPLY;
 }
 
+/* DIR/NAME/.status: what an operator asks first. Plain text, one fact per line, a snapshot of one moment. */
+static char *status_text(size_t *len)
+{
+    static const char *const names[] = { "down", "connecting", "authenticating", "up" };
+    char b[1024];
+    size_t n = 0;
+#define ADD(...) do { if (n < sizeof b) n += (size_t)snprintf(b + n, sizeof b - n, __VA_ARGS__); } while (0)
+    pthread_mutex_lock(&G.mtx);
+    uint64_t t = now_ms();
+    int waiting = 0;
+    for (int i = 0; i < NPEND; i++)
+        if (G.pend[i].used && !G.pend[i].done)
+            waiting++;
+    ADD("peer        %s at %s\n", name, peer_text);
+    if (G.state == C_UP)
+        ADD("state       up for %llu s\n", (unsigned long long)((t - G.up_at) / 1000u));
+    else if (G.state == C_DOWN && G.down_at != 0)
+        ADD("state       down for %llu s (the next call reconnects)\n", (unsigned long long)((t - G.down_at) / 1000u));
+    else if (G.state == C_DOWN)
+        ADD("state       not connected yet (the first call connects)\n");
+    else
+        ADD("state       %s\n", names[G.state]);
+    ADD("link        %s\n", G.keylen ? "authenticated; every frame carries an HMAC-SHA256 tag"
+                                     : "NOT AUTHENTICATED (-I)");
+    if (G.state == C_UP)
+        ADD("last heard  %s (down after %d s of silence)\n", t - G.last_rx < 1000 ? "within the last second" : "over a second ago",
+            CN_DEAD_MS / 1000);
+    ADD("waiting     %d call%s\n", waiting, waiting == 1 ? "" : "s");
+    ADD("connects    %u\n", G.ups);
+    ADD("drops       %u\n", G.drops);
+    if (G.last_drop[0])
+        ADD("last down   %s\n", G.last_drop);
+    ADD("refused     %u frame%s%s%s\n", G.refused, G.refused == 1 ? "" : "s", G.last_refused[0] ? ", last: " : "",
+        G.last_refused);
+    pthread_mutex_unlock(&G.mtx);
+#undef ADD
+    if (n >= sizeof b)
+        n = sizeof b - 1;
+    char *r = malloc(n + 1);
+    if (r != NULL) {
+        memcpy(r, b, n);
+        r[n] = '\0';
+        *len = n;
+    }
+    return r;
+}
+
 /* Root, or the -g group, as file_attr's owner and mode say; checked before anything is forwarded. */
 static int check_client(resmgr_context_t *ctp, unsigned ioflag)
 {
@@ -1004,6 +1094,26 @@ static int cn_open(resmgr_context_t *ctp, io_open_t *msg, iofunc_attr_t *handle,
     struct cn_ocb *ocb = ocb_new();
     if (ocb == NULL)
         return ENOMEM;
+    if (strcmp(path, CN_STATUS_NAME) == 0) {
+        /* Answered here, from this process's own state, so it works with the peer down. Read only. */
+        if (msg->connect.ioflag & _IO_FLAG_WR) {
+            ocb_destroy(ocb);
+            return EROFS;
+        }
+        ocb->text = status_text(&ocb->tlen);
+        if (ocb->text == NULL) {
+            ocb_destroy(ocb);
+            return ENOMEM;
+        }
+        ocb->state = OCB_STATUS;
+        iofunc_attr_lock(&status_attr);
+        status_attr.nbytes = ocb->tlen;
+        int st = iofunc_ocb_attach(ctp, msg, &ocb->hdr, &status_attr, &iof);
+        iofunc_attr_unlock(&status_attr);
+        if (st != EOK)
+            ocb_destroy(ocb);
+        return st;
+    }
     if (!plain) {
         /* stat() and friends arrive as this connect combined with the operation and a close. The OCB
          * only remembers the name; the stat handler asks the peer. */
@@ -1051,6 +1161,7 @@ static int cn_stat(resmgr_context_t *ctp, io_stat_t *msg, struct cn_ocb *ocb)
     struct aux x = { .sm = msg, .cap = 0 };
     switch (ocb->state) {
     case OCB_LOCAL:
+    case OCB_STATUS:
         return iofunc_stat_default(ctp, msg, &ocb->hdr);
     case OCB_STATPATH:
         return submit(ctp, CN_OP_STAT, NULL, NULL, -1, 0, 0, ocb->path, (uint32_t)strlen(ocb->path), 0, &x);
@@ -1069,6 +1180,17 @@ static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
     unsigned xt = msg->i.xtype & _IO_XTYPE_MASK;
     if (xt != _IO_XTYPE_NONE && !(xt == _IO_XTYPE_READDIR && ocb->isdir))
         return ENOSYS;
+    if (ocb->state == OCB_STATUS) {
+        uint64_t off = ocb->hdr.offset, n = _IO_READ_GET_NBYTES(msg);
+        if (off > ocb->tlen)
+            off = ocb->tlen;
+        if (n > ocb->tlen - off)
+            n = ocb->tlen - off;
+        ocb->hdr.offset = (off_t)(off + n);
+        _IO_SET_READ_NBYTES(ctp, (size_t)n);
+        SETIOV(ctp->iov, ocb->text + off, (size_t)n);
+        return _RESMGR_NPARTS(1);
+    }
     if (ocb->state != OCB_OPEN)
         return ocb->hdr.attr == &dir_attr ? ENOSYS : EBADF;
     uint64_t n = _IO_READ_GET_NBYTES(msg);
@@ -1115,7 +1237,7 @@ static int cn_write(resmgr_context_t *ctp, io_write_t *msg, struct cn_ocb *ocb)
 static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb)
 {
     if (ocb->state != OCB_OPEN)
-        return ocb->hdr.attr == &dir_attr ? ENOTTY : EBADF;
+        return ocb->hdr.attr == &file_attr ? EBADF : ENOTTY;
     unsigned dcmd = (unsigned)msg->i.dcmd;
     unsigned dir = get_device_direction(dcmd);
     uint32_t n = msg->i.nbytes;
@@ -1143,6 +1265,8 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
  * the exception, because its position is only an entry index that this side keeps (rewinddir, seekdir). */
 static int cn_lseek(resmgr_context_t *ctp, io_lseek_t *msg, struct cn_ocb *ocb)
 {
+    if (ocb->state == OCB_STATUS)
+        return iofunc_lseek_default(ctp, msg, &ocb->hdr);
     if (ocb->state != OCB_OPEN || !ocb->isdir)
         return ESPIPE;
     int64_t pos;
@@ -1181,13 +1305,16 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: crossnode-net -n NAME -c ADDRESS:PORT (-k KEYFILE | -I) [-g GID] [-m DIR] [-v]\n"
+            "usage: crossnode-net -n NAME -c ADDRESS:PORT (-k KEYFILE | -I) [-g GID] [-m DIR] [-r PRIO] [-v]\n"
             "  -k KEYFILE       shared key with the agent (at least 16 bytes, mode 600)\n"
             "  -I               no authentication (only against an agent that was also started with -I)\n"
             "  -n NAME          the peer appears as DIR/NAME\n"
             "  -c ADDRESS:PORT  the peer's crossnode-agent\n"
             "  -g GID           members of this group may use DIR/NAME too (default: root only)\n"
-            "  -m DIR           where peers appear (default /net)\n");
+            "  -m DIR           where peers appear (default /net)\n"
+            "  -r PRIO          run the link's I/O thread at PRIO (default: this process's own)\n"
+            "DIR/NAME/.status reads as the link's state: up or down, authentication, last heard, waiting calls,\n"
+            "connects, drops and refused frames, each with its last reason.\n");
     exit(2);
 }
 
@@ -1198,7 +1325,7 @@ int main(int argc, char **argv)
     const char *keyfile = NULL;
     int insecure = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "n:c:g:m:vk:I")) != -1) {
+    while ((opt = getopt(argc, argv, "n:c:g:m:vk:Ir:")) != -1) {
         switch (opt) {
         case 'n': name = optarg; break;
         case 'c': target = optarg; break;
@@ -1207,6 +1334,7 @@ int main(int argc, char **argv)
         case 'v': verbose = 1; break;
         case 'k': keyfile = optarg; break;
         case 'I': insecure = 1; break;
+        case 'r': io_prio = atoi(optarg); break;
         default: usage();
         }
     }
@@ -1225,6 +1353,7 @@ int main(int argc, char **argv)
         }
         G.keylen = (size_t)n;
     }
+    snprintf(peer_text, sizeof peer_text, "%s", target);
     char *colon = strrchr(target, ':');
     if (colon == NULL)
         usage();
@@ -1261,8 +1390,10 @@ int main(int argc, char **argv)
     dir_attr.mount = &cn_mount;
     iofunc_attr_init(&file_attr, S_IFCHR | (group ? 0660 : 0600), NULL, NULL);
     file_attr.mount = &cn_mount;
-    dir_attr.uid = file_attr.uid = 0;
-    dir_attr.gid = file_attr.gid = group ? allowed_gid : 0;
+    iofunc_attr_init(&status_attr, S_IFREG | (group ? 0440 : 0400), NULL, NULL);
+    status_attr.mount = &cn_mount;
+    dir_attr.uid = file_attr.uid = status_attr.uid = 0;
+    dir_attr.gid = file_attr.gid = status_attr.gid = group ? allowed_gid : 0;
 
     iofunc_func_init(_RESMGR_CONNECT_NFUNCS, &cf, _RESMGR_IO_NFUNCS, &iof);
     cf.open = cn_open;
@@ -1299,7 +1430,23 @@ int main(int argc, char **argv)
         return 1;
     }
     pthread_t t;
-    if (pthread_create(&t, NULL, io_thread, NULL) != 0) {
+    /* The I/O thread moves every request and reply, so it must not wait behind lower-priority work on this
+     * machine: -r puts it above that work. (The dispatch thread already runs at each caller's priority.) */
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    if (io_prio > 0) {
+        struct sched_param sp;
+        int pol;
+        if (pthread_getschedparam(pthread_self(), &pol, &sp) == 0) {
+            sp.sched_priority = io_prio;
+            pthread_attr_setinheritsched(&at, PTHREAD_EXPLICIT_SCHED);
+            pthread_attr_setschedpolicy(&at, pol);
+            pthread_attr_setschedparam(&at, &sp);
+        }
+    }
+    int trc = pthread_create(&t, &at, io_thread, NULL);
+    pthread_attr_destroy(&at);
+    if (trc != 0) {
         fprintf(stderr, "crossnode-net: cannot start the I/O thread\n");
         return 1;
     }

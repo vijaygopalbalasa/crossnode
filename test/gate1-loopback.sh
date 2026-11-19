@@ -35,7 +35,8 @@ le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }    # le VALUE LIMIT, false if VALUE i
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
    || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h \
-   || stale cnmitm tools/cnmitm.c src/cn_proto.h || stale crossnode-net-noverify src/cn_net.c src/cn_proto.h src/cn_auth.h; then
+   || stale cnmitm tools/cnmitm.c src/cn_proto.h || stale crossnode-net-noverify src/cn_net.c src/cn_proto.h src/cn_auth.h \
+   || stale crossnode-agent-noverify src/cn_agent.c src/cn_proto.h src/cn_auth.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 
@@ -47,14 +48,16 @@ echo "guest: $(q 'uname -a')"
 echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo uncommitted)"
 # CN_MUTATE=1 runs the whole suite with a crossnode-net built to skip the per-frame check: 25a and 25b must fail.
 NETBIN=crossnode-net; [ "${CN_MUTATE:-0}" = 1 ] && NETBIN=crossnode-net-noverify
-[ "${CN_MUTATE:-0}" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): crossnode-net is the build that skips the per-frame check; 25a and 25b must FAIL."
-for f in hellodev crossnode-agent $NETBIN cnprobe cnmitm; do
+AGENTBIN=crossnode-agent; [ "${CN_MUTATE:-0}" = 1 ] && AGENTBIN=crossnode-agent-noverify
+[ "${CN_MUTATE:-0}" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): crossnode-net and crossnode-agent are the builds that skip the per-frame check; 25a, 25b, 25c and 25d must FAIL."
+for f in hellodev $AGENTBIN $NETBIN cnprobe cnmitm; do
     echo "  $f sha256 $(shasum -a 256 "$BIN/$f" | cut -c1-16)"
 done
 q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; rm -f /tmp/cn/*.log /tmp/cn/*.txt; true'
-for f in hellodev crossnode-agent cnprobe cnmitm; do
+for f in hellodev cnprobe cnmitm; do
     q "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
 done
+q "cat > /tmp/cn/crossnode-agent && chmod +x /tmp/cn/crossnode-agent" < "$BIN/$AGENTBIN"
 q "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/$NETBIN"
 q 'umask 077; rm -f /tmp/cn/key /tmp/cn/key2; head -c 32 /dev/urandom > /tmp/cn/key; head -c 32 /dev/urandom > /tmp/cn/key2; ls -l /tmp/cn/key | cut -c1-10'
 q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape && ln -s /etc/no-such-file /tmp/cnx/probe'
@@ -442,6 +445,10 @@ echo "$O" | sed 's/^/  /'
 G1=$(echo "$O" | grep 'op=get'); L1=$(echo "$O" | grep 'flips=')
 [ "$(field rc "$G1")" = EHOSTDOWN ] && [ "$(field flips "$L1")" -ge 1 ] && [ "$(field integrity "$L1")" -ge 1 ]
 check "25a a reply with one bit flipped on the wire is refused: the call fails with EHOSTDOWN and the change is logged as an integrity failure, never handed to the program" $? "$G1; $L1"
+O=$(q 'cat /net/mitmflip/.status')
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q '^refused     1 frame, last: a frame failed its integrity check' && echo "$O" | grep -q '^state       down'
+check "25c the refusal shows in /net/mitmflip/.status: link down, one frame refused, and why" $? "$(echo "$O" | grep '^refused' | cut -c13-60)"
 q 'slay -f cnmitm >/dev/null 2>&1; true'
 q "cd /tmp/cn; (./cnmitm 7791 127.0.0.1 7777 replay $TAG > mitm-replay.log 2>&1 &); (./crossnode-net -v -k /tmp/cn/key -n mitmreplay -c 127.0.0.1:7791 > mitm-replay-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/mitmreplay >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; sleep 1"
 O=$(q "cd /tmp/cn; ./cnprobe get /net/mitmreplay/dev/hello; sleep 1; echo replays=\$(grep -c replayed mitm-replay.log) integrity=\$(grep -c 'integrity' mitm-replay-net.log)")
@@ -450,6 +457,40 @@ G2=$(echo "$O" | grep 'op=get'); L2=$(echo "$O" | grep 'replays=')
 [ "$(field rc "$G2")" = EOK ] && [ "$(field value "$G2")" = 42 ] && [ "$(field replays "$L2")" -ge 1 ] && [ "$(field integrity "$L2")" -ge 1 ]
 check "25b a reply sent twice is refused the second time: the first copy answers the call, the copy is logged as an integrity failure" $? "$G2; $L2"
 q 'slay -f cnmitm >/dev/null 2>&1; true'
+q "cd /tmp/cn; ./cnprobe set /dev/hello 7 >/dev/null; (./cnmitm 7792 127.0.0.1 7777 flipreq $TAG > mitm-req.log 2>&1 &); (./crossnode-net -v -k /tmp/cn/key -n mitmreq -c 127.0.0.1:7792 > mitm-req-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/mitmreq >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; sleep 1"
+O=$(q "cd /tmp/cn; ./cnprobe set /net/mitmreq/dev/hello 42; sleep 1; ./cnprobe get /dev/hello; echo flips=\$(grep -c flipped mitm-req.log) integrity=\$(grep -c 'integrity' agent.log)")
+echo "$O" | sed 's/^/  /'
+S3=$(echo "$O" | grep 'op=set'); G3=$(echo "$O" | grep 'op=get'); L3=$(echo "$O" | grep 'flips=')
+[ "$(field rc "$S3")" = EHOSTDOWN ] && [ "$(field value "$G3")" = 7 ] && [ "$(field flips "$L3")" -ge 1 ] && [ "$(field integrity "$L3")" -ge 1 ]
+check "25d a request with one bit flipped on the wire is refused by the agent: the device keeps its value (7, not 42 or 43), the call fails with EHOSTDOWN, the agent logs an integrity failure" $? "$S3; local $G3; $L3"
+q 'slay -f cnmitm >/dev/null 2>&1; true'
+
+echo
+echo "== 26. /net/NAME/.status: the link's own state, answered by crossnode-net, never forwarded"
+O=$(q 'cd /tmp/cn; ./cnprobe get /net/self/dev/hello >/dev/null; cat /net/self/.status')
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q '^peer        self at 127.0.0.1:7777$' && echo "$O" | grep -q '^state       up for ' \
+  && echo "$O" | grep -q '^link        authenticated; every frame carries an HMAC-SHA256 tag$' \
+  && echo "$O" | grep -q '^waiting     0 calls$' && echo "$O" | grep -q '^refused     0 frames$'
+check "26a with the link up, .status names the peer and says up, authenticated, nothing waiting, nothing refused" $? "$(echo "$O" | sed -n 2p)"
+O=$(q 'ls -l /net/self/.status | cut -c1-10; sh -c "echo x > /net/self/.status" 2>&1; ls /net/self/ | grep -c "^\.status$"')
+echo "$O" | sed 's/^/  /'
+[ "$(echo "$O" | sed -n 1p)" = "-r--r-----" ] && echo "$O" | grep -qi 'read-only' && [ "$(echo "$O" | tail -1)" = 0 ]
+check "26b .status is a read-only file (writing it is refused) and is not one of the peer's entries" $? "$(echo "$O" | tr '\n' ' ')"
+q 'slay -f -s KILL crossnode-agent >/dev/null 2>&1; true'
+sleep 1
+O=$(q 'cat /net/self/.status')
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q '^state       down for ' && echo "$O" | grep -q '^drops       [1-9]' && echo "$O" | grep -Eq '^last down   (the peer closed the connection|connection error)$'
+check "26c with the agent killed, .status still answers and says down, with the reason" $? "$(echo "$O" | grep '^last down' | cut -c13-)"
+q "cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key -n nobody -c 127.0.0.1:7798 > nobody-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/nobody >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done"
+O=$(q 'cat /net/nobody/.status; /tmp/cn/cnprobe get /net/nobody/dev/hello; cat /net/nobody/.status')
+echo "$O" | sed 's/^/  /'
+echo "$O" | grep -q '^state       not connected yet' && echo "$O" | grep -q '^connects    0$' \
+  && echo "$O" | grep -q 'rc=EHOSTDOWN' && echo "$O" | grep -q '^last down   could not connect: '
+check "26d a peer that was never reached: .status says not connected yet, then why the first call could not connect" $? "$(echo "$O" | grep '^last down' | tail -1 | cut -c13-)"
+q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; true'
+q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 
 echo
 echo "== crossnode-net log"

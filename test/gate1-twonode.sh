@@ -6,13 +6,16 @@
 # reset ever arrives, and every caller on nodex must still get a clean error within the limit.
 #
 # Usage: test/gate1-twonode.sh IMAGES_DIR
+#        CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR   nodex runs crossnode-net-noliveness, built without the
+#        liveness limit: checks 4 and 5a must FAIL. Section 6 is skipped there (a new open would wait forever).
 set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/x86_64
 KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT=$ROOT/evidence/gate1-twonode-$STAMP.txt
+MUTATE=${CN_MUTATE:-0}
+OUT=$ROOT/evidence/gate1-twonode-$([ "$MUTATE" = liveness ] && echo mutation-liveness-)$STAMP.txt
 mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
 
@@ -28,7 +31,8 @@ field() { echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
-   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h; then
+   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h \
+   || stale crossnode-net-noliveness src/cn_net.c src/cn_proto.h src/cn_auth.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT   # one shared key for this run
@@ -66,6 +70,10 @@ echo "link:  $(qx 'ifconfig vtnet1 | grep "inet "' | tr -s ' \t' ' ') <-> $(qy '
 echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo uncommitted)"
 push qx
 push qy
+if [ "$MUTATE" = liveness ]; then
+    echo "== MUTATION RUN (CN_MUTATE=liveness): nodex runs crossnode-net-noliveness, which never declares a silent peer down. Checks 4 and 5a must FAIL."
+    qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-noliveness"
+fi
 start_nodey
 qx 'cd /tmp/cn && (./crossnode-net -v -k /tmp/cn/key -g 1000 -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
 sleep 1
@@ -183,6 +191,9 @@ check "5c a process holding an fd exits at once" $? "$X"
 
 echo
 echo "== 6. New opens while nodey is off"
+if [ "$MUTATE" = liveness ]; then
+    echo "  MUTATION: skipped; without the liveness limit nodex still thinks nodey is up, so a new open would wait forever"
+else
 O=$(qx "cd /tmp/cn; sleep 2; ./cnprobe open $P; ./cnprobe open $P")
 echo "$O" | sed 's/^/  /'
 FIRST=$(echo "$O" | sed -n 1p); SECOND=$(echo "$O" | sed -n 2p)
@@ -196,6 +207,7 @@ echo "$O" | sed 's/^/  /'
 L1=$(echo "$O" | grep 'op=ls'); L2=$(echo "$O" | grep 'op=stat')
 [ "$(field rc "$L1")" = EHOSTDOWN ] && [ "$(field rc "$L2")" = EHOSTDOWN ] && le "$(field ms "$L1")" $((CONNECT_MS + SLACK_MS)) && le "$(field ms "$L2")" 100
 check "6c listing a dead node fails with EHOSTDOWN within the connect limit, and a stat right after fails at once" $? "$L1; $L2"
+fi
 
 echo
 echo "== 7. nodey boots again; nodex needs no restart"
