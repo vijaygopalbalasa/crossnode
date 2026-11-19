@@ -1,6 +1,7 @@
 # Crossnode
 
-Reach a device on another QNX 8.0 machine by its path, with the programs you already have.
+Reach a device on another QNX 8.0 machine by its path, with the programs you already have (blocking `open`, `read`,
+`write`, `devctl` and `stat`; the [limits](#limits) list what is not covered).
 
 Simulated sensors on QEMU guests (`t` is seconds since the sensor started):
 
@@ -31,12 +32,13 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
   and cannot be changed while the system runs.
 
-Crossnode has no AI component. It is infrastructure: the point is a non-obvious use of QNX's own resource manager,
-message passing, boot image and security policy features to bring back something QNX 8.0 lost.
+The creative part is a non-obvious use of QNX's own resource manager, message passing, boot image and security
+policy features to bring back something QNX 8.0 lost.
 
 Who it is for: a QNX 7 system whose programs reach a device on another board through Qnet's `/net/<node>/` paths (a
-supervisor on one board reading a sensor driver on another, for example) has no listed alternative on QNX 8.0, so
-each such program would have to be rewritten against sockets. Crossnode keeps them unchanged, because on QNX every
+supervisor on one board reading a sensor driver on another, for example) finds no drop-in replacement for those
+paths listed for QNX 8.0, so each such program would otherwise move to sockets or to middleware such as SOME/IP or
+DDS. Crossnode keeps them unchanged, because on QNX every
 open, read and devctl is already a message to whichever server owns the path, and a user-space server can own a path
 that stands for another machine. It is not a real-time transport: requests go over TCP, and a lost peer is noticed
 after 2 s of silence. What it bounds is failure: a caller gets an error within a stated time instead of hanging.
