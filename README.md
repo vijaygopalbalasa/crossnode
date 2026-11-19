@@ -24,8 +24,8 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 
 - A machine shares only the paths it lists, and only root or one named group may use a peer's paths.
 - Each link has its own key. Both ends prove they hold it when they connect, and every frame after that carries an
-  HMAC-SHA256 tag with a frame counter, so a frame changed or replayed on the wire is refused. The traffic is not
-  encrypted.
+  HMAC-SHA256 tag with a frame counter, checked at both ends. The tests change and replay replies on the wire and
+  show them refused. The traffic is not encrypted.
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
   the peer comes back, with nothing restarted.
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
@@ -125,8 +125,9 @@ fail: `CN_MUTATE=1` cuts front instead of rear, leaves rear down and kills centr
 ## Reproduce
 
 Needs QNX SDP 8.0 (the free non-commercial licence works), a Linux shell where `qnxsdp-env.sh` is sourced, and QEMU
-(on macOS QEMU needs `-cpu max`, which the scripts pass). The images stay on your machine; nothing from QNX is in
-this repository.
+(on macOS QEMU needs `-cpu max`, which the scripts pass). The toolchain is SDP 8.0's `qcc` (the Makefile calls
+`qcc -Vgcc_ntox86_64`); the target is x86_64 QEMU guests built with `mkqnximage`. The images stay on your machine;
+nothing from QNX is in this repository.
 
 ```
 source ~/qnx800/qnxsdp-env.sh && make                       # build/x86_64: the two programs, the sensors and the test tools
@@ -196,7 +197,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 ## Limits
 
 - The traffic is not encrypted: on an untrusted network it can be read, though not changed or replayed unnoticed.
-  `-I` links have no handshake and no tags.
+  `-I` links have no handshake and no tags. The man-in-the-middle tests (loopback 25a, 25b) change and replay replies
+  only; the agent's check of request tags is in the code (`src/cn_agent.c`, `reader`) but not shown by a test.
 - The handshake caps (2 waiting handshakes per address, 4 authenticated connections per address) can drop a
   legitimate handshake from an address that is also flooding.
 - `crossnode-net` has one dispatch thread per process and one peer per process (central runs one per zone).
