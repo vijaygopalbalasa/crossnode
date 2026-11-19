@@ -101,7 +101,11 @@ static struct {
     int ring;                 /* completions are waiting for the dispatch thread */
     unsigned char *out;
     size_t outlen, outcap;
-    unsigned char rx[sizeof(struct cn_hdr) + CN_MAX_DATA];
+    unsigned char *wire;             /* keyed links: whole frames with their tags, in the order they go out */
+    size_t wirelen, wirecap;
+    unsigned char ktx[32], krx[32];  /* frame keys of this connection: to the agent, from the agent */
+    uint64_t ctx, crx;               /* frames sent and received since the handshake */
+    unsigned char rx[sizeof(struct cn_hdr) + CN_MAX_DATA + CN_TAG_LEN];
     size_t rxlen;
     struct pend pend[NPEND];
     int wake[2];
@@ -194,6 +198,24 @@ static int out_append(const struct cn_hdr *h, const void *p, size_t n)
     return 0;
 }
 
+static int wire_append(const void *p, size_t n)
+{
+    size_t need = G.wirelen + n;
+    if (need > G.wirecap) {
+        size_t cap = G.wirecap ? G.wirecap : 4096;
+        while (cap < need)
+            cap *= 2;
+        unsigned char *q = realloc(G.wire, cap);
+        if (q == NULL)
+            return -1;
+        G.wire = q;
+        G.wirecap = cap;
+    }
+    memcpy(G.wire + G.wirelen, p, n);
+    G.wirelen += n;
+    return 0;
+}
+
 static void queue_close_locked(int32_t rh)
 {
     struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_CLOSE, .seq = ++G.seq, .handle = rh };
@@ -216,7 +238,11 @@ static void teardown_locked(const char *why)
     G.gen++;
     G.last_fail = now_ms();
     G.outlen = 0;
+    G.wirelen = 0;
     G.rxlen = 0;
+    G.ctx = G.crx = 0;
+    memset(G.ktx, 0, sizeof G.ktx);
+    memset(G.krx, 0, sizeof G.krx);
     for (int i = 0; i < NPEND; i++) {
         struct pend *e = &G.pend[i];
         if (e->used && !e->done) {
@@ -229,6 +255,10 @@ static void teardown_locked(const char *why)
 
 static void up_locked(void)
 {
+    if (G.keylen) {          /* the handshake just finished: every later frame carries a tag */
+        cn_frame_keys(G.key, G.keylen, G.na, G.nc, G.ktx, G.krx);
+        G.ctx = G.crx = 0;
+    }
     G.state = C_UP;
     G.last_rx = G.last_ping = now_ms();
     vlog("peer up\n");
@@ -431,15 +461,26 @@ static void io_read_locked(void)
                 teardown_locked("protocol error");
                 return;
             }
-            if (G.rxlen - off < sizeof h + h.len)
+            size_t tag = G.state == C_UP && G.keylen ? CN_TAG_LEN : 0;   /* the handshake frames carry none */
+            if (G.rxlen - off < sizeof h + h.len + tag)
                 break;
+            if (tag) {
+                unsigned char want[CN_TAG_LEN];
+                cn_frame_tag(G.krx, G.crx++, G.rx + off, G.rx + off + sizeof h, h.len, want);
+#ifndef CN_NO_VERIFY
+                if (!cn_ct_equal(want, G.rx + off + sizeof h + h.len, CN_TAG_LEN)) {
+                    teardown_locked("a frame failed its integrity check (changed, replayed or out of order)");
+                    return;
+                }
+#endif
+            }
             int was_auth = G.state == C_AUTH;
             if (handle_frame_locked(&h, G.rx + off + sizeof h) != 0) {
                 teardown_locked(G.why ? G.why : was_auth ? "the agent's answer was wrong" : "a reply did not match its request");
                 G.why = NULL;
                 return;
             }
-            off += sizeof h + h.len;
+            off += sizeof h + h.len + tag;
         }
         memmove(G.rx, G.rx + off, G.rxlen - off);
         G.rxlen -= off;
@@ -460,10 +501,41 @@ static void io_write_locked(void)
         }
         return;
     }
-    ssize_t w = send(G.sock, G.out, G.outlen, 0);
+    if (G.keylen == 0) {                     /* -I: frames go out as they are */
+        ssize_t w = send(G.sock, G.out, G.outlen, 0);
+        if (w > 0) {
+            memmove(G.out, G.out + w, G.outlen - (size_t)w);
+            G.outlen -= (size_t)w;
+        } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            teardown_locked(strerror(errno));
+        }
+        return;
+    }
+    /* Keyed: each whole frame gets its tag as it moves from the queue to the wire, so the counter follows the order
+     * in which frames reach the agent (only this thread sends, under the lock). */
+    size_t off = 0;
+    while (G.outlen - off >= sizeof(struct cn_hdr)) {
+        struct cn_hdr h;
+        memcpy(&h, G.out + off, sizeof h);
+        size_t fl = sizeof h + h.len;
+        if (G.outlen - off < fl)
+            break;
+        unsigned char tag[CN_TAG_LEN];
+        cn_frame_tag(G.ktx, G.ctx++, G.out + off, G.out + off + sizeof h, h.len, tag);
+        if (wire_append(G.out + off, fl) != 0 || wire_append(tag, sizeof tag) != 0) {
+            teardown_locked("out of memory");
+            return;
+        }
+        off += fl;
+    }
+    memmove(G.out, G.out + off, G.outlen - off);
+    G.outlen -= off;
+    if (G.wirelen == 0)
+        return;
+    ssize_t w = send(G.sock, G.wire, G.wirelen, 0);
     if (w > 0) {
-        memmove(G.out, G.out + w, G.outlen - (size_t)w);
-        G.outlen -= (size_t)w;
+        memmove(G.wire, G.wire + w, G.wirelen - (size_t)w);
+        G.wirelen -= (size_t)w;
     } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         teardown_locked(strerror(errno));
     }
@@ -499,7 +571,7 @@ static void *io_thread(void *arg)
         fds[0].revents = 0;
         if (G.sock >= 0) {
             fds[1].fd = G.sock;
-            size_t pending = G.state == C_AUTH ? G.authlen : G.outlen;
+            size_t pending = G.state == C_AUTH ? G.authlen : G.outlen + G.wirelen;
             fds[1].events = (short)(G.state == C_CONNECTING ? POLLOUT : (POLLIN | (pending ? POLLOUT : 0)));
             fds[1].revents = 0;
             nfds = 2;
@@ -545,7 +617,7 @@ static void *io_thread(void *arg)
                 if (re & POLLIN)
                     io_read_locked();
                 if ((G.state == C_UP || G.state == C_AUTH) && (re & POLLOUT) &&
-                    (G.state == C_AUTH ? G.authlen : G.outlen))
+                    (G.state == C_AUTH ? G.authlen : G.outlen + G.wirelen))
                     io_write_locked();
                 if ((G.state == C_UP || G.state == C_AUTH) && (re & (POLLERR | POLLHUP | POLLNVAL)) && !(re & POLLIN))
                     teardown_locked("connection error");

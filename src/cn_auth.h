@@ -8,8 +8,10 @@
  * MAC(role, x, y) = HMAC-SHA256(key, "crossnode-v1" || role || x || y). The key never travels, and both
  * nonces are fresh per connection, so a recorded exchange cannot be replayed.
  *
- * This authenticates the two ends. It does not encrypt or integrity-protect the traffic after the
- * handshake: on an untrusted network, run it over a protected link.
+ * After the handshake every frame carries a tag (cn_frame_tag): HMAC-SHA256 over a per-direction frame counter, the
+ * 28-byte header and the payload, with one key per direction derived from both nonces (cn_frame_keys). A frame that
+ * is changed, replayed, dropped, reordered or reflected back fails its tag and the receiver drops the connection.
+ * The traffic is not encrypted: on an untrusted network the contents can still be read.
  */
 #ifndef CN_AUTH_H
 #define CN_AUTH_H
@@ -155,6 +157,30 @@ static inline void cn_auth_mac(const unsigned char *key, size_t klen, char role,
     const unsigned char *parts[4] = { tag, &r, x, y };
     size_t lens[4] = { sizeof tag - 1, 1, CN_NONCE_LEN, CN_NONCE_LEN };
     cn_hmac_sha256_parts(key, klen, parts, lens, 4, out);
+}
+
+#define CN_TAG_LEN 32
+
+/* The two frame keys of a connection, from the shared key and both handshake nonces (na from the agent, nc from
+ * crossnode-net): one for frames to the agent, one for frames to crossnode-net. */
+static inline void cn_frame_keys(const unsigned char *key, size_t klen, const unsigned char *na, const unsigned char *nc,
+                                 unsigned char to_agent[32], unsigned char to_net[32])
+{
+    cn_auth_mac(key, klen, 'n', na, nc, to_agent);
+    cn_auth_mac(key, klen, 'a', na, nc, to_net);
+}
+
+/* The tag of one frame: HMAC-SHA256(direction key, counter as 8 little-endian bytes || 28-byte header || payload).
+ * Each side counts the frames it sends and receives after the handshake, from 0. */
+static inline void cn_frame_tag(const unsigned char k[32], uint64_t ctr, const void *hdr, const void *payload, size_t n,
+                                unsigned char out[CN_TAG_LEN])
+{
+    unsigned char c[8];
+    for (int i = 0; i < 8; i++)
+        c[i] = (unsigned char)(ctr >> (8 * i));
+    const unsigned char *parts[3] = { c, (const unsigned char *)hdr, (const unsigned char *)payload };
+    size_t lens[3] = { 8, 28, n };
+    cn_hmac_sha256_parts(k, 32, parts, lens, n ? 3 : 2, out);
 }
 
 static inline int cn_ct_equal(const unsigned char *a, const unsigned char *b, size_t n)

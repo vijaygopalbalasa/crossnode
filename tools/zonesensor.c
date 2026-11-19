@@ -4,7 +4,7 @@
  *   zonesensor PATH LABEL UNIT MIN MAX STEP
  *
  * The reading starts at MIN and moves by STEP once per second, turning back at MIN and MAX, so a reader on
- * another machine sees it change. read returns one line, "LABEL value=N UNIT t=S", where S is the number of
+ * another machine sees it change. read returns one line, "LABEL(sim) value=N UNIT t=S", where S is the number of
  * seconds since the sensor started; devctl GET returns the reading (info value HELLO_INFO_MARK) and SET pins
  * it to a value until the next SET with -1, which lets a demo stage an event. The reading is computed from
  * the monotonic clock when it is read, so no thread or timer is needed.
@@ -57,7 +57,7 @@ static int s_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
     if ((msg->i.xtype & _IO_XTYPE_MASK) != _IO_XTYPE_NONE)
         return ENOSYS;
     if (ocb->offset == 0)
-        snprintf(text, sizeof text, "%s value=%ld %s t=%ld\n", label, reading(), unit, seconds());
+        snprintf(text, sizeof text, "%s(sim) value=%ld %s t=%ld\n", label, reading(), unit, seconds());
     size_t len = strlen(text);
     size_t off = (size_t)ocb->offset < len ? (size_t)ocb->offset : len;
     size_t n = len - off;

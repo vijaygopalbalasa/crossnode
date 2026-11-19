@@ -28,7 +28,7 @@ field() { echo "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
-   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
+   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT   # one shared key for this run

@@ -6,7 +6,8 @@ ARCH   ?= x86_64
 CC      = qcc -Vgcc_nto$(ARCH)
 CFLAGS ?= -O2 -g -std=gnu11 -Wall -Wextra -Werror
 OUT     = build/$(ARCH)
-BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe
+BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe $(OUT)/cnmitm \
+          $(OUT)/crossnode-net-noverify
 
 all: $(BINS)
 
@@ -25,7 +26,15 @@ $(OUT)/hellodev: tools/hellodev.c tools/hello_dcmd.h | $(OUT)
 $(OUT)/zonesensor: tools/zonesensor.c tools/hello_dcmd.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/zonesensor.c
 
-$(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h | $(OUT)
+# Test-only builds: a man in the middle for the integrity checks, and a crossnode-net that skips the frame check
+# (the mutation the integrity checks must catch).
+$(OUT)/cnmitm: tools/cnmitm.c src/cn_proto.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ tools/cnmitm.c -lsocket
+
+$(OUT)/crossnode-net-noverify: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
+	$(CC) $(CFLAGS) -DCN_NO_VERIFY -o $@ src/cn_net.c -lsocket
+
+$(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c -lsocket
 
 clean:

@@ -15,7 +15,7 @@ import socket
 import struct
 import sys
 
-MAGIC = 0x31304E43
+MAGIC = 0x32304E43   # "CN02"; this agent runs without a key (-I), so its frames carry no tag
 HDR = struct.Struct("<IHHIiiiI")          # magic, op, flags, seq, handle, a, b, len
 PING, OPEN, READ, WRITE, DEVCTL, CLOSE, CANCEL, STAT, READDIR = 1, 2, 3, 4, 5, 6, 7, 8, 9
 REPLY = 0x8000

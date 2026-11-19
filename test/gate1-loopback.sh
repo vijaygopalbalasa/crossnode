@@ -12,7 +12,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/x86_64
 KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT=$ROOT/evidence/gate1-loopback-$STAMP.txt
+OUT=$ROOT/evidence/gate1-loopback-$([ "${CN_MUTATE:-0}" = 1 ] && echo mutation-)$STAMP.txt
 mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
 
@@ -34,7 +34,8 @@ le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }    # le VALUE LIMIT, false if VALUE i
 # Refuse to produce evidence from a stale build: each binary must be newer than its own sources.
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
-   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h; then
+   || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h \
+   || stale cnmitm tools/cnmitm.c src/cn_proto.h || stale crossnode-net-noverify src/cn_net.c src/cn_proto.h src/cn_auth.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 
@@ -44,13 +45,17 @@ P=/net/self/dev/hello
 echo "== Crossnode gate 1, loopback, $STAMP"
 echo "guest: $(q 'uname -a')"
 echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo uncommitted)"
-for f in hellodev crossnode-agent crossnode-net cnprobe; do
+# CN_MUTATE=1 runs the whole suite with a crossnode-net built to skip the per-frame check: 25a and 25b must fail.
+NETBIN=crossnode-net; [ "${CN_MUTATE:-0}" = 1 ] && NETBIN=crossnode-net-noverify
+[ "${CN_MUTATE:-0}" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): crossnode-net is the build that skips the per-frame check; 25a and 25b must FAIL."
+for f in hellodev crossnode-agent $NETBIN cnprobe cnmitm; do
     echo "  $f sha256 $(shasum -a 256 "$BIN/$f" | cut -c1-16)"
 done
 q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; rm -f /tmp/cn/*.log /tmp/cn/*.txt; true'
-for f in hellodev crossnode-agent crossnode-net cnprobe; do
+for f in hellodev crossnode-agent cnprobe cnmitm; do
     q "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
 done
+q "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/$NETBIN"
 q 'umask 077; rm -f /tmp/cn/key /tmp/cn/key2; head -c 32 /dev/urandom > /tmp/cn/key; head -c 32 /dev/urandom > /tmp/cn/key2; ls -l /tmp/cn/key | cut -c1-10'
 q 'rm -rf /tmp/cnx && mkdir /tmp/cnx && echo "plain file inside the share" > /tmp/cnx/ok && ln -s /tmp/cnx/ok /tmp/cnx/inside && ln -s /etc/passwd /tmp/cnx/escape && ln -s /etc/no-such-file /tmp/cnx/probe'
 # Root, plus group 1000 (qnxuser), may use /net/self.
@@ -427,6 +432,24 @@ q 'slay -f -s KILL crossnode-net crossnode-agent >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 q 'slay -f -s KILL crossnode-agent crossnode-net >/dev/null 2>&1; sleep 1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
+
+echo
+echo "== 25. Every frame after the handshake carries an integrity tag"
+TAG=${CN_MITM_TAG:-32}     # tag bytes per frame; 0 models the stream before tags existed
+q "cd /tmp/cn; ./cnprobe set $P 42 >/dev/null; (./cnmitm 7790 127.0.0.1 7777 flip $TAG > mitm-flip.log 2>&1 &); (./crossnode-net -v -k /tmp/cn/key -n mitmflip -c 127.0.0.1:7790 > mitm-flip-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/mitmflip >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; sleep 1"
+O=$(q "cd /tmp/cn; ./cnprobe get /net/mitmflip/dev/hello; sleep 1; echo flips=\$(grep -c flipped mitm-flip.log) integrity=\$(grep -c 'integrity' mitm-flip-net.log)")
+echo "$O" | sed 's/^/  /'
+G1=$(echo "$O" | grep 'op=get'); L1=$(echo "$O" | grep 'flips=')
+[ "$(field rc "$G1")" = EHOSTDOWN ] && [ "$(field flips "$L1")" -ge 1 ] && [ "$(field integrity "$L1")" -ge 1 ]
+check "25a a reply with one bit flipped on the wire is refused: the call fails with EHOSTDOWN and the change is logged as an integrity failure, never handed to the program" $? "$G1; $L1"
+q 'slay -f cnmitm >/dev/null 2>&1; true'
+q "cd /tmp/cn; (./cnmitm 7791 127.0.0.1 7777 replay $TAG > mitm-replay.log 2>&1 &); (./crossnode-net -v -k /tmp/cn/key -n mitmreplay -c 127.0.0.1:7791 > mitm-replay-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/mitmreplay >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done; sleep 1"
+O=$(q "cd /tmp/cn; ./cnprobe get /net/mitmreplay/dev/hello; sleep 1; echo replays=\$(grep -c replayed mitm-replay.log) integrity=\$(grep -c 'integrity' mitm-replay-net.log)")
+echo "$O" | sed 's/^/  /'
+G2=$(echo "$O" | grep 'op=get'); L2=$(echo "$O" | grep 'replays=')
+[ "$(field rc "$G2")" = EOK ] && [ "$(field value "$G2")" = 42 ] && [ "$(field replays "$L2")" -ge 1 ] && [ "$(field integrity "$L2")" -ge 1 ]
+check "25b a reply sent twice is refused the second time: the first copy answers the call, the copy is logged as an integrity failure" $? "$G2; $L2"
+q 'slay -f cnmitm >/dev/null 2>&1; true'
 
 echo
 echo "== crossnode-net log"

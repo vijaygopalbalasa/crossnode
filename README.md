@@ -2,6 +2,8 @@
 
 Reach a device on another QNX 8.0 machine by its path, with the programs you already have.
 
+Simulated sensors on QEMU guests (`t` is seconds since the sensor started):
+
 ```
 central# ls /net/front/dev /net/rear/dev
 /net/front/dev:
@@ -18,11 +20,18 @@ rear-radar value=60 cm t=20
 QNX 7 had Qnet: every machine's `/dev` and files appeared under `/net/<node>/`, and an unmodified program could
 open, read, write and devctl a device on another machine. QNX 8.0 discontinued Qnet ("Qnet code was in the io-pkt
 package, which has been removed"; alternative "N/A", [QNX 8.0 discontinuation notice](https://www.qnx.com/developers/docs/relnotes8.0/com.qnx.doc.discontinuation_notice/topic/networking.html)).
-Crossnode brings the path-based part back for QNX 8.0 as two small user-space programs. A machine shares only the
-paths it lists; each link has its own key and both ends must prove they hold it; only root or one named group may
-use a peer's paths; when a peer goes silent, every waiting caller gets a clean error instead of hanging; and both
-programs can run as a non-root user under a QNX security policy that is enforced and cannot be changed while the
-system runs.
+Crossnode brings the path-based part back for QNX 8.0 as two small user-space programs:
+
+- A machine shares only the paths it lists, and only root or one named group may use a peer's paths.
+- Each link has its own key, and both ends prove they hold it when they connect. Frames after that are not yet
+  protected (see Limits).
+- When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
+  the peer comes back, with nothing restarted.
+- Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
+  and cannot be changed while the system runs.
+
+Crossnode has no AI component. It is infrastructure: the point is a non-obvious use of QNX's own resource manager,
+message passing, boot image and security policy features to bring back something QNX 8.0 lost.
 
 ![Three QNX 8.0 machines: front and rear zones share simulated sensors, central reads them by path](docs/architecture.svg)
 
@@ -37,7 +46,7 @@ listed at the end. The demo machines are QEMU guests and the sensors are simulat
 | A peer that loses power or freezes: every waiting call fails with `EHOSTDOWN` once the peer has been silent for 2 s (test bound 2000 + 200 ms), and the other zone keeps answering | zonal 9 and 10, two-node 4 and 5a |
 | The peer comes back and its path works again with nothing restarted on the using machine | zonal 12 and 13, two-node 7 |
 | Confined: both programs run as uid 70 and the sensors as uid 71, each under its own security type, under an immutable policy; `crossnode-net` may attach only its `/net` paths, the agent may attach none, and root cannot start another program under these types | zonal 4 to 7, boot image 6 to 11 |
-| Authenticated per link: an HMAC-SHA256 challenge with no key on the wire; no key, a wrong key, or an agent that cannot prove the key are refused; front's and rear's links use different keys | loopback 22a to 22f, `test/auth-vectors.c`, zonal 8 |
+| A key per link, proven at connect: an HMAC-SHA256 challenge with no key on the wire; no key, a wrong key, or an agent that cannot prove the key are refused; front's and rear's links use different keys | loopback 22a to 22f, `test/auth-vectors.c`, zonal 8 |
 | Only listed paths are shared, links must stay inside a share, and only root or the group given with `-g` may use a peer | loopback 3, 3b to 3e, 12a, 12b, 19f, 20e, boot image 5 |
 
 Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md). Transcripts are in `evidence/`;
@@ -64,7 +73,7 @@ emulated machines, not performance figures for QNX.
 
 ## Why not Qnet, NFS, SSHFS or plain sockets?
 
-| Option | What it gives | Why it does not do this job |
+| Option | What it gives | What it does not cover (by design or protocol; not a test of QNX) |
 |---|---|---|
 | Qnet | QNX 7's `/net/<node>/` for any resource manager | Discontinued in QNX 8.0, alternative "N/A" (notice linked above) |
 | NFS v3 (QNX 8.0 has [`fs-nfs3`](https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/f/fs-nfs3.html) and [`nfsd`](https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/n/nfsd.html)) | Remote files | In the NFS v3 protocol (RFC 1813, section 3.3) there is no device-control procedure, and a device file is only a type and two numbers, so a sensor's `devctl` or `stty` has no way to reach the other machine's driver. We did not evaluate QNX's NFS. |
@@ -90,8 +99,7 @@ the demo, not hand-designed or minimised. What they give the Crossnode and senso
 `prot_exec` and `map_fixed` were recorded for every program here, the sensors included; we did not test removing
 them.
 
-Every ability not listed is denied. The policy also decides which session types may open `/net/front` at all, on top
-of Crossnode's own root-or-group check.
+Every ability not listed is denied.
 
 ## Zonal demo: three machines
 
@@ -103,7 +111,8 @@ machines after power-on, and the checks run commands on central over SSH from th
 central reads it; the read fails with `EHOSTDOWN` within the stated bound, front keeps answering, and when rear boots
 again central reads it with the same `crossnode-net` processes. On the enforced set: 13 of 13
 (`evidence/zonal-20261119T013940Z.txt`). With `CN_MUTATE=1` the same script cuts front instead of rear, leaves rear down and kills
-central's services, and checks 9 to 13 fail as they should (`evidence/zonal-mutation-20261119T014026Z.txt`). `demo/zonal-demo.sh` is the
+central's services; it runs on the open (policy-recording) set, because root must be able to kill central's services there,
+so checks 6 and 7 do not apply, and checks 9 to 13 fail as they should (`evidence/zonal-mutation-20261119T014026Z.txt`). `demo/zonal-demo.sh` is the
 same story for the video, shown with a plain `cat` loop, which prints "Host is down".
 
 ## Reproduce
@@ -174,11 +183,13 @@ Wire format: `src/cn_proto.h` (a 28-byte header and a payload; both ends little-
 
 ## Limits
 
-- Authentication proves both ends of a link hold its key. The traffic after the handshake is not encrypted, and has
-  no integrity or replay protection, so use a protected link.
+- Authentication proves both ends of a link hold its key when they connect. The frames after the handshake are not
+  encrypted and, for now, have no integrity or replay protection, so use a protected link.
 - The handshake caps (2 waiting handshakes per address, 4 authenticated connections per address) can drop a
   legitimate handshake from an address that is also flooding.
 - `crossnode-net` has one dispatch thread per process and one peer per process (central runs one per zone).
+- For a directory, the second check compares device and inode of a second open, not `iofdinfo`, because `iofdinfo`
+  cannot check a descriptor opened with `O_DIRECTORY` (observed: `ENOSYS`).
 - A device or FIFO is checked by name before and after a second resolve, not through an opened descriptor (opening
   it would run its open handler), so a path swapped in between is narrowed but not ruled out.
 - `stat` follows links, so `ls -l` shows a link inside a share as the file it points to.

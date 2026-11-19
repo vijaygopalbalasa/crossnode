@@ -1,7 +1,9 @@
 /*
- * Crossnode wire protocol, version 1.
+ * Crossnode wire protocol, version 2.
  *
- * Every frame is a fixed 28-byte header followed by `len` payload bytes.
+ * Every frame is a fixed 28-byte header followed by `len` payload bytes. On a link started with a key (-k), every
+ * frame after the handshake is followed by a 32-byte integrity tag (CN_TAG_LEN, see cn_auth.h); with -I there is no
+ * handshake and no tag.
  * Both ends are little-endian QNX targets (x86_64 and aarch64le), so fields travel as they are.
  */
 #ifndef CN_PROTO_H
@@ -9,7 +11,7 @@
 
 #include <stdint.h>
 
-#define CN_MAGIC        0x31304e43u     /* "CN01" as little-endian bytes */
+#define CN_MAGIC        0x32304e43u     /* "CN02" as little-endian bytes (version 2: tagged frames) */
 #define CN_MAX_DATA     16384u          /* largest read, write or devctl payload */
 #define CN_MAX_PATH     1024u           /* longest path, without the terminating NUL */
 #define CN_MAX_HANDLES  256             /* open remote files per connection */

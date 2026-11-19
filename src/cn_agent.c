@@ -100,6 +100,9 @@ struct conn {
     pthread_mutex_t dir_mtx;       /* one directory read at a time: a directory descriptor has one offset */
     struct jobslot js[MAX_JOBS];
     char peer[64];
+    int tagged;               /* keyed link after the handshake: every frame carries a tag */
+    unsigned char ktx[32], krx[32];  /* frame keys: to crossnode-net (written under mtx), from it (reader only) */
+    uint64_t ctx, crx;        /* frames sent (under mtx) and received since the handshake */
 };
 
 struct job {
@@ -261,14 +264,19 @@ static void send_reply_f(struct conn *c, const struct cn_hdr *req, int32_t err, 
         .magic = CN_MAGIC, .op = (uint16_t)(req->op | CN_REPLY), .flags = flags, .seq = req->seq,
         .handle = req->handle, .a = err, .b = val, .len = len,
     };
-    unsigned char *buf = malloc(sizeof r + len);
+    unsigned char *buf = malloc(sizeof r + len + CN_TAG_LEN);
     if (buf == NULL)
         return;                   /* the peer sees no reply and its liveness check stays honest */
     memcpy(buf, &r, sizeof r);
     if (len)
         memcpy(buf + sizeof r, data, len);
     pthread_mutex_lock(&c->mtx);
-    if (!c->dead && write_full(c->sock, buf, sizeof r + len) != 0) {
+    size_t n = sizeof r + len;
+    if (c->tagged) {              /* the counter follows the order of writes, which this lock fixes */
+        cn_frame_tag(c->ktx, c->ctx++, buf, buf + sizeof r, len, buf + n);
+        n += CN_TAG_LEN;
+    }
+    if (!c->dead && write_full(c->sock, buf, n) != 0) {
         c->dead = 1;
         shutdown(c->sock, SHUT_RDWR);
     }
@@ -987,6 +995,9 @@ static int handshake(struct conn *c)
     cn_auth_mac(key, keylen, 'A', req, na, out + sizeof r);
     if (write_full(c->sock, out, sizeof r + CN_MAC_LEN) != 0)
         return -1;
+    cn_frame_keys(key, keylen, na, req, c->krx, c->ktx);   /* req starts with crossnode-net's nonce */
+    c->ctx = c->crx = 0;
+    c->tagged = 1;
     struct timeval rtv = { PEER_SILENCE_MS / 1000, (PEER_SILENCE_MS % 1000) * 1000 };
     setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
     vlog("peer %s authenticated\n", c->peer);
@@ -1009,6 +1020,19 @@ static void *reader(void *arg)
         if (h.len) {
             p = malloc(h.len);
             if (p == NULL || read_full(c->sock, p, h.len) != 0) {
+                free(p);
+                break;
+            }
+        }
+        if (c->tagged) {
+            unsigned char got[CN_TAG_LEN], want[CN_TAG_LEN];
+            if (read_full(c->sock, got, sizeof got) != 0) {
+                free(p);
+                break;
+            }
+            cn_frame_tag(c->krx, c->crx++, &h, p, h.len, want);
+            if (!cn_ct_equal(want, got, CN_TAG_LEN)) {
+                fprintf(stderr, "crossnode-agent: a frame from %s failed its integrity check; dropping the connection\n", c->peer);
                 free(p);
                 break;
             }
