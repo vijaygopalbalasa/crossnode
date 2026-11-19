@@ -8,7 +8,7 @@ on a direct link), priority (the same two machines), boot image (the pair built 
 - `gate1-loopback-20261119T144602Z` (81 of 81); `gate1-loopback-mutation-20261119T144831Z` (`crossnode-net` and
   `crossnode-agent` built to skip the frame check: 25a, 25b, 25c and 25d fail).
 - `gate1-twonode-20261119T145100Z` (24 of 24); `gate1-twonode-mutation-liveness-20261119T145249Z` (no liveness limit:
-  4, 5a and 5b fail); `gate1-twonode-mutation-notify-20261119T145603Z` (no `select` forwarding: 8b to 8e fail).
+  4, 5a and 5b fail); `gate1-twonode-mutation-notify-20261119T145603Z` (no `select` forwarding: 8b to 8f fail).
 - `priority-20261119T145756Z` (4 of 4); `priority-mutation-20261119T145900Z` (priority not carried: check 2 fails);
   `priority-mutation-central-20261119T145958Z` (`crossnode-net` started without `-r`: check 4 fails). Checks 2 and 4 are timed inside the caller's machine against a 1000 ms bound, and the transcript records `io-sock` at priority 21 on both machines. At an earlier
   commit, one priority run in a release sequence failed check 4 once while four reruns passed; that transcript,
@@ -66,10 +66,10 @@ guest.
 | The priority checks can fail | priority 2 with `CN_MUTATE=1`; priority 4 with `CN_MUTATE=central` | without carrying the priority: `rc=EOK, outside the bound`; without `-r`: `rc=EHOSTDOWN, outside the bound` (the starved I/O thread let the link look dead) |
 | `/net/<name>/.status` says up or down, authenticated, waiting calls, connects, drops and refused frames with their last reasons; it is read-only, answered locally, and works with the peer down or never reached | loopback 26a to 26d; zonal 15 | after rear's power cut and reboot: `connects    2`, `drops       1`, `last down   no answer within the liveness limit`, `refused     0 frames` |
 | One file lists every peer (`crossnode-net -f`): a bad file is refused before anything is attached; each peer gets its own process, and an unreachable peer does not hold up another | loopback 27a, 27b; zonal 16 | `named twice`, a missing key and the name `..` refused; `confa EOK, confb EHOSTDOWN, confa again EOK`; on central, both processes started by one `-f /data/etc/crossnode.conf` |
-| `select`, `poll` and `ionotify` on a peer's device: a program waiting on another machine's serial port wakes when a line is typed there; with nothing typed it times out; a wait wakes when the link fails | two-node 8a, 8b, 8e | `ready=1 read=EOK data=typed-on-nodey-ser2_`; `ready=0`; `ready=1 read=EHOSTDOWN` |
+| `select`, `poll` and `ionotify` on a peer's device: a program waiting on another machine's serial port wakes when a line is typed there; with nothing typed it times out; a wait wakes when the link fails | two-node 8a, 8b, 8e, 8f | `ready=1 read=EOK data=typed-on-nodey-ser2_`; `ready=0`; `ready=1 read=EHOSTDOWN` |
 | At most 16 `select` waiters per link (both ends enforce it): the 17th gets `EAGAIN` at once and ordinary calls still go through | two-node 8c | `eagain=4 timedout=16` with 20 waiters, and the devctl after them `rc=EOK` |
 | An ordinary POSIX program with no Crossnode code (`examples/serialwatch.c`: `open`, `tcsetattr`, `select`, `read`), written the way a Qnet-era program watches another machine's serial port, runs unchanged through `/net` | two-node 8d | it sets nodey's port to 115200 baud (nodey's own `stty` reports `baud=115200`) and prints the line typed on it |
 | The supervisor (`crossnode-net -f`): a peer process that dies is started again; `kill -HUP` adds and removes peers and leaves the others alone; under the enforced policy too | loopback 27c, 27d; zonal 17 | `confa EOK from` a new pid; `confc EOK, confb gone, confa` same pid; on central, rear back from a new pid after its process is killed |
-| The `select` checks can fail | two-node 8b to 8e with `CN_MUTATE=notify` | `ready=0` where a line was typed; `eagain=0 timedout=20`; no wake on link failure |
+| The `select` checks can fail | two-node 8b to 8f with `CN_MUTATE=notify` | `ready=0` where a line was typed; `eagain=0 timedout=20`; no wake on link failure |
 | The liveness checks can fail | two-node 4, 5a, 5b with `CN_MUTATE=liveness` | the waiting calls never end with `EHOSTDOWN` (`call_ms=` is empty) |
 | The power-cut checks can fail | zonal 10 to 17 with `CN_MUTATE=1` | 7 FAIL lines, each for the reason the mutation causes |

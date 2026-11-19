@@ -90,7 +90,7 @@ boards, not a sensor's real-time data path.
 | The caller's priority, as the kernel gave it to the receiving thread (`ctp->info.priority`), sent with the request and used for the worker on the other machine (`PTHREAD_EXPLICIT_SCHED`), capped by `-P` | `src/cn_net.c`, `submit`; `src/cn_agent.c`, job start | priority 1 to 4 |
 | A file answered by the resource manager itself, never forwarded (`/net/<peer>/.status`) | `src/cn_net.c`, `cn_open`, `status_text` | loopback 25c, 26a to 26d, zonal 15 |
 | A stale unblock pulse told apart from a live one (`MsgInfo`, `_NTO_MI_UNBLOCK_REQ`) | `src/cn_net.c`, `cancel_waiting` | loopback 21a to 21e, two-node 3, 3b |
-| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8e |
+| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8f |
 | Path containment (`realpath`), then the opened descriptor is asked where it points (`iofdinfo`) | `src/cn_agent.c`, `resolve`, `do_open` | loopback 3, 3b to 3e |
 | A blocked device call interrupted with a targeted signal (`pthread_kill`) | `src/cn_agent.c`, `cancel_job_locked` | loopback 16d, 16e, two-node 2c-2 |
 | Security policy: one type per program, recorded with `secpolgenerate`, compiled into the boot image and enforced (`on -T`, `mkqnximage --secpol --policy`, `secpol -Q`) | `image/build-image.sh`, `image/record-policy.sh` | zonal 4 to 8, boot image 6 to 13 |
@@ -114,7 +114,7 @@ Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md
 `evidence/` ran at commit `24e8610` (earlier runs, including the first submission's, are in `evidence/history/`); each
 names its commit. Every important check has a deliberately broken build or run that fails it: the frame check
 (loopback 25a to 25d), priority carrying (priority 2), the I/O thread's priority (priority 4), the liveness limit
-(two-node 4, 5a, 5b), `select` forwarding (two-node 8b to 8e), the power cut (zonal 10 to 17) and confinement (zonal 4 to 8). The times are pass or fail
+(two-node 4, 5a, 5b), `select` forwarding (two-node 8b to 8f), the power cut (zonal 10 to 17) and confinement (zonal 4 to 8). The times are pass or fail
 against bounds stated in the tests, for this code on emulated machines, not performance figures for QNX.
 
 ## Why not Qnet, NFS, SSHFS or plain sockets?
@@ -299,8 +299,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 test/twonode-up.sh IMAGES_DIR                           # boot two plain test machines (nodex, nodey) with a direct link
 test/gate1-loopback.sh 2222                             # 81 checks on one machine
 CN_MUTATE=1 test/gate1-loopback.sh 2222                 # builds that skip the frame check: 25a to 25d fail
-test/gate1-twonode.sh IMAGES_DIR                        # 24 checks across the two machines
-CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b to 8e fail
+test/gate1-twonode.sh IMAGES_DIR                        # 25 checks across the two machines
+CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b to 8f fail
 CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR     # a crossnode-net without the liveness limit: 4, 5a and 5b fail
 test/priority.sh IMAGES_DIR                             # 4 checks: the caller's priority on both machines
 CN_MUTATE=1|central test/priority.sh IMAGES_DIR         # priority not carried: 2 fails; no -r on the caller's side: 4 fails
