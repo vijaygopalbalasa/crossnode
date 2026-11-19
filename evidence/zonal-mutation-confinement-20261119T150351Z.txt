@@ -1,0 +1,65 @@
+== Crossnode zonal demo check, 20261119T150351Z, build 24e8610
+== MUTATION RUN (CN_MUTATE=confinement): the set was built without the security policy (CN_SECPOL=no) but is checked as CN_EXPECT=secure. Checks 4 to 8 must FAIL.
+front started
+rear started
+central started
+front: startup complete
+rear: startup complete
+central: startup complete
+  front 8.0.0 
+  rear 8.0.0 
+  central 8.0.0 
+  expected: secure; detected: confined services no, security policy enforced no
+== 1. Power on, nothing typed: central sees both zones by path
+  central# ls /net/front/dev; ls /net/rear/dev -> hello temp radar 
+PASS  1 central lists each zone's shared devices, and only those  [hello temp radar ]
+  central# cat /net/front/dev/temp -> cabin-temp(sim) value=23 C t=11
+  central# cat /net/rear/dev/radar -> rear-radar(sim) value=123 cm t=11
+PASS  2 central reads both zones' sensors with cat  [cabin-temp(sim) value=23 C t=11 | rear-radar(sim) value=123 cm t=11]
+  central# cat /net/rear/dev/radar (2 s later) -> rear-radar(sim) value=109 cm t=13
+PASS  3 the rear radar's reading moves as central watches it  [123 cm -> 109 cm]
+FAIL  4 central's crossnode-net processes (a supervisor and one per zone) run as uid 70 under crossnode_net_t  [ 3 - 0]
+FAIL  5 each zone's agent runs as uid 70 and each sensor as uid 71, each under its own security type  [front: - 0 - 0 - 0 ; rear: - 0 - 0 ]
+FAIL  6 all three machines run under a security policy that cannot be changed while they run  [policy id:0 policy id:0 policy id:0 ]
+  root tries secpolpush: policy id:0 sh: secpolpush: cannot execute - No such file or directory policy id:0 
+  root tries secpolpush: policy id:0 sh: secpolpush: cannot execute - No such file or directory policy id:0 
+  root tries secpolpush: policy id:0 sh: secpolpush: cannot execute - No such file or directory policy id:0 
+FAIL  7 root's attempt to load a security policy is refused on all three, and the policy id stays the same  [0 of 3 refused]
+/proc/boot/secpol.bin: No such file or directory
+FAIL  8 on central, crossnode-net's type may attach exactly /net/front and /net/rear  []
+PASS  9 each link has its own key: front's and rear's differ, and central holds each only for its own link  [checksums front 1622034019, rear 428768203, central 1622034019 and 428768203]
+== 2. The rear zone loses power while central is watching it
+  power cut on rear at 15:04:18 UTC
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=10 rc=EOK value=60 ms=4
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=11 rc=EOK value=60 ms=4
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=12 rc=EHOSTDOWN value=0 ms=1751
+  central# cnprobe watch /net/rear/dev/radar: result=stopped rc=EHOSTDOWN call_ms=1751 t_end=29250
+PASS  10 the live readings stop with EHOSTDOWN within the liveness limit when rear loses power  [12 readings, then result=stopped rc=EHOSTDOWN call_ms=1751 t_end=29250, bound 2000+200 ms]
+  central# (rear down) op=watch i=0 rc=EOK value=25 ms=2
+  central# (rear down) op=watch i=1 rc=EOK value=24 ms=3
+  central# (rear down) op=watch i=2 rc=EOK value=24 ms=3
+  central# (rear down) hello from front
+PASS  11 the front zone keeps answering while rear is down  [3 readings and hello]
+PASS  12 a new open on the dead zone fails cleanly instead of hanging  [op=open rc=EHOSTDOWN ms=1507]
+== 3. The rear zone boots again
+rear started
+rear: startup complete
+  central# cnprobe watch /net/rear/dev/radar 1 0 -> op=watch i=0 rc=EOK value=193 ms=2
+  central# cat /net/rear/dev/radar -> rear-radar(sim) value=193 cm t=1
+PASS  13 central reads the rear radar again after rear reboots  [rear-radar(sim) value=193 cm t=1]
+PASS  14 nothing was restarted on central: the same crossnode-net processes serve both zones  [pids before: 348175 356373 356374  after: 348175 356373 356374 ]
+  central# cat /net/rear/.status: peer        rear at 10.10.0.2:7777
+  central# cat /net/rear/.status: state       up for 0 s
+  central# cat /net/rear/.status: link        authenticated; every frame carries an HMAC-SHA256 tag
+  central# cat /net/rear/.status: last heard  within the last second (down after 2 s of silence)
+  central# cat /net/rear/.status: waiting     0 calls
+  central# cat /net/rear/.status: connects    2
+  central# cat /net/rear/.status: drops       1
+  central# cat /net/rear/.status: last down   no answer within the liveness limit
+  central# cat /net/rear/.status: refused     0 frames
+PASS  15 /net/rear/.status tells the story: up again, connected twice, dropped once for silence, nothing refused  [connects 2;drops 1;last down no answer within the liveness limit;]
+PASS  16 central's links come from one file: the supervisor and both zone processes come from one -f /data/etc/crossnode.conf listing front and rear  [3 processes; peers in the file: front rear ]
+  central# kill -9 356374 (rear's process); then rear rc=EOK from pid 1974274
+PASS  17 under the enforced policy, the supervisor starts rear's process again when it is killed, and central reads rear again within 12 s  [pid 356374 killed, rear back from pid 1974274]
+
+== RESULT: 12 passed, 5 failed
