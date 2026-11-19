@@ -75,8 +75,10 @@ struct pair {
 static void *upstream(void *arg)
 {
     struct pair *pp = arg;
-    static unsigned char frame[sizeof(struct cn_hdr) + CN_MAX_DATA + 64];
+    unsigned char *frame = malloc(sizeof(struct cn_hdr) + CN_MAX_DATA + 64);   /* one per connection */
     int n = 0, done = 0;
+    if (frame == NULL)
+        return NULL;
     for (;;) {
         struct cn_hdr h;
         if (read_full(pp->client, &h, sizeof h) != 0 || h.magic != CN_MAGIC || h.len > CN_MAX_DATA)
@@ -96,6 +98,7 @@ static void *upstream(void *arg)
         if (write_full(pp->agent, frame, total) != 0)
             break;
     }
+    free(frame);
     shutdown(pp->agent, SHUT_RDWR);
     shutdown(pp->client, SHUT_RDWR);
     return NULL;
@@ -141,6 +144,10 @@ int main(int argc, char **argv)
     }
     mode = argv[4];
     trailer = (size_t)atoi(argv[5]);
+    if (trailer > 64) {
+        fprintf(stderr, "cnmitm: TRAILER is at most 64\n");
+        return 2;
+    }
     signal(SIGPIPE, SIG_IGN);
     memset(&target, 0, sizeof target);
     target.sin_family = AF_INET;

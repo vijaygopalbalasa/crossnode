@@ -487,18 +487,18 @@ q "cd /tmp/cn; (./crossnode-net -v -k /tmp/cn/key -n nobody -c 127.0.0.1:7798 > 
 O=$(q 'cat /net/nobody/.status; /tmp/cn/cnprobe get /net/nobody/dev/hello; cat /net/nobody/.status')
 echo "$O" | sed 's/^/  /'
 echo "$O" | grep -q '^state       not connected yet' && echo "$O" | grep -q '^connects    0$' \
-  && echo "$O" | grep -q 'rc=EHOSTDOWN' && echo "$O" | grep -q '^last down   could not connect: '
-check "26d a peer that was never reached: .status says not connected yet, then why the first call could not connect" $? "$(echo "$O" | grep '^last down' | tail -1 | cut -c13-)"
+  && echo "$O" | grep -q 'rc=EHOSTDOWN' && echo "$O" | grep -q '^retry       the last attempt failed: ' && ! echo "$O" | grep -q '^last down'
+check "26d a peer that was never reached: .status says not connected yet, then why the first call could not connect (and no drop, since it never came up)" $? "$(echo "$O" | grep '^retry' | tail -1 | cut -c13-)"
 q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 
 echo
 echo "== 27. One file lists every peer (crossnode-net -f)"
-q 'cd /tmp/cn; printf "# name     address          key\nconfa      127.0.0.1:7777   /tmp/cn/key\n\nconfb      127.0.0.1:7797   /tmp/cn/key\n" > peers.conf; printf "confa 127.0.0.1:7777 /tmp/cn/key\nconfa 127.0.0.1:7778 /tmp/cn/key\n" > twice.conf; printf "confa 127.0.0.1:7777 /tmp/cn/no-such-key\n" > nokey.conf'
-O=$(q 'cd /tmp/cn; ./crossnode-net -f twice.conf 2>&1; echo "exit=$?"; ./crossnode-net -f nokey.conf 2>&1; echo "exit=$?"; ls -d /net/confa 2>&1 | grep -c "^/net/confa$"')
+q 'cd /tmp/cn; printf "# name     address          key\nconfa      127.0.0.1:7777   /tmp/cn/key   # the agent on this machine\n\nconfb      127.0.0.1:7797   /tmp/cn/key\n" > peers.conf; printf "confa 127.0.0.1:7777 /tmp/cn/key\nconfa 127.0.0.1:7778 /tmp/cn/key\n" > twice.conf; printf "confa 127.0.0.1:7777 /tmp/cn/no-such-key\n" > nokey.conf; printf ".. 127.0.0.1:7777 /tmp/cn/key\n" > dotdot.conf'
+O=$(q 'cd /tmp/cn; ./crossnode-net -f twice.conf 2>&1; echo "exit=$?"; ./crossnode-net -f nokey.conf 2>&1; echo "exit=$?"; ./crossnode-net -f dotdot.conf 2>&1; echo "exit=$?"; ls -d /net/confa 2>&1 | grep -c "^/net/confa$"')
 echo "$O" | sed 's/^/  /'
-[ "$(echo "$O" | grep -c '^exit=2$')" = 2 ] && echo "$O" | grep -q 'named twice' && echo "$O" | grep -q 'no-such-key' && [ "$(echo "$O" | tail -1)" = 0 ]
-check "27a a file that names a peer twice, or points at a missing key, is refused before anything is attached" $? "$(echo "$O" | grep -c '^exit=2$') refused, $(echo "$O" | tail -1) attached"
+[ "$(echo "$O" | grep -c '^exit=2$')" = 3 ] && echo "$O" | grep -q 'named twice' && echo "$O" | grep -q 'no-such-key' && echo "$O" | grep -q 'bad name \.\.' && [ "$(echo "$O" | tail -1)" = 0 ]
+check "27a a file that names a peer twice, points at a missing key, or names a peer .., is refused before anything is attached" $? "$(echo "$O" | grep -c '^exit=2$') refused, $(echo "$O" | tail -1) attached"
 q "cd /tmp/cn; (./crossnode-net -v -f peers.conf > conf-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/confa /net/confb >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done"
 O=$(q 'cd /tmp/cn; ./cnprobe get /net/confa/dev/hello; ./cnprobe get /net/confb/dev/hello; ./cnprobe get /net/confa/dev/hello; pidin -p crossnode-net arg | grep -c "\-f peers.conf"; sed -n 1,2p /net/confa/.status; sed -n 1p /net/confb/.status')
 echo "$O" | sed 's/^/  /'

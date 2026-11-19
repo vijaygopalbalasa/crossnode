@@ -9,7 +9,7 @@
 #        instead of being skipped when the machines do not look confined.
 #        CN_MUTATE=1 test/zonal.sh PROJECTS_DIR   a deliberately broken run: front loses power instead of rear, rear
 #        is cut later and not booted again, and central's crossnode-net processes are killed before check 14.
-#        Checks 10 to 15 must fail.
+#        Checks 10 to 16 must fail.
 #        Checks 10 to 14 must then fail; run it on a policy-recording (open) set, where root may kill the services.
 #        CN_MUTATE=confinement CN_EXPECT=secure on a set built without the policy: checks 4 to 8 must fail.
 set -u
@@ -32,7 +32,7 @@ trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
 echo "== Crossnode zonal demo check, $STAMP, build $(cd "$ROOT" && git describe --always --dirty)"
 [ "$MUTATE" = confinement ] && echo "== MUTATION RUN (CN_MUTATE=confinement): the set was built without the security policy (CN_SECPOL=no) but is checked as CN_EXPECT=secure. Checks 4 to 8 must FAIL."
-[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 15 must FAIL."
+[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 16 must FAIL."
 "$ROOT/image/run-zones.sh" "$D"
 sleep 8
 for p in $FRONT $REAR $CENTRAL; do echo "  $(ssh_to $p 'uname -n; uname -r' | tr '\n' ' ')"; done

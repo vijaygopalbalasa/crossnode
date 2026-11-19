@@ -956,7 +956,7 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
     int rc = pthread_create(&t, &at, worker, j);
     pthread_attr_destroy(&at);
     if (rc != 0) {
-        send_reply(c, h, EAGAIN, 0, NULL, 0);
+        send_reply(c, h, rc, 0, NULL, 0);     /* EAGAIN when out of threads, EPERM when the priority is not allowed */
         job_end(j);
     }
 }

@@ -129,6 +129,7 @@ static struct {
     uint64_t up_at, down_at;         /* when the link last came up, last went down */
     unsigned ups, drops, refused;    /* times up, times dropped after being up or authenticating, frames refused */
     char last_drop[128], last_refused[128];
+    char last_connect[128];          /* why the latest connection attempt failed; cleared when the link comes up */
 } G = { .mtx = PTHREAD_MUTEX_INITIALIZER, .sock = -1 };
 
 static iofunc_attr_t dir_attr, file_attr, status_attr;
@@ -249,7 +250,7 @@ static void teardown_locked(const char *why)
         G.drops++;
         snprintf(G.last_drop, sizeof G.last_drop, "%s%s", G.state == C_AUTH ? "authentication failed: " : "", why);
     } else if (G.state == C_CONNECTING) {
-        snprintf(G.last_drop, sizeof G.last_drop, "could not connect: %s", why);
+        snprintf(G.last_connect, sizeof G.last_connect, "%s", why);
     }
     if (G.state != C_DOWN)
         G.down_at = now_ms();
@@ -283,6 +284,7 @@ static void up_locked(void)
     G.state = C_UP;
     G.last_rx = G.last_ping = G.up_at = now_ms();
     G.ups++;
+    G.last_connect[0] = '\0';
     vlog("peer up\n");
 }
 
@@ -1040,6 +1042,8 @@ static char *status_text(size_t *len)
     ADD("drops       %u\n", G.drops);
     if (G.last_drop[0])
         ADD("last down   %s\n", G.last_drop);
+    if (G.state != C_UP && G.last_connect[0])
+        ADD("retry       the last attempt failed: %s\n", G.last_connect);
     ADD("refused     %u frame%s%s%s\n", G.refused, G.refused == 1 ? "" : "s", G.last_refused[0] ? ", last: " : "",
         G.last_refused);
     pthread_mutex_unlock(&G.mtx);
@@ -1099,6 +1103,14 @@ static int cn_open(resmgr_context_t *ctp, io_open_t *msg, iofunc_attr_t *handle,
         if (msg->connect.ioflag & _IO_FLAG_WR) {
             ocb_destroy(ocb);
             return EROFS;
+        }
+        if ((msg->connect.ioflag & O_DIRECTORY) || (msg->connect.eflag & _IO_CONNECT_EFLAG_DIR)) {
+            ocb_destroy(ocb);
+            return ENOTDIR;
+        }
+        if ((msg->connect.ioflag & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+            ocb_destroy(ocb);
+            return EEXIST;
         }
         ocb->text = status_text(&ocb->tlen);
         if (ocb->text == NULL) {
@@ -1160,8 +1172,10 @@ static int cn_stat(resmgr_context_t *ctp, io_stat_t *msg, struct cn_ocb *ocb)
 {
     struct aux x = { .sm = msg, .cap = 0 };
     switch (ocb->state) {
-    case OCB_LOCAL:
     case OCB_STATUS:
+        status_attr.nbytes = ocb->tlen;     /* each open has its own snapshot; one dispatch thread, so no race */
+        return iofunc_stat_default(ctp, msg, &ocb->hdr);
+    case OCB_LOCAL:
         return iofunc_stat_default(ctp, msg, &ocb->hdr);
     case OCB_STATPATH:
         return submit(ctp, CN_OP_STAT, NULL, NULL, -1, 0, 0, ocb->path, (uint32_t)strlen(ocb->path), 0, &x);
@@ -1265,8 +1279,10 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
  * the exception, because its position is only an entry index that this side keeps (rewinddir, seekdir). */
 static int cn_lseek(resmgr_context_t *ctp, io_lseek_t *msg, struct cn_ocb *ocb)
 {
-    if (ocb->state == OCB_STATUS)
+    if (ocb->state == OCB_STATUS) {
+        status_attr.nbytes = ocb->tlen;
         return iofunc_lseek_default(ctp, msg, &ocb->hdr);
+    }
     if (ocb->state != OCB_OPEN || !ocb->isdir)
         return ESPIPE;
     int64_t pos;
@@ -1310,6 +1326,25 @@ struct peercfg {
     size_t keylen;
 };
 
+/* A peer name becomes one path component under DIR: letters, digits, '-', '_' and '.', but not "." or "..", and
+ * not the status file's name. */
+static int name_ok(const char *n)
+{
+    if (n[0] == '\0' || strcmp(n, ".") == 0 || strcmp(n, "..") == 0 || strcmp(n, CN_STATUS_NAME) == 0 || strlen(n) > 63)
+        return 0;
+    for (const char *p = n; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+            return 0;
+    return 1;
+}
+
+static int port_ok(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    return end != s && *end == '\0' && v > 0 && v <= 65535;
+}
+
 static int read_conf(const char *path, struct peercfg *pc, int max)
 {
     FILE *f = fopen(path, "r");
@@ -1322,8 +1357,16 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
     while (!bad && fgets(line, sizeof line, f) != NULL) {
         lineno++;
         char nm[64], ad[64], kf[256], extra[2];
+        if (strchr(line, '\n') == NULL && !feof(f)) {
+            fprintf(stderr, "crossnode-net: %s line %d: longer than %zu characters\n", path, lineno, sizeof line - 2);
+            bad = 1;
+            break;
+        }
+        char *hash = strchr(line, '#');
+        if (hash != NULL)
+            *hash = '\0';                     /* # starts a comment, also after the fields */
         char *t = line + strspn(line, " \t");
-        if (*t == '#' || *t == '\n' || *t == '\0')
+        if (*t == '\n' || *t == '\0')
             continue;
         int k = sscanf(t, "%63s %63s %255s %1s", nm, ad, kf, extra);
         struct in_addr ia;
@@ -1332,10 +1375,10 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
         if (k != 3) {
             fprintf(stderr, "crossnode-net: %s line %d: want NAME ADDRESS:PORT KEYFILE\n", path, lineno);
             bad = 1;
-        } else if (strchr(nm, '/') != NULL || strcmp(nm, CN_STATUS_NAME) == 0) {
+        } else if (!name_ok(nm)) {
             fprintf(stderr, "crossnode-net: %s line %d: bad name %s\n", path, lineno, nm);
             bad = 1;
-        } else if (colon == NULL || colon - ad >= (long)sizeof host || atoi(colon + 1) <= 0 || atoi(colon + 1) > 65535 ||
+        } else if (colon == NULL || colon - ad >= (long)sizeof host || !port_ok(colon + 1) ||
                    (snprintf(host, sizeof host, "%.*s", (int)(colon - ad), ad), inet_pton(AF_INET, host, &ia) != 1)) {
             fprintf(stderr, "crossnode-net: %s line %d: bad address %s\n", path, lineno, ad);
             bad = 1;
@@ -1427,12 +1470,17 @@ int main(int argc, char **argv)
         if (np < 0)
             return 2;
         int me = np - 1;              /* this process serves the last peer; a child serves each of the others */
+        pid_t kids[CN_MAX_PEERS];
+        signal(SIGCHLD, SIG_IGN);     /* a child that exits is reaped by the system, never left a zombie */
         for (int i = 0; i < np - 1; i++) {
             pid_t c = fork();
             if (c < 0) {
                 perror("crossnode-net: fork");
+                for (int j = 0; j < i; j++)    /* all or nothing: stop the peers already started */
+                    kill(kids[j], SIGTERM);
                 return 1;
             }
+            kids[i] = c;
             if (c == 0) {
                 me = i;
                 break;
@@ -1448,8 +1496,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < np; i++)          /* keep only this link's key */
             memset(pc[i].key, 0, sizeof pc[i].key);
     }
-    if (name == NULL || target == NULL || strchr(name, '/') != NULL || name[0] == '\0' ||
-        strcmp(name, CN_STATUS_NAME) == 0)
+    if (name == NULL || target == NULL || !name_ok(name))
         usage();
     if (conf == NULL && (keyfile == NULL) == (insecure == 0)) {
         fprintf(stderr, "crossnode-net: give either -k KEYFILE or -I (no authentication), not both and not neither\n");
