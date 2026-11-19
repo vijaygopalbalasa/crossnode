@@ -1,0 +1,371 @@
+== Crossnode gate 1, loopback, 20261119T105854Z
+guest: QNX nodex 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
+build: f61cb02
+  hellodev sha256 050bfc05fc5da0dc
+  crossnode-agent sha256 24faac484527c1f1
+  crossnode-net sha256 f519871d8c257f09
+  cnprobe sha256 461b3d7a0329bde1
+  cnmitm sha256 12412d273d02c602
+-rw-------
+
+== 1. Same answers locally and through /net/self
+local:
+  hello from nodex
+  op=set rc=EOK info=0 value=41
+  op=add rc=EOK info=0 value=42
+  op=get rc=EOK info=7 value=42
+remote:
+  hello from nodex
+  op=set rc=EOK info=0 value=41
+  op=add rc=EOK info=0 value=42
+  op=get rc=EOK info=7 value=42
+PASS  1 cat and devctl set/add/get give identical results, info value included  [compared 4 lines]
+
+== 2. A stock QNX tool (stty) through /net/self
+  same
+  13
+PASS  2 stty -a on /net/self/dev/ser1 matches /dev/ser1 byte for byte  [13 lines]
+
+== 3. A path outside the share list is refused
+  cat: /net/self/etc/passwd: Permission denied
+PASS  3 /net/self/etc/passwd is refused  [cat: /net/self/etc/passwd: Permission denied]
+PASS  3b a link that stays inside the share is followed  [plain file inside the share]
+PASS  3c a link that leads out of the share is refused  [cat: /net/self/tmp/cnx/escape: Permission denied]
+PASS  3d a missing name inside the share says so  [cat: /net/self/tmp/cnx/missing: No such file or directory]
+PASS  3e a link to a missing name outside the share is refused, not reported missing  [cat: /net/self/tmp/cnx/probe: Permission denied]
+
+== 4. A waiting devctl when the peer is killed
+  kill_at=6500330
+  result=stopped rc=EHOSTDOWN call_ms=1016 t_end=6500347
+PASS  4 the waiting call returns EHOSTDOWN once the peer is killed  [rc=EHOSTDOWN, 17 ms after the kill, bound 200 ms]
+
+== 5. A waiting devctl when the peer freezes and stays silent
+  stop_at=6503217
+  result=stopped rc=EHOSTDOWN call_ms=1955 t_end=6505220
+PASS  5 the waiting call returns EHOSTDOWN within the liveness limit  [rc=EHOSTDOWN, 2003 ms after the freeze, bound 2000+200 ms]
+
+== 6. A new open while the peer is still frozen
+  op=open rc=EHOSTDOWN ms=1515
+  op=open rc=EHOSTDOWN ms=0
+PASS  6a the open fails with EHOSTDOWN within the liveness limit  [op=open rc=EHOSTDOWN ms=1515]
+PASS  6b a second open right after fails at once  [op=open rc=EHOSTDOWN ms=0]
+
+== 7. A new open after the peer is gone
+  op=open rc=EHOSTDOWN ms=4
+PASS  7 the open fails with EHOSTDOWN at once (the port is closed)  [op=open rc=EHOSTDOWN ms=4]
+
+== 8. Using and closing an fd whose peer died
+  op=get-before rc=EOK value=42
+  op=get-after rc=EHOSTDOWN ms=0
+  op=close rc=EOK ms=0
+PASS  8a a call on the old fd fails at once with EHOSTDOWN  [op=get-after rc=EHOSTDOWN ms=0]
+PASS  8b close returns at once  [op=close rc=EOK ms=0]
+
+== 9. A process exits while holding an fd whose peer died
+  op=exit-with-open-fd opened=y ms=2
+PASS  9 the process exits at once  [op=exit-with-open-fd opened=y ms=2]
+
+== 10. A signal to a waiting caller
+  op=get-with-signal rc=EINTR ms=312
+PASS  10 the call returns EINTR when the signal arrives, not when the peer answers  [op=get-with-signal rc=EINTR ms=312]
+
+== 11. The path recovers when the peer comes back
+  op=get rc=EOK info=7 value=42 ms=5
+PASS  11 a fresh call works again  [op=get rc=EOK info=7 value=42 ms=5]
+
+== 12. Only root and the allowed group may use /net/self
+  qnxuser (group 1000): op=get rc=EOK info=7 value=42 ms=5
+  user1 (group 1001): op=open rc=EACCES errno=13 ms=0
+  /net/self mode: drwxr-x---
+PASS  12a a member of the allowed group may use the path  [op=get rc=EOK info=7 value=42 ms=5]
+PASS  12b any other user is refused before anything is forwarded  [op=open rc=EACCES errno=13 ms=0]
+
+== 13. lseek is refused, not faked
+  op=seek rc=ESPIPE
+PASS  13 lseek on a /net fd answers ESPIPE instead of moving a local copy of the offset  [op=seek rc=ESPIPE]
+
+== 14. A signal during a waiting open
+  op=open-with-signal rc=EINTR ms=312
+PASS  14a the open returns EINTR when the signal arrives  [op=open-with-signal rc=EINTR ms=312]
+       10 rc=EINTR
+  op=get rc=EOK info=7 value=42 ms=5
+  0
+PASS  14b ten more interrupted opens: all EINTR, no unbind error, the path still works  [op=get rc=EOK info=7 value=42 ms=5]
+
+== 15. Transfers larger than one network packet
+  22304597 204800
+  22304597 204800
+  22304597 204800
+PASS  15a a 200 KB read through /net matches the file  [22304597 204800]
+PASS  15b a 200 KB write through /net lands intact  [22304597 204800]
+
+== 16. A peer that is alive but slow: a read that waits for input
+  still_waiting=yes
+  op=get rc=EOK info=7 value=42 ms=3
+  threads_while_waiting=4 interrupt_ms=11
+  threads_after=3
+  threads_before=3 (pidin lines, header included)
+PASS  16a the read stays blocked for 10 s while the peer is alive  [1 of 1]
+PASS  16b another caller is served meanwhile  [op=get rc=EOK info=7 value=42 ms=3]
+PASS  16c Ctrl-C on the waiting reader returns at once  [11 ms]
+PASS  16d the agent's blocked worker ends when the caller gives up  [threads 3 -> 4 -> 3]
+  op=get rc=EOK info=7 value=42 ms=4
+  threads_after_cycles=3
+PASS  16e four client restarts during blocked reads leave no stuck worker or connection  [threads_after_cycles=3]
+
+== 17. Connection caps
+  op=conns tried=6 kept=2
+  0
+PASS  17 one address holds at most 2 connections in the handshake (6 probes: the older ones are dropped for newer ones, 2 stay)  [op=conns tried=6 kept=2]
+
+== 18. Replies that break the protocol are refused
+  op=readn asked=10 rc=EHOSTDOWN got=-1
+  op=get rc=EHOSTDOWN info=-1 value=0 ms=3
+  op=stat rc=EHOSTDOWN ms=9
+  op=ls rc=EHOSTDOWN ms=11
+test/gate1-loopback.sh: line 253: 60710 Terminated: 15          python3 "$ROOT/test/fake-agent.py" 7799 > "$ROOT/evidence/.fake-agent.log" 2>&1
+  fake agent:
+    fake-agent: listening on 127.0.0.1:7799
+    fake-agent: answered a 10-byte read with 74 bytes
+    fake-agent: answered a devctl as if it were a read
+    fake-agent: answered a stat with an impossible file type
+    fake-agent: answered a stat with an impossible file type
+  evil.log: crossnode-net: /net/evil -> 10.0.2.2:7799 (liveness 2000 ms, connect 1500 ms, NO AUTHENTICATION: -I)
+  evil.log: crossnode-net[evil]: peer up
+  evil.log: crossnode-net[evil]: peer down: a reply did not match its request
+  evil.log: crossnode-net[evil]: peer up
+  evil.log: crossnode-net[evil]: peer down: a reply did not match its request
+  evil.log: crossnode-net[evil]: peer up
+  evil.log: crossnode-net[evil]: peer down: a reply did not match its request
+  evil.log: crossnode-net[evil]: peer up
+  evil.log: crossnode-net[evil]: peer down: a reply did not match its request
+PASS  18a an oversized read reply never reaches the program  [op=readn asked=10 rc=EHOSTDOWN got=-1]
+PASS  18b a reply with the wrong operation is refused  [op=get rc=EHOSTDOWN info=-1 value=0 ms=3]
+PASS  18c a stat reply with an impossible file type never reaches the program  [op=stat rc=EHOSTDOWN ms=9]
+PASS  18d a directory entry whose name contains a slash never reaches the program  [op=ls rc=EHOSTDOWN ms=11]
+
+== 19. stat() and fstat() answer from the peer, through the same containment as open
+fixtures-ready
+  local:  op=stat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=0
+  remote: op=stat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=12
+PASS  19a stat of a file through /net matches the file's own stat (mode size uid gid nlink mtime)  [op=stat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=12]
+  local:  op=stat rc=EOK mode=20666 size=0 uid=0 gid=0 nlink=1 mtime=1795085942 rdev=1 ms=0
+  remote: op=stat rc=EOK mode=20666 size=0 uid=0 gid=0 nlink=1 mtime=1795085942 rdev=1 ms=2
+PASS  19b stat of the remote device matches the device's own stat  [op=stat rc=EOK mode=20666 size=0 uid=0 gid=0 nlink=1 mtime=1795085942 rdev=1 ms=2]
+  local:  op=fstat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=0
+  remote: op=fstat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=9
+PASS  19c fstat on an open /net descriptor matches  [op=fstat rc=EOK mode=100644 size=7 uid=0 gid=0 nlink=1 mtime=1795086013 rdev=0 ms=9]
+  local:  op=stat rc=EOK mode=40755 size=4096 uid=0 gid=0 nlink=2 mtime=1795086013 rdev=0 ms=0
+  remote: op=stat rc=EOK mode=40755 size=4096 uid=0 gid=0 nlink=2 mtime=1795086013 rdev=0 ms=2
+PASS  19d stat of a directory inside the share matches  [op=stat rc=EOK mode=40755 size=4096 uid=0 gid=0 nlink=2 mtime=1795086013 rdev=0 ms=2]
+  virtual: op=stat rc=EOK mode=40555 size=0 uid=0 gid=0 nlink=2 mtime=1795085972 rdev=0 ms=2
+  virtual: op=stat rc=EOK mode=40555 size=0 uid=0 gid=0 nlink=2 mtime=1795085972 rdev=0 ms=2
+PASS  19e a directory above a share is a read-only directory (mode 040xxx, no write bits)  [op=stat rc=EOK mode=40555]
+PASS  19e2 and it grants no write permission  [mode=40555]
+PASS  19f stat of /net/self/etc/passwd is refused  [op=stat rc=EACCES ms=3]
+PASS  19f stat of /net/self/tmp/cnx/escape is refused  [op=stat rc=EACCES ms=4]
+PASS  19f stat of /net/self/tmp/cnx/probe is refused  [op=stat rc=EACCES ms=4]
+PASS  19g stat of a missing name inside the share says ENOENT  [op=stat rc=ENOENT ms=2]
+  mount root: op=stat rc=EOK mode=40750 size=0 uid=0 gid=1000 nlink=1 mtime=1795086016 rdev=1 ms=0
+PASS  19h the mount root's own stat stays local and shows the access policy (group allowed: 40750)  [op=stat rc=EOK mode=40750 size=0 uid=0 gid=1000 nlink=1 mtime=1795086016 rdev=1 ms=0]
+
+== 20. Directory listing
+  /net/self: . .. dev tmp 
+PASS  20a the mount root lists only the top of the share list  [. .. dev tmp ]
+  /net/self/dev: . .. hello ser1 
+PASS  20b a directory above shares lists exactly the shared names, not the other devices  [. .. hello ser1 ]
+PASS  20c a 300-entry directory lists completely through /net (several reads)  [op=ls pass=0 rc=EOK n=302 ms=41]
+  op=lsr pass=0 rc=EOK n=302 ms=42
+  op=lsr pass=1 rc=EOK n=302 ms=76
+PASS  20d rewinddir lists the directory again  [op=lsr pass=0 rc=EOK n=302 ms=42 op=lsr pass=1 rc=EOK n=302 ms=76 ]
+PASS  20e listing a directory outside the share is refused  [op=ls rc=EACCES ms=3]
+  ls -l: -rw-r--r--  1 root root 4 2026-11-19 11:00 a
+  ls -l: -rw-r--r--  1 root root 7 2026-11-19 11:00 b
+  ls -l: -rw-r--r--  1 root root 0 2026-11-19 11:00 c
+PASS  20f the stock 'ls -l' prints the same through /net as locally  [3 lines]
+  ls: hello ser1 dev tmp 
+PASS  20g the stock 'ls' shows the shared devices and the top of the share list  [hello ser1 dev tmp ]
+  ls -l: total 832
+  ls -l: -rw-r--r--  1 root root 204800 2026-11-19 10:59 big
+  ls -l: drwxr-xr-x  2 root root   4096 2026-11-19 11:00 d
+  ls -l: -?????????  ? ?    ?         ?                ? escape
+  ls -l: -rw-r--r--  1 root root     28 2026-11-19 10:59 inside
+  ls -l: drwxr-xr-x  2 root root  12288 2026-11-19 11:00 many
+  ls -l: -rw-r--r--  1 root root     28 2026-11-19 10:59 ok
+  ls -l: -?????????  ? ?    ?         ?                ? probe
+  ls -l: -rw-r--r--  1 root root 204800 2026-11-19 10:59 w
+PASS  20h 'ls -l' on the fixture directory lists the plain files and shows the two links that leave the share as refused (all question marks)  [2 refused rows]
+
+== 21. A waiting stat blocks nobody else
+  op=get-with-signal rc=EINTR ms=307
+  op=stat rc=EHOSTDOWN ms=1763
+PASS  21a while a stat waits on a frozen peer, another caller still gets EINTR on time  [op=get-with-signal rc=EINTR ms=307]
+PASS  21b the waiting stat itself fails with EHOSTDOWN within the liveness limit  [op=stat rc=EHOSTDOWN ms=1763]
+        6 rc=EINTR
+  op=stat rc=EOK
+  0
+PASS  21c six interrupted stats: all EINTR, no unbind error, the path still works  [      6 rc=EINTR op=stat rc=EOK ]
+  A
+  op=stat-with-signal rc=EHOSTDOWN ms=1994
+  B
+  op=stat-with-signal rc=EINTR ms=306
+PASS  21e two stats wait together; a signal to one interrupts only that one, the other ends with EHOSTDOWN  [signalled: op=stat-with-signal rc=EINTR ms=306 / other: op=stat-with-signal rc=EHOSTDOWN ms=1994]
+  threads=3
+  op=fstat rc=EOK
+PASS  21d 400 stats in a row leave the service working  [threads=3]
+
+== 22. Peer authentication
+  op=rawping ping_reply=no closed=yes
+PASS  22a a client that skips the handshake gets no answer and is hung up on  [op=rawping ping_reply=no closed=yes]
+  op=open rc=EHOSTDOWN ms=13
+  op=open rc=EHOSTDOWN ms=5
+  2
+PASS  22b a client with the wrong key is refused with EHOSTDOWN  [op=open rc=EHOSTDOWN ms=13]
+PASS  22c a client with no key is refused with EHOSTDOWN  [op=open rc=EHOSTDOWN ms=5]
+PASS  22d each refusal is logged on the refusing side as an authentication failure  [2 lines]
+  op=open rc=EHOSTDOWN ms=1511
+PASS  22e a keyed client refuses an agent that does not prove it holds the key  [op=open rc=EHOSTDOWN ms=1511]
+  crossnode-agent: key file /tmp/cn/key2 is readable by others (mode 644); chmod 600 it
+  rc=2
+  crossnode-agent: no -k KEYFILE (give a key, or -I to run without authentication)
+  rc=2
+PASS  22f a key file others can read is refused, and so is starting with neither a key nor -I  [crossnode-agent: key file /tmp/cn/key2 is readable by others (mode 644); chmod 600 it]
+
+== 23. Strangers cannot hold the agent open
+  op=trickle tried=6 instant=4 held=2 never=0 held_max_ms=2051
+  op=open rc=EOK ms=20
+PASS  23a six trickling strangers: every one is dropped by about 2 s in total (none is held longer by trickling)  [op=trickle tried=6 instant=4 held=2 never=0 held_max_ms=2051]
+PASS  23b an authenticated peer connects while the trickling strangers fill the handshake places (the longest-waiting stranger makes room)  [op=open rc=EOK ms=20]
+
+== 24. A flood of handshakes from one address cannot push out another address's handshake
+  B
+  op=trickle tried=1 instant=0 held=1 never=0 held_max_ms=2012
+  A
+  op=trickle tried=6 instant=4 held=2 never=0 held_max_ms=2050
+PASS  24a six handshakes from 127.0.0.1 lose their own places; the older handshake from 10.9.0.1 is held to its full 2 s  [other address: op=trickle tried=1 instant=0 held=1 never=0 held_max_ms=2012 / flooder: op=trickle tried=6 instant=4 held=2 never=0 held_max_ms=2050]
+  tk1: op=open rc=EOK ms=15
+  tk2: op=open rc=EOK ms=8
+  tk3: op=open rc=EOK ms=8
+  tk4: op=open rc=EOK ms=15
+PASS  24b four authenticated peers from one address connect while that address floods handshakes (dropped handshakes are never counted as peers)  [all four opens]
+  tk5: op=open rc=EHOSTDOWN ms=7
+PASS  24c a fifth authenticated peer from the same address is refused (the per-address cap is exactly 4)  [op=open rc=EHOSTDOWN ms=7]
+
+== 25. Every frame after the handshake carries an integrity tag
+  op=get rc=EHOSTDOWN info=-1 value=0 ms=7
+  flips=1 integrity=1
+PASS  25a a reply with one bit flipped on the wire is refused: the call fails with EHOSTDOWN and the change is logged as an integrity failure, never handed to the program  [op=get rc=EHOSTDOWN info=-1 value=0 ms=7; flips=1 integrity=1]
+  peer        mitmflip at 127.0.0.1:7790
+  state       down for 1 s (the next call reconnects)
+  link        authenticated; every frame carries an HMAC-SHA256 tag
+  waiting     0 calls
+  connects    1
+  drops       1
+  last down   a frame failed its integrity check (changed, replayed or out of order)
+  refused     1 frame, last: a frame failed its integrity check (changed, replayed or out of order)
+PASS  25c the refusal shows in /net/mitmflip/.status: link down, one frame refused, and why  [1 frame, last: a frame failed its integrity chec]
+  op=get rc=EOK info=7 value=42 ms=3
+  replays=1 integrity=1
+PASS  25b a reply sent twice is refused the second time: the first copy answers the call, the copy is logged as an integrity failure  [op=get rc=EOK info=7 value=42 ms=3; replays=1 integrity=1]
+  op=set rc=EHOSTDOWN info=-1 value=42 ms=11
+  op=get rc=EOK info=7 value=7 ms=0
+  flips=1 integrity=1
+PASS  25d a request with one bit flipped on the wire is refused by the agent: the device keeps its value (7, not 42 or 43), the call fails with EHOSTDOWN, the agent logs an integrity failure  [op=set rc=EHOSTDOWN info=-1 value=42 ms=11; local op=get rc=EOK info=7 value=7 ms=0; flips=1 integrity=1]
+
+== 26. /net/NAME/.status: the link's own state, answered by crossnode-net, never forwarded
+  peer        self at 127.0.0.1:7777
+  state       up for 8 s
+  link        authenticated; every frame carries an HMAC-SHA256 tag
+  last heard  within the last second (down after 2 s of silence)
+  waiting     0 calls
+  connects    1
+  drops       0
+  refused     0 frames
+PASS  26a with the link up, .status names the peer and says up, authenticated, nothing waiting, nothing refused  [state       up for 8 s]
+  -r--r-----
+  sh: cannot create /net/self/.status: Read-only file system
+  0
+PASS  26b .status is a read-only file (writing it is refused) and is not one of the peer's entries  [-r--r----- sh: cannot create /net/self/.status: Read-only file system 0 ]
+  peer        self at 127.0.0.1:7777
+  state       down for 1 s (the next call reconnects)
+  link        authenticated; every frame carries an HMAC-SHA256 tag
+  waiting     0 calls
+  connects    1
+  drops       1
+  last down   the peer closed the connection
+  refused     0 frames
+PASS  26c with the agent killed, .status still answers and says down, with the reason  [the peer closed the connection]
+  peer        nobody at 127.0.0.1:7798
+  state       not connected yet (the first call connects)
+  link        authenticated; every frame carries an HMAC-SHA256 tag
+  waiting     0 calls
+  connects    0
+  drops       0
+  refused     0 frames
+  op=open rc=EHOSTDOWN errno=264 ms=4
+  peer        nobody at 127.0.0.1:7798
+  state       down for 0 s (the next call reconnects)
+  link        authenticated; every frame carries an HMAC-SHA256 tag
+  waiting     0 calls
+  connects    0
+  drops       0
+  retry       the last attempt failed: Connection refused
+  refused     0 frames
+PASS  26d a peer that was never reached: .status says not connected yet, then why the first call could not connect (and no drop, since it never came up)  [the last attempt failed: Connection refused]
+
+== 27. One file lists every peer (crossnode-net -f)
+  crossnode-net: twice.conf line 2: confa is named twice
+  exit=2
+  crossnode-net: nokey.conf line 1: cannot open key file /tmp/cn/no-such-key: No such file or directory
+  exit=2
+  crossnode-net: dotdot.conf line 1: bad name ..
+  exit=2
+  0
+PASS  27a a file that names a peer twice, points at a missing key, or names a peer .., is refused before anything is attached  [3 refused, 0 attached]
+  op=get rc=EOK info=7 value=7 ms=4
+  op=open rc=EHOSTDOWN errno=264 ms=3
+  op=get rc=EOK info=7 value=7 ms=3
+  2
+  peer        confa at 127.0.0.1:7777
+  state       up for 0 s
+  peer        confb at 127.0.0.1:7797
+PASS  27b one command serves both peers from the file, one process each: confa answers, confb (nothing listening) fails cleanly and does not hold up confa  [confa EOK, confb EHOSTDOWN, confa again EOK]
+
+== crossnode-net log
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: no answer within the liveness limit
+  crossnode-net[self]: peer down: authentication failed (timed out)
+  crossnode-net[self]: peer down: Connection refused
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: no answer within the liveness limit
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: no answer within the liveness limit
+  crossnode-net[self]: peer up
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+  crossnode-net[self]: peer up
+  crossnode-net[self]: peer down: the peer closed the connection
+  crossnode-net: /net/self -> 127.0.0.1:7777 (liveness 2000 ms, connect 1500 ms, authenticated)
+
+== RESULT: 79 passed, 0 failed
+transcript: evidence/gate1-loopback-20261119T105854Z.txt

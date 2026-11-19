@@ -1,0 +1,8 @@
+commit: f61cb02
+nodex runs crossnode-net
+nodex starts crossnode-net -r 30
+PASS  1 with nodey idle, a priority 30 call is answered  [op=get rc=EOK info=7 value=0]
+PASS  2 while priority 12 hogs hold nodey's CPUs, a priority 30 call is answered within 3000 ms  [rc=EOK, inside the bound]
+PASS  3 control: a priority 5 call waits until the hogs stop (at least 5000 ms), so the hogs do hold the CPUs  [rc=EOK, after the hogs stopped]
+PASS  4 while priority 12 hogs hold nodex's CPUs (the caller's own machine), a priority 30 call is answered within 3000 ms  [rc=EOK, inside the bound]
+== RESULT: 4 passed, 0 failed

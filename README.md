@@ -43,10 +43,11 @@ policy features to bring back something QNX 8.0 lost.
 
 Who it is for: systems built from several QNX boards that talk through Qnet's `/net/<node>/` paths, such as
 distributed control systems, test rigs and lab instruments with a supervisor on one board and drivers on others,
-and multi-board controllers. Their users noticed. On the OpenQNX forum, the maintainer of a QNX multi-port serial
-driver, a Qnet user since 1987, described customers who reach serial ports on machines elsewhere in a building
-through Qnet rather than run serial cables, and wrote "Arguably QNX ain't QNX without Qnet" when its removal was
-announced ([thread, 2020](https://forums.openqnx.com/t/topic/8120)); Crossnode's tests run the stock `stty -a` on
+and multi-board controllers. Their users noticed. On the OpenQNX forum, when the QNX 7.1 notes said Qnet would be
+removed in a future release, the maintainer of a QNX multi-port serial driver, a Qnet user since 1987, described
+reaching serial ports on remote machines through Qnet instead of running serial cables around buildings and
+factories, named wind farms and even cars and motorbikes as places where linking remote CPUs matters, and wrote
+"Arguably QNX ain't QNX without Qnet" ([thread, 2020](https://forums.openqnx.com/t/topic/8120)); Crossnode's tests run the stock `stty -a` on
 another machine's serial port through `/net`. A 2025 write-up of Qnet notes it is gone in 8.0 and hopes it returns
 ([blog](https://linguini1.github.io/blog/2025/06/03/qnet.html)). QNX 8.0 lists no drop-in
 replacement for those paths, so each such program would otherwise move to sockets or to middleware such as SOME/IP
@@ -88,18 +89,20 @@ boards, not a sensor's real-time data path.
 
 | What | One line from the transcripts (check, run) |
 |---|---|
-| Unmodified programs read, write and devctl a device on another machine; `stty -a` through `/net` prints the same 13 lines as on the other machine | PASS 2 [cabin-temp(sim) value=19 C t=15 / rear-radar(sim) value=88 cm t=16], `zonal-20261119T024608Z`<br>PASS 2 [13 lines], `gate1-twonode-20261119T021933Z` |
-| A peer that loses power: the waiting call fails with `EHOSTDOWN` after about 2 s of silence (test bound 2000 + 200 ms), and the other zone keeps answering | PASS 10 [12 readings, then result=stopped rc=EHOSTDOWN call_ms=1755 t_end=43421, bound 2000+200 ms], `zonal-20261119T024608Z`<br>PASS 11 [3 readings and hello], `zonal-20261119T024608Z` |
-| The peer boots again and its path works with nothing restarted on the using machine | PASS 14 [pids before: 413714 438292  after: 413714 438292], `zonal-20261119T024608Z` |
-| Every frame after the handshake carries an integrity tag: a reply changed or replayed on the wire is refused (requests are tagged and checked the same way in `src/cn_agent.c`, `reader`; no test changes one yet); a build that skips the check fails this check | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 flips=1 integrity=1], `gate1-loopback-20261119T021328Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 flips=1 integrity=0], `gate1-loopback-mutation-20261119T021618Z` |
-| Confined: non-root programs under their own security types; the policy is immutable, root's `secpolpush` is refused, and root cannot start a program under crossnode-net's type | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossn...], `zonal-20261119T024608Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T024608Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted (/bin/tr...], `boot-image-20261119T023406Z` |
-| A key per link, and only listed paths are shared | PASS 9 [checksums front 4223641969, rear 3478472649, central 4223641969 and 3478472649], `zonal-20261119T024608Z`<br>PASS 3 [cat: /net/self/etc/passwd: Permission denied], `gate1-loopback-20261119T021328Z` |
+| Unmodified programs read, write and devctl a device on another machine; `stty -a` through `/net` prints the same 13 lines as on the other machine | PASS 2 [cabin-temp(sim) value=23 C t=11 \| rear-radar(sim) value=123 cm t=11], `zonal-20261119T111114Z`<br>PASS 2 [13 lines], `gate1-twonode-20261119T110345Z` |
+| The caller's priority travels: with priority 12 work on both CPUs of either machine, a priority 30 call is answered within the bound; a build that does not carry the priority fails | PASS 2 [rc=EOK, inside the bound], PASS 4 [rc=EOK, inside the bound], `priority-20261119T111359Z`<br>FAIL 2 [rc=EOK, outside the bound], `priority-mutation-20261119T110820Z` |
+| A peer that loses power: the waiting call fails with `EHOSTDOWN` after about 2 s of silence (test bound 2000 + 200 ms), and the other zone keeps answering | PASS 10 [12 readings, then result=stopped rc=EHOSTDOWN (time cut), bound 2000+200 ms], `zonal-20261119T111114Z`<br>PASS 11 [3 readings and hello], `zonal-20261119T111114Z` |
+| The peer boots again and its path works with nothing restarted; its status file tells what happened | PASS 14 [pids before: 430098 446485  after: 430098 446485], PASS 15 [connects 2;drops 1;last down no answer within the liveness limit;], `zonal-20261119T111114Z` |
+| Every frame after the handshake carries an integrity tag: a reply or a request changed on the wire is refused; a build that skips the check fails | PASS 25a [op=get rc=EHOSTDOWN info=-1 value=0 (time cut); flips=1 integrity=1], `gate1-loopback-20261119T105854Z`<br>FAIL 25a [op=get rc=EOK info=7 value=43 (time cut); flips=1 integrity=0], `gate1-loopback-mutation-20261119T110123Z` |
+| Confined: non-root programs under their own security types; the policy is immutable, root's `secpolpush` is refused, and root cannot start a program under crossnode-net's type | PASS 5 [front: hellodev_t 71 zonesensor_t 71 crossnode_agent_ 70 ; rear: zonesensor_t 71 crossnode_agent_ 70], `zonal-20261119T111114Z`<br>PASS 7 [3 of 3 refused], `zonal-20261119T111114Z`<br>PASS 13 [on: Operation not permitted (/system/bin/hellodev) on: Operation not permitted ...], `boot-image-20261119T111053Z` |
+| A key per link, central's links from one file, and only listed paths are shared | PASS 9 [checksums front 3631666464, rear 1329987501, central 3631666464 and 1329987501], PASS 16 [2 processes; peers in the file: front rear], `zonal-20261119T111114Z`<br>PASS 3 [cat: /net/self/etc/passwd: Permission denied], `gate1-loopback-20261119T105854Z` |
 
 Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md). All transcripts directly in
-`evidence/` ran at commit `aa53a3c` (earlier runs are in `evidence/history/`); each names its commit. The power-cut
-checks (zonal 10 to 14), the confinement checks (zonal 4 to 8) and the integrity checks (loopback 25a, 25b) each have
-a deliberately broken run that fails them. The times are pass or fail against bounds stated in the tests, for this code on emulated machines, not
-performance figures for QNX.
+`evidence/` ran at commit `f61cb02` (earlier runs, including the first submission's, are in `evidence/history/`); each
+names its commit. Every important check has a deliberately broken build or run that fails it: the frame check
+(loopback 25a to 25d), priority carrying (priority 2), the I/O thread's priority (priority 4), the liveness limit
+(two-node 4, 5a, 5b), the power cut (zonal 10 to 16) and confinement (zonal 4 to 8). The times are pass or fail
+against bounds stated in the tests, for this code on emulated machines, not performance figures for QNX.
 
 ## Why not Qnet, NFS, SSHFS or plain sockets?
 
@@ -139,11 +142,11 @@ and `demo/zonal-demo.sh` then run commands on central over SSH from the host. Re
 it; the read fails with `EHOSTDOWN` after about 2 s of silence, front keeps answering, and when rear boots again
 central reads it with the same `crossnode-net` processes.
 
-On the enforced set all 14 checks pass (`evidence/zonal-20261119T024608Z.txt`). Two deliberately broken runs show the checks can
+On the enforced set all 16 checks pass (`evidence/zonal-20261119T111114Z.txt`). Two deliberately broken runs show the checks can
 fail: `CN_MUTATE=1` cuts front instead of rear, leaves rear down and kills central's services, on the open
-(policy-recording) set where root may do that, and checks 10 to 14 fail (`evidence/zonal-mutation-20261119T024711Z.txt`);
+(policy-recording) set where root may do that, and checks 10 to 16 fail (`evidence/zonal-mutation-20261119T111159Z.txt`);
 `CN_MUTATE=confinement` runs the secure checks against a set built without the policy, and checks 4 to 8 fail
-(`evidence/zonal-mutation-confinement-20261119T025158Z.txt`). The demo shows the failure with a plain `cat` loop, which prints "Host is down".
+(`evidence/zonal-mutation-confinement-20261119T111249Z.txt`). The demo shows the failure with a plain `cat` loop, which prints "Host is down".
 
 ## Reproduce
 
@@ -263,12 +266,15 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 
 ```
 test/twonode-up.sh IMAGES_DIR                           # boot two plain test machines (nodex, nodey) with a direct link
-test/gate1-loopback.sh 2222                             # 71 checks on one machine
-CN_MUTATE=1 test/gate1-loopback.sh 2222                 # the same with a crossnode-net that skips the frame check: 25a and 25b fail
+test/gate1-loopback.sh 2222                             # 79 checks on one machine
+CN_MUTATE=1 test/gate1-loopback.sh 2222                 # builds that skip the frame check: 25a to 25d fail
 test/gate1-twonode.sh IMAGES_DIR                        # 19 checks across the two machines
+CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR     # a crossnode-net without the liveness limit: 4, 5a and 5b fail
+test/priority.sh IMAGES_DIR                             # 4 checks: the caller's priority on both machines
+CN_MUTATE=1|central test/priority.sh IMAGES_DIR         # priority not carried: 2 fails; no -r on the caller's side: 4 fails
 CN_EXPECT=none|open|secure test/boot-image.sh DIR       # the pair: 5 checks, 13 when confined and enforced
-CN_EXPECT=secure test/zonal.sh DIR                      # the three-machine zonal set: 14 checks when confined and enforced
-cc -o /tmp/auth-vectors test/auth-vectors.c && /tmp/auth-vectors   # HMAC-SHA256 against RFC 4231 vectors, on the host
+CN_EXPECT=secure test/zonal.sh DIR                      # the three-machine zonal set: 16 checks when confined and enforced
+cc -o /tmp/auth-vectors test/auth-vectors.c && /tmp/auth-vectors   # SHA-256, HMAC-SHA256 and frame-tag vectors, on the host
 ```
 
 Each suite pushes or boots the current build, saves its transcript under `evidence/`, and names the commit it ran on.

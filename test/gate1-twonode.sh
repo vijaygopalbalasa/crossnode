@@ -7,7 +7,7 @@
 #
 # Usage: test/gate1-twonode.sh IMAGES_DIR
 #        CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR   nodex runs crossnode-net-noliveness, built without the
-#        liveness limit: checks 4, 5a, 5b and 7 must FAIL (7: nodex never notices nodey went away). Section 6 is skipped there (a new open would wait forever).
+#        liveness limit: checks 4, 5a and 5b must FAIL (7 can fail too, depending on timing). Section 6 is skipped there (a new open would wait forever).
 set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -71,7 +71,7 @@ echo "build: $(cd "$ROOT" && git describe --always --dirty 2>/dev/null || echo u
 push qx
 push qy
 if [ "$MUTATE" = liveness ]; then
-    echo "== MUTATION RUN (CN_MUTATE=liveness): nodex runs crossnode-net-noliveness, which never declares a silent peer down. Checks 4, 5a, 5b and 7 must FAIL."
+    echo "== MUTATION RUN (CN_MUTATE=liveness): nodex runs crossnode-net-noliveness, which never declares a silent peer down. Checks 4, 5a and 5b must FAIL (7 can fail too: nodex may not notice that nodey rebooted)."
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-noliveness"
 fi
 start_nodey
