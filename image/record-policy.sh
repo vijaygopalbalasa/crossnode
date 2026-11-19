@@ -33,9 +33,13 @@ if [ -d "$D/rear" ]; then
         ls /net/front/dev; ls /net/rear/dev; cat /net/front/dev/temp; cat /net/rear/dev/radar; cat /net/front/dev/hello
         cat /net/front/etc/passwd; ls -l /net/front/dev /net/rear/dev; stat /net/rear/dev/radar
         cnprobe watch /net/front/dev/temp 3 100; cnprobe watch /net/rear/dev/radar 3 100; cnprobe open /net/rear/dev/radar
+        cat /data/etc/crossnode.conf; cat /net/front/.status; cat /net/rear/.status
+        cnprobe set /net/front/dev/hello 42; cnprobe get /net/front/dev/hello; cnprobe add /net/front/dev/hello 1
         cksum < /data/etc/crossnode-front.key; cksum < /data/etc/crossnode-rear.key; date +%T
         sh -c "for i in 1 2 3; do v=\$(cat /net/rear/dev/radar 2>&1); echo \"\$(date +%T) \$v\"; sleep 0.25; done" > /tmp/catloop.log; tail -1 /tmp/catloop.log' >/dev/null 2>&1 || true
     for p in 2224 2226; do ssh_to $p 'cksum < /data/etc/crossnode.key' >/dev/null 2>&1 || true; done
+    ssh_to 2224 'cnprobe get /dev/hello; cnprobe get /dev/temp; cat /dev/temp' >/dev/null 2>&1 || true
+    ssh_to 2226 'cnprobe get /dev/radar; cat /dev/radar' >/dev/null 2>&1 || true
     ssh_to 2224 'cat /dev/secpolgenerate/policy' > "$D/front-policy.txt"
     ssh_to 2226 'cat /dev/secpolgenerate/policy' > "$D/rear-policy.txt"
     echo "front: $(grep -c . "$D/front-policy.txt") policy lines; rear: $(grep -c . "$D/rear-policy.txt")"
@@ -47,7 +51,7 @@ if [ -d "$D/rear" ]; then
     "$ROOT/image/run-zones.sh" "$D" rear >/dev/null
     sleep 8
     ssh_to 2225 'for i in $(seq 1 30); do cnprobe watch /net/rear/dev/radar 1 0 2>/dev/null | grep -q EOK && break; sleep 2; done
-        cat /net/rear/dev/radar; pidin arg' >/dev/null 2>&1 || true
+        cat /net/rear/dev/radar; pidin arg; pidin -f an_U; cat /net/rear/.status; cat /net/front/.status' >/dev/null 2>&1 || true
     ssh_to 2225 'cat /dev/secpolgenerate/policy' > "$D/central-policy.txt"
     echo "central: $(grep -c . "$D/central-policy.txt") policy lines"
     TYPES='crossnode_agent_t|crossnode_net_t|hellodev_t|zonesensor_t'
@@ -65,7 +69,9 @@ for p in 2224 2225; do
 done
 ssh_to 2225 'for i in 1 2 3 4 5 6 7 8; do ls /net/front/dev >/dev/null 2>&1 && break; sleep 2; done
     ls /net/front/dev; cat /net/front/dev/hello; cat /net/front/etc/passwd; ls -l /net/front/dev; stat /net/front/dev/hello
-    cnprobe set /net/front/dev/hello 5; cnprobe get /net/front/dev/hello; cnprobe add /net/front/dev/hello 1' >/dev/null 2>&1 || true
+    cnprobe set /net/front/dev/hello 5; cnprobe get /net/front/dev/hello; cnprobe add /net/front/dev/hello 1
+    cat /data/etc/crossnode.conf; cat /net/front/.status' >/dev/null 2>&1 || true
+ssh_to 2224 'cnprobe get /dev/hello' >/dev/null 2>&1 || true
 ssh_to 2224 'cat /dev/secpolgenerate/policy' > "$D/front-policy.txt"
 echo "front: $(grep -c . "$D/front-policy.txt") policy lines"
 

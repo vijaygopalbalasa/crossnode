@@ -26,8 +26,13 @@ sleep 6
 for i in $(seq 1 10); do ssh_to $CENTRAL 'ls /net/front/dev /net/rear/dev' >/dev/null 2>&1 && break; sleep 2; done
 run $CENTRAL central 'uname -sr; ls /net'
 say "Nothing was typed after power-on. From here, commands run on central over SSH from the host"
+say "Central's links come from one file: one process per zone, each holding only its own key"
+run $CENTRAL central 'cat /data/etc/crossnode.conf'
 run $CENTRAL central 'ls /net/front/dev /net/rear/dev'
 run $CENTRAL central 'cat /net/front/dev/temp /net/rear/dev/radar'
+say "A devctl from central lands on front's driver"
+run $CENTRAL central 'cnprobe set /net/front/dev/hello 42 | cut -d" " -f1-4'
+run $FRONT front 'cnprobe get /dev/hello | cut -d" " -f1-4'
 say "Stock tools, no code changes. The services run as uid 70 under their own security types"
 run $CENTRAL central 'pidin -f an_U | grep crossnode'
 run $CENTRAL central 'secpol -Q'
@@ -42,10 +47,12 @@ sleep 3.5
 run $CENTRAL central 'tail -3 /tmp/catloop.log'
 say "The waiting cat ended with Host is down after about 2 s of silence. Front is not affected"
 run $CENTRAL central 'cat /net/front/dev/temp; cat /net/rear/dev/radar'
+run $CENTRAL central 'cat /net/rear/.status'
 say "Power the rear zone back on. Nothing is restarted on central"
 "$ROOT/image/run-zones.sh" "$D" rear | sed 's/^/  /'
 for i in $(seq 1 30); do ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null | grep -q EOK && break; sleep 2; done
 run $CENTRAL central 'cat /net/rear/dev/radar'
 run $CENTRAL central 'pidin -f an_U | grep crossnode-net'
-say "Same processes, same paths. Crossnode: Qnet-style paths, authenticated, confined, and honest about failure"
+run $CENTRAL central 'cat /net/rear/.status'
+say "Same processes, same paths. Crossnode: the path-based part of Qnet, authenticated, confined, and honest about failure"
 pause 2
