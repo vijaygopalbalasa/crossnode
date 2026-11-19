@@ -40,7 +40,7 @@ enum cn_op {
 struct cn_hdr {
     uint32_t magic;
     uint16_t op;
-    uint16_t flags;     /* reserved, 0 */
+    uint16_t flags;     /* request: CN_F_PRIO | the caller's priority; reply: see CN_F_DIR */
     uint32_t seq;       /* request number; the reply carries the same one */
     int32_t  handle;
     int32_t  a;         /* request: see enum cn_op; reply: errno, 0 on success */
@@ -49,6 +49,11 @@ struct cn_hdr {
 };
 
 _Static_assert(sizeof(struct cn_hdr) == 28, "the wire header is 28 bytes");
+
+/* A request's flags carry the priority of the client thread that made the call, so the sharing machine can run the
+ * work at that priority (see crossnode-agent -P). */
+#define CN_F_PRIO      0x8000
+#define CN_PRIO_MASK   0x00ff
 
 /* The attributes of one object, in fixed-width fields: never a raw struct stat. */
 struct cn_stat {

@@ -696,6 +696,11 @@ static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct 
     struct cn_hdr h = {
         .magic = CN_MAGIC, .op = (uint16_t)op, .seq = e->seq, .handle = handle, .a = a, .b = b, .len = plen,
     };
+#ifndef CN_NO_PRIO
+    /* Carry the caller's priority, so the peer can do the work at it (crossnode-agent -P). */
+    if (ctp->info.priority > 0)
+        h.flags = (uint16_t)(CN_F_PRIO | (ctp->info.priority & CN_PRIO_MASK));
+#endif
     if (out_append(&h, payload, plen) != 0) {
         e->used = 0;
         pthread_mutex_unlock(&G.mtx);

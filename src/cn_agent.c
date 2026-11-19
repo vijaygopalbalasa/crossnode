@@ -37,6 +37,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -67,6 +68,24 @@ static char *exports[MAX_EXPORTS];      /* as given, without the leading '/' */
 static char *rexports[MAX_EXPORTS];     /* the same, resolved with realpath() at start */
 static int nexports;
 static int verbose;
+static int prio_cap = 63;     /* -P: a request runs at its caller's priority, up to this; 0 = never */
+static int reader_prio;       /* -r: priority of the threads that read each peer's link; 0 = inherit */
+static int base_prio;         /* the agent's own priority: requests that carry none run at it */
+
+/* Set ATTR so the new thread runs at PRIO with this thread's scheduling policy; PRIO <= 0 leaves it inherited. */
+static void attr_prio(pthread_attr_t *attr, int prio)
+{
+    if (prio <= 0)
+        return;
+    struct sched_param sp;
+    int pol;
+    if (pthread_getschedparam(pthread_self(), &pol, &sp) != 0)
+        return;
+    sp.sched_priority = prio;
+    pthread_attr_setinheritsched(attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(attr, pol);
+    pthread_attr_setschedparam(attr, &sp);
+}
 static pthread_mutex_t conns_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards the slot table */
 static struct in_addr slot_addr[MAX_CONNS];
 static int slot_used[MAX_CONNS];
@@ -921,6 +940,15 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
     pthread_t t;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    /* The work runs at the caller's priority (up to -P), or at the agent's own when none is carried: never at the
+     * reader thread's priority (-r), which only keeps the link read. */
+    int prio = base_prio;
+    if (prio_cap > 0 && (h->flags & CN_F_PRIO) != 0) {
+        prio = h->flags & CN_PRIO_MASK;
+        if (prio > prio_cap)
+            prio = prio_cap;
+    }
+    attr_prio(&at, prio);
     int rc = pthread_create(&t, &at, worker, j);
     pthread_attr_destroy(&at);
     if (rc != 0) {
@@ -1089,23 +1117,31 @@ static void *reader(void *arg)
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: crossnode-agent (-k KEYFILE | -I) -e PATH [-e PATH ...] [-l ADDRESS] [-p PORT] [-v]\n"
+            "usage: crossnode-agent (-k KEYFILE | -I) -e PATH [-e PATH ...] [-l ADDRESS] [-p PORT] [-P CAP] [-r PRIO] [-v]\n"
             "  -k KEYFILE  shared key (at least 16 bytes, mode 600); peers must prove they hold it\n"
             "  -I          run with NO authentication (anyone who reaches the port can use the shares)\n"
             "  -e PATH     export PATH and everything under it (for example /dev/hello or /dev)\n"
             "  -l ADDRESS  listen on this IPv4 address (default 127.0.0.1)\n"
-            "  -p PORT     listen on this TCP port (default 7777)\n");
+            "  -p PORT     listen on this TCP port (default 7777)\n"
+            "  -P CAP      run each request at its caller's priority, up to CAP (default 63; 0 = never)\n"
+            "  -r PRIO     run the threads that read each link at PRIO (default: inherited)\n");
     exit(2);
 }
 
 int main(int argc, char **argv)
 {
+    {
+        struct sched_param sp;
+        int pol;
+        if (pthread_getschedparam(pthread_self(), &pol, &sp) == 0)
+            base_prio = sp.sched_priority;
+    }
     const char *addr = "127.0.0.1";
     int port = 7777;
     int opt;
     const char *keyfile = NULL;
     int insecure = 0;
-    while ((opt = getopt(argc, argv, "e:l:p:vk:I")) != -1) {
+    while ((opt = getopt(argc, argv, "e:l:p:vk:IP:r:")) != -1) {
         switch (opt) {
         case 'e': {
             if (nexports == MAX_EXPORTS)
@@ -1129,6 +1165,8 @@ int main(int argc, char **argv)
         case 'v': verbose = 1; break;
         case 'k': keyfile = optarg; break;
         case 'I': insecure = 1; break;
+        case 'P': prio_cap = atoi(optarg); break;
+        case 'r': reader_prio = atoi(optarg); break;
         default: usage();
         }
     }
@@ -1277,6 +1315,7 @@ int main(int argc, char **argv)
         pthread_t t;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        attr_prio(&at, reader_prio);
         if (pthread_create(&t, &at, reader, c) != 0)
             conn_put(c);            /* closes the socket and gives the slot back */
         pthread_attr_destroy(&at);

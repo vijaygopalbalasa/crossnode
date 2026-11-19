@@ -7,7 +7,7 @@ CC      = qcc -Vgcc_nto$(ARCH)
 CFLAGS ?= -O2 -g -std=gnu11 -Wall -Wextra -Werror
 OUT     = build/$(ARCH)
 BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe $(OUT)/cnmitm \
-          $(OUT)/crossnode-net-noverify
+          $(OUT)/crossnode-net-noverify $(OUT)/crossnode-net-noprio
 
 all: $(BINS)
 
@@ -33,6 +33,10 @@ $(OUT)/cnmitm: tools/cnmitm.c src/cn_proto.h | $(OUT)
 
 $(OUT)/crossnode-net-noverify: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
 	$(CC) $(CFLAGS) -DCN_NO_VERIFY -o $@ src/cn_net.c -lsocket
+
+# A mutation build that does not carry the caller's priority (test/priority.sh must fail with it).
+$(OUT)/crossnode-net-noprio: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
+	$(CC) $(CFLAGS) -DCN_NO_PRIO -o $@ src/cn_net.c -lsocket
 
 $(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c -lsocket
