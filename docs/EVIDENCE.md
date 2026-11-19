@@ -1,29 +1,27 @@
 # Evidence: every claim and the checks that show it
 
-All transcripts below ran at commit `f61cb02`; later commits change only documentation, comments and the text of
-one mutation header (`test/gate1-twonode.sh`, see below). Check numbers are the ones printed in the transcripts
-under `evidence/`: loopback (one machine), two-node (two plain test machines on a direct link), priority (the same
-two machines), boot image (the pair built by `image/build-image.sh`) and zonal (three machines). Runs:
+All transcripts below ran at commit `8b04ac9`; later commits change only documentation and comments. Check numbers
+are the ones printed in the transcripts under `evidence/`: loopback (one machine), two-node (two plain test machines
+on a direct link), priority (the same two machines), boot image (the pair built by `image/build-image.sh`) and zonal
+(three machines). Runs:
 
-- `gate1-loopback-20261119T105854Z` (79 of 79); `gate1-loopback-mutation-20261119T110123Z` (`crossnode-net` and
-  `crossnode-agent` built to skip the frame check: 25a, 25b, 25c and 25d fail, 75 passed).
-- `gate1-twonode-20261119T110345Z` (19 of 19); `gate1-twonode-mutation-liveness-20261119T110449Z` and
-  `...-111658Z` (`crossnode-net` built without the liveness limit: 4, 5a and 5b fail in both; 7 also failed in the
-  second). The header printed in these two transcripts said "4, 5a, 5b and 7 must FAIL"; 7 depends on timing (whether
-  nodex notices that nodey rebooted), so the header now names 4, 5a and 5b.
-- `priority-20261119T111359Z`, `...111454Z`, `...111549Z`, `...111923Z` (4 of 4 each). The first priority run in the
-  release sequence, `priority-20261119T110726Z`, failed check 4 once (the call was answered, outside the 3000 ms
-  bound); four reruns at the same commit passed, one of them in the same order right after the liveness mutation run.
-  The cause is not confirmed (a lost frame on the emulated link while both of nodex's CPUs are busy would make TCP
-  wait to resend). Both are kept here.
-- `priority-mutation-20261119T110820Z` (`crossnode-net` built without carrying the priority: check 2 fails);
-  `priority-mutation-central-20261119T110920Z` (`crossnode-net` started without `-r`: check 4 fails).
-- `boot-image-20261119T111015Z` (default pair, 5 of 5), `boot-image-20261119T111034Z` (confined, policy recording,
-  8 of 8), `boot-image-20261119T111053Z` (confined and enforced, 13 of 13).
-- `zonal-20261119T111114Z` (confined and enforced, 16 of 16); `zonal-mutation-20261119T111159Z` (`CN_MUTATE=1`:
-  checks 10 to 16 fail); `zonal-mutation-confinement-20261119T111249Z` (secure checks against a set built without the
+- `gate1-loopback-20261119T122843Z` (79 of 79); `gate1-loopback-mutation-20261119T123104Z` (`crossnode-net` and
+  `crossnode-agent` built to skip the frame check: 25a, 25b, 25c and 25d fail).
+- `gate1-twonode-20261119T123328Z` (23 of 23); `gate1-twonode-mutation-liveness-20261119T123455Z` (no liveness limit:
+  4, 5a and 5b fail); `gate1-twonode-mutation-notify-20261119T123755Z` (no `select` forwarding: 8b, 8c and 8d fail).
+- `priority-20261119T123935Z` (4 of 4); `priority-mutation-20261119T124030Z` (priority not carried: check 2 fails);
+  `priority-mutation-central-20261119T124130Z` (`crossnode-net` started without `-r`: check 4 fails). At an earlier
+  commit, one priority run in a release sequence failed check 4 once while four reruns passed; that transcript,
+  `evidence/history/priority-20261119T110726Z`, is kept. The cause was not found (a lost frame on the emulated link
+  while both CPUs are busy would make TCP wait to resend).
+- `boot-image-20261119T124225Z` (default pair, 5 of 5), `boot-image-20261119T124244Z` (confined, policy recording,
+  8 of 8), `boot-image-20261119T124303Z` (confined and enforced, 13 of 13).
+- `zonal-20261119T124324Z` (confined and enforced, 16 of 16); `zonal-mutation-20261119T124409Z` (`CN_MUTATE=1`:
+  checks 10 to 16 fail); `zonal-mutation-confinement-20261119T124459Z` (secure checks against a set built without the
   policy: checks 4 to 8 fail).
-- `auth-vectors-f61cb02` (SHA-256 against the FIPS 180-4 examples, HMAC-SHA256 against RFC 4231, the frame tag).
+- `zonal-20261119T124959Z` (16 of 16): the same checks run by `scripts/zonal-from-scratch.sh` from an empty folder
+  (build, record the policy, enforce it, check, demo).
+- `auth-vectors-8b04ac9` (SHA-256 against the FIPS 180-4 examples, HMAC-SHA256 against RFC 4231, the frame tag).
 
 Earlier runs, including the submitted version's (`aa53a3c`), are in `evidence/history/`.
 
@@ -64,9 +62,12 @@ guest.
 | Root cannot start programs under `crossnode-net`'s type | boot image 13 | two attempts (a test device and `true`): `on: Operation not permitted` both times |
 | The confinement checks can fail | zonal 4 to 8 with `CN_MUTATE=confinement` | against a set built without the policy, all five FAIL |
 | The caller's priority travels: with priority 12 work on both of the sharing machine's CPUs, a priority 30 caller is answered within the bound, while a priority 5 caller waits for the work to end | priority 1, 2, 3 | `rc=EOK, inside the bound`; the control: `rc=EOK, after the hogs stopped` |
-| Priority on the caller's own machine: with priority 12 work on both of its CPUs, the link's I/O thread (`-r 30`) still serves a priority 30 caller | priority 4 | `rc=EOK, inside the bound` (one release run failed this once; see above) |
+| Priority on the caller's own machine: with priority 12 work on both of its CPUs, the link's I/O thread (`-r 30`) still serves a priority 30 caller | priority 4 | `rc=EOK, inside the bound` (one run at an earlier commit failed this once; see above) |
 | The priority checks can fail | priority 2 with `CN_MUTATE=1`; priority 4 with `CN_MUTATE=central` | without carrying the priority: `rc=EOK, outside the bound`; without `-r`: `rc=EHOSTDOWN, outside the bound` (the starved I/O thread let the link look dead) |
 | `/net/<name>/.status` says up or down, authenticated, waiting calls, connects, drops and refused frames with their last reasons; it is read-only, answered locally, and works with the peer down or never reached | loopback 26a to 26d; zonal 15 | after rear's power cut and reboot: `connects    2`, `drops       1`, `last down   no answer within the liveness limit`, `refused     0 frames` |
 | One file lists every peer (`crossnode-net -f`): a bad file is refused before anything is attached; each peer gets its own process, and an unreachable peer does not hold up another | loopback 27a, 27b; zonal 16 | `named twice`, a missing key and the name `..` refused; `confa EOK, confb EHOSTDOWN, confa again EOK`; on central, both processes started by one `-f /data/etc/crossnode.conf` |
+| `select`, `poll` and `ionotify` on a peer's device: a program waiting on another machine's serial port wakes when a line is typed there; with nothing typed it times out; a wait wakes when the link fails | two-node 8a, 8b, 8d | `ready=1 read=EOK data=typed-on-nodey-ser2_`; `ready=0`; `ready=1 read=EHOSTDOWN` |
+| At most 16 `select` waiters per link (both ends enforce it): the 17th gets `EAGAIN` at once and ordinary calls still go through | two-node 8c | `eagain=4 timedout=16` with 20 waiters, and the devctl after them `rc=EOK` |
+| The `select` checks can fail | two-node 8b, 8c, 8d with `CN_MUTATE=notify` | `ready=0` where a line was typed; `eagain=0 timedout=20`; no wake on link failure |
 | The liveness checks can fail | two-node 4, 5a, 5b with `CN_MUTATE=liveness` | the waiting calls never end with `EHOSTDOWN` (`call_ms=` is empty) |
 | The power-cut checks can fail | zonal 10 to 16 with `CN_MUTATE=1` | 7 FAIL lines, each for the reason the mutation causes |
