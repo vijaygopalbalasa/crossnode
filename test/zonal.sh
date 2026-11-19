@@ -5,12 +5,16 @@
 # restart on central. Images: image/build-image.sh with CN_LAYOUT=zones (optionally confined with CN_SECPOL).
 # The sensors are simulations (tools/zonesensor.c), not vehicle interfaces.
 # Usage: test/zonal.sh PROJECTS_DIR        (PROJECTS_DIR/front, /rear and /central)
+#        CN_MUTATE=1 test/zonal.sh PROJECTS_DIR   a deliberately broken run: front loses power instead of rear, rear
+#        is cut later and not booted again, and central's crossnode-net processes are killed before the last check.
+#        Checks 9 to 13 must then fail; run it on a policy-recording (open) set, where root may kill the services.
 set -u
 D=${1:?usage: zonal.sh PROJECTS_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT=$ROOT/evidence/zonal-$STAMP.txt
+MUTATE=${CN_MUTATE:-0}
+OUT=$ROOT/evidence/zonal-$([ "$MUTATE" = 1 ] && echo mutation-)$STAMP.txt
 exec > >(tee "$OUT") 2>&1
 DEAD_MS=2000; SLACK_MS=200          # crossnode-net liveness limit, and the stated allowance on an emulated guest
 FRONT=2224; CENTRAL=2225; REAR=2226
@@ -21,6 +25,7 @@ check() { if [ "$2" -eq 0 ]; then echo "PASS  $1  [$3]"; PASS=$((PASS + 1)); els
 trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
 echo "== Crossnode zonal demo check, $STAMP, build $(cd "$ROOT" && git describe --always --dirty)"
+[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 9 to 13 must FAIL."
 "$ROOT/image/run-zones.sh" "$D"
 sleep 8
 for p in $FRONT $REAR $CENTRAL; do echo "  $(ssh_to $p 'uname -n; uname -r' | tr '\n' ' ')"; done
@@ -49,9 +54,9 @@ if [ "$CONF" = 1 ]; then
     O=$(ssh_to $CENTRAL 'pidin -f an_U' | awk '/crossnode-net/ {print $3, $4}' | sort | uniq -c | tr -s ' ')
     [ "$(echo "$O" | tr -d '\n')" = " 2 crossnode_net_t 70" ]
     check "4 central's two crossnode-net processes run as uid 70 under crossnode_net_t" $? "$O"
-    O="front: $(ssh_to $FRONT 'pidin -f an_U' | awk '/crossnode-agent/ {print $3, $4}'); rear: $(ssh_to $REAR 'pidin -f an_U' | awk '/crossnode-agent/ {print $3, $4}')"
-    [ "$(echo "$O" | grep -o 'crossnode_agent_[a-z]* 70' | grep -c .)" = 2 ]
-    check "5 each zone's agent runs as uid 70 under its own security type" $? "$O"
+    O="front: $(ssh_to $FRONT 'pidin -f an_U' | awk '/crossnode-agent|hellodev|zonesensor/ {print $3, $4}' | tr '\n' ' '); rear: $(ssh_to $REAR 'pidin -f an_U' | awk '/crossnode-agent|zonesensor/ {print $3, $4}' | tr '\n' ' ')"
+    [ "$(echo "$O" | grep -o 'crossnode_agent_[a-z]* 70' | grep -c .)" = 2 ] && [ "$(echo "$O" | grep -o -E '(hellodev_t|zonesensor_t) +71' | grep -c .)" = 3 ]
+    check "5 each zone's agent runs as uid 70 and each sensor as uid 71, each under its own security type" $? "$O"
 fi
 if [ "$SECURE" = 1 ]; then
     O="$(for p in $FRONT $REAR $CENTRAL; do ssh_to $p 'secpol -Q'; done | tr '\n' ' ')"
@@ -62,12 +67,18 @@ if [ "$SECURE" = 1 ]; then
     check "7 on central, crossnode-net's type may attach exactly /net/front and /net/rear" $? "$O"
 fi
 
+K="front $(ssh_to $FRONT 'cksum < /data/etc/crossnode.key') | rear $(ssh_to $REAR 'cksum < /data/etc/crossnode.key') | central-front $(ssh_to $CENTRAL 'cksum < /data/etc/crossnode-front.key') | central-rear $(ssh_to $CENTRAL 'cksum < /data/etc/crossnode-rear.key')"
+KF=$(echo "$K" | sed -n 's/^front \([0-9]*\).*/\1/p'); KR=$(echo "$K" | sed -n 's/.*| rear \([0-9]*\) .*/\1/p')
+KCF=$(echo "$K" | sed -n 's/.*central-front \([0-9]*\) .*/\1/p'); KCR=$(echo "$K" | sed -n 's/.*central-rear \([0-9]*\) .*/\1/p')
+[ -n "$KF" ] && [ -n "$KR" ] && [ "$KF" != "$KR" ] && [ "$KCF" = "$KF" ] && [ "$KCR" = "$KR" ]
+check "8 each link has its own key: front's and rear's differ, and central holds each only for its own link" $? "checksums front $KF, rear $KR, central $KCF and $KCR"
+
 echo "== 2. The rear zone loses power while central is watching it"
 NETPIDS=$(ssh_to $CENTRAL 'pidin arg' | awk '/crossnode-net/ && !/awk/ {print $1}' | sort | tr '\n' ' ')
 ssh_to $CENTRAL 'rm -f /tmp/watch.log; nohup cnprobe watch /net/rear/dev/radar 400 250 > /tmp/watch.log 2>&1 &'
 sleep 3
-kill "$(cat "$D/rear/output/qemu.pid")"
-echo "  power cut on rear at $(date -u +%H:%M:%S) UTC"
+if [ "$MUTATE" = 1 ]; then kill "$(cat "$D/front/output/qemu.pid")"; else kill "$(cat "$D/rear/output/qemu.pid")"; fi
+echo "  power cut on $([ "$MUTATE" = 1 ] && echo front || echo rear) at $(date -u +%H:%M:%S) UTC"
 sleep 5
 W=$(ssh_to $CENTRAL 'cat /tmp/watch.log')
 echo "$W" | tail -4 | sed 's/^/  central# cnprobe watch \/net\/rear\/dev\/radar: /'
@@ -75,27 +86,28 @@ OK=$(echo "$W" | grep -c "rc=EOK")
 LAST=$(echo "$W" | grep "^result=stopped" | tail -1)
 MS=$(field call_ms "$LAST")
 [ "$OK" -ge 3 ] && [ "$(field rc "$LAST")" = EHOSTDOWN ] && [ "${MS:-99999}" -le $((DEAD_MS + SLACK_MS)) ]
-check "8 the live readings stop with EHOSTDOWN within the liveness limit when rear loses power" $? "$OK readings, then $LAST, bound $DEAD_MS+$SLACK_MS ms"
+check "9 the live readings stop with EHOSTDOWN within the liveness limit when rear loses power" $? "$OK readings, then $LAST, bound $DEAD_MS+$SLACK_MS ms"
 O=$(ssh_to $CENTRAL 'cnprobe watch /net/front/dev/temp 3 100; cat /net/front/dev/hello')
 echo "$O" | sed 's/^/  central# (front, rear down) /'
 [ "$(echo "$O" | grep -c "op=watch.*rc=EOK")" = 3 ] && echo "$O" | grep -q "hello from front"
-check "9 the front zone keeps answering while rear is down" $? "$(echo "$O" | grep -c "rc=EOK") readings and hello"
+check "10 the front zone keeps answering while rear is down" $? "$(echo "$O" | grep -c "rc=EOK") readings and hello"
 O=$(ssh_to $CENTRAL 'cnprobe open /net/rear/dev/radar')
 [ "$(field rc "$O")" = EHOSTDOWN ]
-check "10 a new open on the dead zone fails cleanly instead of hanging" $? "$O"
+check "11 a new open on the dead zone fails cleanly instead of hanging" $? "$O"
 
 echo "== 3. The rear zone boots again"
-"$ROOT/image/run-zones.sh" "$D" rear
+if [ "$MUTATE" = 1 ]; then kill "$(cat "$D/rear/output/qemu.pid")"; else "$ROOT/image/run-zones.sh" "$D" rear; fi
 O=""
-for i in $(seq 1 30); do O=$(ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null); echo "$O" | grep -q "rc=EOK" && break; sleep 2; done
+for i in $(seq 1 $([ "$MUTATE" = 1 ] && echo 3 || echo 30)); do O=$(ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null); echo "$O" | grep -q "rc=EOK" && break; sleep 2; done
 R3=$(ssh_to $CENTRAL 'cat /net/rear/dev/radar')
 echo "  central# cnprobe watch /net/rear/dev/radar 1 0 -> $O"
 echo "  central# cat /net/rear/dev/radar -> $R3"
 echo "$O" | grep -q "rc=EOK" && echo "$R3" | grep -q "^rear-radar value="
-check "11 central reads the rear radar again after rear reboots" $? "$R3"
+check "12 central reads the rear radar again after rear reboots" $? "$R3"
+[ "$MUTATE" = 1 ] && ssh_to $CENTRAL 'slay -f crossnode-net; sleep 1; true'
 NOW=$(ssh_to $CENTRAL 'pidin arg' | awk '/crossnode-net/ && !/awk/ {print $1}' | sort | tr '\n' ' ')
 [ -n "$NETPIDS" ] && [ "$NOW" = "$NETPIDS" ]
-check "12 nothing was restarted on central: the same crossnode-net processes serve both zones" $? "pids before: $NETPIDS after: $NOW"
+check "13 nothing was restarted on central: the same crossnode-net processes serve both zones" $? "pids before: $NETPIDS after: $NOW"
 echo
 echo "== RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -10,7 +10,7 @@ set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/x86_64
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$ROOT/evidence/gate1-twonode-$STAMP.txt
 mkdir -p "$ROOT/evidence"

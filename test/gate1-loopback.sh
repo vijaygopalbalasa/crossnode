@@ -5,12 +5,12 @@
 # /net/self, runs every check, and saves the transcript under evidence/.
 #
 # Usage: test/gate1-loopback.sh [SSH_PORT]     (guest reachable as root on 127.0.0.1:SSH_PORT)
-# Env:   CN_SSH_KEY  private key for the guest (default ~/qnx-work/home/.ssh/qnx_gate1)
+# Env:   CN_SSH_KEY  private key for the guest (required)
 set -u
 PORT=${1:-2222}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/x86_64
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$ROOT/evidence/gate1-loopback-$STAMP.txt
 mkdir -p "$ROOT/evidence"

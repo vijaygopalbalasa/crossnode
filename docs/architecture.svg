@@ -7,7 +7,7 @@
   </defs>
   <rect x="0" y="0" width="1200" height="640" fill="#ffffff"/>
   <text x="600" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#0f172a">Crossnode: a device on another QNX 8.0 machine, by its path</text>
-  <text x="600" y="64" text-anchor="middle" font-size="15" fill="#475569">Zonal demo on three QEMU machines (a labelled simulation). Both Crossnode programs run as uid 70 under their own security types.</text>
+  <text x="600" y="64" text-anchor="middle" font-size="15" fill="#475569">Zonal demo on three QEMU machines (a labelled simulation). Every Crossnode and sensor program runs non-root under its own security type.</text>
 
   <!-- central -->
   <rect x="420" y="96" width="360" height="420" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
@@ -37,7 +37,7 @@
     <text x="617" y="408">same pids after a reboot</text>
   </g>
   <text x="600" y="448" text-anchor="middle" font-size="13" fill="#0f172a">immutable security policy (secpol)</text>
-  <text x="600" y="468" text-anchor="middle" font-size="13" fill="#0f172a">boot image starts everything; key file mode 600</text>
+  <text x="600" y="468" text-anchor="middle" font-size="13" fill="#0f172a">boot image starts everything; a key per link, mode 600</text>
   <text x="600" y="496" text-anchor="middle" font-size="12" fill="#64748b">vtnet1 10.9.0.1           vtnet2 10.10.0.1</text>
 
   <!-- front -->
@@ -48,7 +48,7 @@
   <g font-size="11" fill="#065f46">
     <text x="74" y="240">uid 70, type crossnode_agent_t, no path ability</text>
     <text x="74" y="256">shares only /dev/hello and /dev/temp</text>
-    <text x="74" y="272">HMAC handshake; realpath and iofdinfo checks</text>
+    <text x="74" y="272">own key for this link; realpath, iofdinfo</text>
     <text x="74" y="288">a slow device is never taken for a dead node</text>
   </g>
   <rect x="62" y="316" width="122" height="62" rx="8" fill="#ffffff" stroke="#94a3b8"/>
@@ -57,7 +57,7 @@
   <rect x="196" y="316" width="122" height="62" rx="8" fill="#ffffff" stroke="#94a3b8"/>
   <text x="257" y="340" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">zonesensor</text>
   <text x="257" y="360" text-anchor="middle" font-size="12" fill="#334155" font-family="Menlo, monospace">/dev/temp</text>
-  <text x="190" y="404" text-anchor="middle" font-size="12" fill="#64748b">cabin temperature (simulated)</text>
+  <text x="190" y="404" text-anchor="middle" font-size="12" fill="#64748b">sensors run as uid 71 (simulated)</text>
   <text x="190" y="430" text-anchor="middle" font-size="12" fill="#64748b">vtnet1 10.9.0.2</text>
 
   <!-- rear -->
@@ -68,13 +68,13 @@
   <g font-size="11" fill="#065f46">
     <text x="894" y="240">uid 70, type crossnode_agent_t, no path ability</text>
     <text x="894" y="256">shares only /dev/radar</text>
-    <text x="894" y="272">may reach only its sensor, io-sock and random</text>
+    <text x="894" y="272">own key for this link; reaches only its sensor</text>
     <text x="894" y="288">power cut in the demo, then a reboot</text>
   </g>
   <rect x="949" y="316" width="122" height="62" rx="8" fill="#ffffff" stroke="#94a3b8"/>
   <text x="1010" y="340" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">zonesensor</text>
   <text x="1010" y="360" text-anchor="middle" font-size="12" fill="#334155" font-family="Menlo, monospace">/dev/radar</text>
-  <text x="1010" y="404" text-anchor="middle" font-size="12" fill="#64748b">rear radar distance (simulated)</text>
+  <text x="1010" y="404" text-anchor="middle" font-size="12" fill="#64748b">radar runs as uid 71 (simulated)</text>
   <text x="1010" y="430" text-anchor="middle" font-size="12" fill="#64748b">vtnet1 10.10.0.2</text>
 
   <!-- links -->
@@ -85,7 +85,7 @@
 
   <!-- footer -->
   <rect x="40" y="540" width="1120" height="76" rx="10" fill="#fff7ed" stroke="#fdba74"/>
-  <text x="60" y="566" font-size="14" fill="#7c2d12">Shown by test/zonal.sh (12 of 12, evidence/zonal-20261119T004751Z.txt): rear loses power while central watches /dev/radar;</text>
-  <text x="60" y="586" font-size="14" fill="#7c2d12">the readings stop with EHOSTDOWN after 1796 ms (limit 2000 + 200 ms), front keeps answering, rear reboots and</text>
-  <text x="60" y="606" font-size="14" fill="#7c2d12">central reads it again with the same crossnode-net processes. Times are behaviour bounds of this code on QEMU.</text>
+  <text x="60" y="566" font-size="14" fill="#7c2d12">Shown by test/zonal.sh on the enforced set (transcripts in evidence/): rear loses power while central reads /dev/radar;</text>
+  <text x="60" y="586" font-size="14" fill="#7c2d12">the read fails with EHOSTDOWN after 2 s of silence (test bound 2000 + 200 ms), front keeps answering, rear reboots and</text>
+  <text x="60" y="606" font-size="14" fill="#7c2d12">central reads it again with the same crossnode-net processes. Bounds are for this code on QEMU, not QNX figures.</text>
 </svg>

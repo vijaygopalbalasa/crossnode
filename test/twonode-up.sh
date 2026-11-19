@@ -12,7 +12,7 @@
 set -eu
 IMG=${1:?usage: twonode-up.sh IMAGES_DIR [node]}
 ONLY=${2:-}
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 
 boot() {   # boot NAME SSH_PORT MAC_LAN MAC_LINK LINK_LOCAL_PORT LINK_REMOTE_PORT
     local d=$IMG/$1/output

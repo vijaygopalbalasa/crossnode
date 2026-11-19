@@ -5,7 +5,7 @@
 set -u
 D=${1:?usage: boot-image.sh PROJECTS_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$ROOT/evidence/boot-image-$STAMP.txt
 exec > >(tee "$OUT") 2>&1

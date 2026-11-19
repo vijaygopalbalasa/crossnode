@@ -17,7 +17,7 @@
 set -eu
 D=${1:?usage: record-policy.sh PROJECTS_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-KEY=${CN_SSH_KEY:-$HOME/qnx-work/home/.ssh/qnx_gate1}
+KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 ssh_to() { local p=$1; shift; ssh -i "$KEY" -p "$p" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=30 root@127.0.0.1 "$@"; }
 trap '"$ROOT/image/run-pair.sh" "$D" stop >/dev/null 2>&1' EXIT
 
@@ -32,7 +32,10 @@ if [ -d "$D/rear" ]; then
     ssh_to 2225 'for i in 1 2 3 4 5 6 7 8 9 10; do ls /net/front/dev /net/rear/dev >/dev/null 2>&1 && break; sleep 2; done
         ls /net/front/dev; ls /net/rear/dev; cat /net/front/dev/temp; cat /net/rear/dev/radar; cat /net/front/dev/hello
         cat /net/front/etc/passwd; ls -l /net/front/dev /net/rear/dev; stat /net/rear/dev/radar
-        cnprobe watch /net/front/dev/temp 3 100; cnprobe watch /net/rear/dev/radar 3 100; cnprobe open /net/rear/dev/radar' >/dev/null 2>&1 || true
+        cnprobe watch /net/front/dev/temp 3 100; cnprobe watch /net/rear/dev/radar 3 100; cnprobe open /net/rear/dev/radar
+        cksum < /data/etc/crossnode-front.key; cksum < /data/etc/crossnode-rear.key; date +%T
+        sh -c "for i in 1 2 3; do v=\$(cat /net/rear/dev/radar 2>&1); echo \"\$(date +%T) \$v\"; sleep 0.25; done" > /tmp/catloop.log; tail -1 /tmp/catloop.log' >/dev/null 2>&1 || true
+    for p in 2224 2226; do ssh_to $p 'cksum < /data/etc/crossnode.key' >/dev/null 2>&1 || true; done
     ssh_to 2224 'cat /dev/secpolgenerate/policy' > "$D/front-policy.txt"
     ssh_to 2226 'cat /dev/secpolgenerate/policy' > "$D/rear-policy.txt"
     echo "front: $(grep -c . "$D/front-policy.txt") policy lines; rear: $(grep -c . "$D/rear-policy.txt")"
@@ -40,7 +43,7 @@ if [ -d "$D/rear" ]; then
     sleep 3
     kill "$(cat "$D/rear/output/qemu.pid")"
     sleep 5
-    ssh_to 2225 'cat /tmp/watch.log; cnprobe watch /net/front/dev/temp 3 100; cnprobe open /net/rear/dev/radar' >/dev/null 2>&1 || true
+    ssh_to 2225 'cat /tmp/watch.log; cnprobe watch /net/front/dev/temp 3 100; cnprobe open /net/rear/dev/radar; cat /net/front/dev/temp; cat /net/rear/dev/radar' >/dev/null 2>&1 || true
     "$ROOT/image/run-zones.sh" "$D" rear >/dev/null
     sleep 8
     ssh_to 2225 'for i in $(seq 1 30); do cnprobe watch /net/rear/dev/radar 1 0 2>/dev/null | grep -q EOK && break; sleep 2; done

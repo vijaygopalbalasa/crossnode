@@ -7,13 +7,14 @@
 # ROLE "front":   a zone that owns a device. Starts hellodev (a stand-in sensor at /dev/hello) and the agent,
 #                 which shares /dev/hello on its link address 10.9.0.2.
 # ROLE "central": a zone that uses it. Starts crossnode-net so that /net/front appears at boot.
-# Both bring up the second network interface (vtnet1) on the 10.9.0.0/24 link. The shared key is generated
-# once, kept next to the project as ../crossnode-demo.key, and copied into each image (mode 600).
-# Nothing from the SDP is stored in this repository; the images stay on the build machine.
+# Both bring up the second network interface (vtnet1) on the 10.9.0.0/24 link. Each link gets its own random key,
+# made once next to the projects (crossnode-front.key, crossnode-rear.key) and copied into the images that use that
+# link (mode 600). Nothing from the SDP is stored in this repository; the images stay on the build machine.
 #
 # Confined variant: CN_SECPOL=open (record a security policy) or CN_SECPOL=secure (enforce one, CN_POLICY=FILE).
-# Both services then run as the non-root user crossnode (uid 70), each under its own security type
-# (crossnode_agent_t, crossnode_net_t), and the key file belongs to that user. Default CN_SECPOL=no: as before.
+# Both Crossnode programs then run as the non-root user crossnode (uid 70) and the simulated sensors as the user
+# sensor (uid 71), each under its own security type; the key files belong to crossnode. Default CN_SECPOL=no: all
+# run as root, as before.
 #
 # Zonal layout: CN_LAYOUT=zones adds the role "rear" (a simulated rear radar at /dev/radar, link 10.10.0.2) and
 # a simulated cabin temperature sensor at /dev/temp on front; central then also mounts /net/rear over a second
@@ -32,6 +33,7 @@ LAYOUT=${CN_LAYOUT:-pair}
 case $LAYOUT in pair|zones) ;; *) echo "CN_LAYOUT must be pair or zones"; exit 1 ;; esac
 POLICY=${CN_POLICY:-none}
 SVC=70
+SENSOR=71
 case $SECPOL in no|open|secure) ;; *) echo "CN_SECPOL must be no, open or secure"; exit 1 ;; esac
 [ "$SECPOL" != secure ] || [ -f "$POLICY" ] || { echo "CN_SECPOL=secure needs CN_POLICY=FILE"; exit 1; }
 [ "$POLICY" = none ] || POLICY=$(cd "$(dirname "$POLICY")" && pwd)/$(basename "$POLICY")
@@ -46,8 +48,10 @@ case $ROLE in
     *) echo "role must be front, rear or central"; exit 1 ;;
 esac
 mkdir -p "$DIR"
-KEY=$(cd "$DIR/.." && pwd)/crossnode-demo.key
-[ -f "$KEY" ] || { (umask 077; head -c 32 /dev/urandom > "$KEY"); }
+# One random key per link, made once next to the projects: front-central and rear-central. A zone holds only its own
+# link's key; central holds one for each link, so a zone cannot authenticate as the other.
+KEYS=$(cd "$DIR/.." && pwd)
+for k in front rear; do [ -f "$KEYS/crossnode-$k.key" ] || { (umask 077; head -c 32 /dev/urandom > "$KEYS/crossnode-$k.key"); }; done
 cd "$DIR"
 if [ ! -d local ]; then
     OPTS="--type=qemu --arch=x86_64 --hostname=$NAME --tcg=yes --macaddr=$MAC --sshd-pregen=yes"
@@ -69,16 +73,21 @@ if [ "$SECPOL" = no ]; then
     rm -f $S/passwd_file.custom $S/group_file.custom
 else
     OWNER="uid=$SVC gid=$SVC"
-    RUN_DEV="on -T hellodev_t "
-    RUN_SENSOR="on -T zonesensor_t "
+    RUN_DEV="on -T hellodev_t -u $SENSOR:$SENSOR "
+    RUN_SENSOR="on -T zonesensor_t -u $SENSOR:$SENSOR "
     RUN_AGENT="on -T crossnode_agent_t -u $SVC:$SVC "
     RUN_NET="on -T crossnode_net_t -u $SVC:$SVC "
-    echo "crossnode:x:$SVC:$SVC:Crossnode service:/:/bin/false" > $S/passwd_file.custom
-    echo "crossnode::$SVC:" > $S/group_file.custom
+    printf 'crossnode:x:%s:%s:Crossnode service:/:/bin/false\nsensor:x:%s:%s:Simulated sensors:/:/bin/false\n' $SVC $SVC $SENSOR $SENSOR > $S/passwd_file.custom
+    printf 'crossnode::%s:\nsensor::%s:\n' $SVC $SENSOR > $S/group_file.custom
 fi
 cat > $S/data_files.custom <<DAT
 [type=dir dperms=755] etc
-[perms=600 $OWNER] etc/crossnode.key=$KEY
+$(case $ROLE in
+    front) echo "[perms=600 $OWNER] etc/crossnode.key=$KEYS/crossnode-front.key" ;;
+    rear)  echo "[perms=600 $OWNER] etc/crossnode.key=$KEYS/crossnode-rear.key" ;;
+    central) echo "[perms=600 $OWNER] etc/crossnode-front.key=$KEYS/crossnode-front.key"
+             if [ "$LAYOUT" = zones ]; then echo "[perms=600 $OWNER] etc/crossnode-rear.key=$KEYS/crossnode-rear.key"; fi ;;
+esac)
 DAT
 {
     echo "# Crossnode starts here, at the end of system start-up (role: $ROLE)."
@@ -98,11 +107,11 @@ DAT
         echo "waitfor /dev/radar"
         echo "${RUN_AGENT}/system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/radar -l $LINK -p 7777 > /tmp/crossnode-agent.log 2>&1 &"
     else
-        echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode.key -g 1000 -n front -c 10.9.0.2:7777 > /tmp/crossnode-net.log 2>&1 &"
+        echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode-front.key -g 1000 -n front -c 10.9.0.2:7777 > /tmp/crossnode-net.log 2>&1 &"
         if [ "$LAYOUT" = zones ]; then
             echo "if_up -p -r 20 vtnet2"
             echo "ifconfig vtnet2 10.10.0.1/24 up"
-            echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode.key -g 1000 -n rear -c 10.10.0.2:7777 > /tmp/crossnode-net-rear.log 2>&1 &"
+            echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode-rear.key -g 1000 -n rear -c 10.10.0.2:7777 > /tmp/crossnode-net-rear.log 2>&1 &"
         fi
     fi
 } > $S/post_start.custom
