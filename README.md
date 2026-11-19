@@ -16,8 +16,10 @@ only the paths it lists, only root (or one named group) may use a peer's paths, 
 caller gets a clean error within a stated limit instead of hanging. Both programs can also run as a non-root user
 under a QNX security policy that limits each one to what it needs.
 
-Status: gate 1 of the build (November 2026). What works is listed below, with the test run that shows it.
-What does not work yet is listed too.
+![Crossnode zonal demo: front and rear zones share simulated sensors; central reads them by path](docs/architecture.svg)
+
+Status: November 2026, in progress. What works is listed below, with the test run that shows it. What does not
+work yet is listed too.
 
 ## What works today
 
@@ -54,6 +56,16 @@ and enforced).
 Evidence: `evidence/gate1-loopback-*.txt` (69 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
 ran on. The times in them are behaviour bounds on emulated machines, not performance figures.
+
+## Why not Qnet, NFS, SSHFS or plain sockets?
+
+| Option | What it gives | Why it does not do this job on QNX 8.0 |
+|---|---|---|
+| Qnet | QNX 7's `/net/<node>/` for any resource manager | Not in QNX 8.0; the 8.0 notes list its alternative as "N/A" |
+| NFS v3 (`fs-nfs3` and `nfsd` ship with QNX 8.0) | Remote files | NFS v3's 22 procedures (RFC 1813, section 3.3) include no device-control call, and a device file is only a type and two numbers that the client machine opens itself, so `stty` or a sensor's devctl cannot reach the remote device |
+| SSHFS or other FUSE file systems | Remote files over SSH | Not in the QNX 8.0 SDP's x86_64 target, and files only |
+| Plain sockets | Anything, per program | Every program needs new code; stock tools such as `cat`, `ls` and `stty` cannot use it |
+| Crossnode | `open`, `read`, `write`, `devctl`, `stat` and `readdir` on a peer's listed paths, by path, from unmodified programs | User space; the limits are below |
 
 ## Not done yet
 
