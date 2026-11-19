@@ -99,9 +99,18 @@ pause
 say "Priority travels: two programs on nodex, at priority 5 and at 30, read that serial port"
 qx '(on -p 5 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &); (on -p 30 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &)'
 sleep 2
-run x "pidin -p cat | awk 'NR > 1 {print \"reader on nodex, priority\", \$4}'"
+qx "cat > /tmp/cn/readers && chmod +x /tmp/cn/readers" <<'H'
+#!/bin/sh
+pidin -p cat | awk 'NR > 1 {print "reader on nodex, priority", $4}'
+H
+run x '/tmp/cn/readers     # pidin, the two readers'
 say "On nodey, the agent's worker for each read waits in the serial driver at the same priority"
-run y "D=\$(pidin -p devc-ser8250 | awk 'NR == 2 {print \$1}'); pidin -p crossnode-agent | awk -v d=\$D 'NR > 1 && \$6 == d {print \"agent worker on nodey, priority\", \$4, \" waiting in the serial driver\"}'"
+qy "cat > /tmp/cn/workers && chmod +x /tmp/cn/workers" <<'H'
+#!/bin/sh
+D=$(pidin -p devc-ser8250 | awk 'NR == 2 {print $1}')
+pidin -p crossnode-agent | awk -v d=$D 'NR > 1 && $6 == d {print "agent worker on nodey, priority", $4, " waiting in the serial driver"}'
+H
+run y '/tmp/cn/workers     # pidin, agent threads blocked in the serial driver'
 qx 'slay -f cat >/dev/null 2>&1; true'
 pause
 say "A test proxy on the wire flips one bit of a request: set 42 on nodey's device"
@@ -126,6 +135,10 @@ for i in $(seq 1 24); do
 done
 rm -f /tmp/cn-order.$$
 say "nodey, seen from a priority 40 snapshot taken while the work ran"
-run y "awk '\$4 == \"12r\" && /\\/sh / {print \"priority 12 work         \", \$5} \$4 == \"5r\" && /crossnode-agent/ {print \"the priority 5 call      \", \$5, \"(waiting for a CPU)\"}' /tmp/cn/snap.txt"
+qy "cat > /tmp/cn/snapshot && chmod +x /tmp/cn/snapshot" <<'H'
+#!/bin/sh
+awk '$4 == "12r" && /\/sh / {print "priority 12 work         ", $5} $4 == "5r" && /crossnode-agent/ {print "the priority 5 call      ", $5, "(waiting for a CPU)"}' /tmp/cn/snap.txt
+H
+run y '/tmp/cn/snapshot    # the pidin snapshot, the lines that matter'
 say "Crossnode: QNX's priority-driven I/O, carried across machines"
 pause 2

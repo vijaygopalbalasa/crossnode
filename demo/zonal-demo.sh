@@ -21,9 +21,22 @@ run() {   # run PORT NAME COMMAND: show the prompt and the command, then its rea
 trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
 say "Three QNX 8.0 machines in QEMU: front, rear and central (the sensors are simulated)"
+# Short helpers on central, so the commands on screen stay readable: services lists each Crossnode process with its user
+# and security type (pidin -f an_U, filtered); netpids lists the crossnode-net process ids.
+helpers() {
+    ssh_to $CENTRAL "cat > /tmp/services && chmod +x /tmp/services" <<'H'
+#!/bin/sh
+pidin -f an_U | awk '/crossnode/ {n = split($2, a, "/"); printf "%-9s %-15s %-17s uid %s\n", $1, a[n], $3, $4}'
+H
+    ssh_to $CENTRAL "cat > /tmp/netpids && chmod +x /tmp/netpids" <<'H'
+#!/bin/sh
+pidin -f an_U | awk '/crossnode-net/ {print $1, "crossnode-net"}'
+H
+}
 "$ROOT/image/run-zones.sh" "$D" | sed 's/^/  /'
 sleep 6
 for i in $(seq 1 10); do ssh_to $CENTRAL 'ls /net/front/dev /net/rear/dev' >/dev/null 2>&1 && break; sleep 2; done
+helpers
 run $CENTRAL central 'uname -sr; ls /net'
 say "Nothing was typed after power-on. Stock ls and cat on central reach both zones by path"
 run $CENTRAL central 'ls /net/front/dev /net/rear/dev'
@@ -34,7 +47,7 @@ run $FRONT front 'cnprobe get /dev/hello | cut -d" " -f1-4'
 say "One file lists the zones: a supervisor runs one process per zone, each with its own key"
 run $CENTRAL central 'cat /data/etc/crossnode.conf'
 say "No root: each service runs as its own user, under its own security type"
-run $CENTRAL central "pidin -f an_U | awk '/crossnode/ {n = split(\$2, a, \"/\"); printf \"%-9s %-15s %-17s uid %s\\n\", \$1, a[n], \$3, \$4}'"
+run $CENTRAL central '/tmp/services     # pidin, one line per Crossnode process'
 say "And the security policy cannot be changed while the machine runs"
 run $CENTRAL central 'secpol -Q'
 say "Central reads the rear radar with a plain cat in a loop"
@@ -54,7 +67,7 @@ say "Power the rear zone back on. Nothing is restarted on central"
 for i in $(seq 1 30); do ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null | grep -q EOK && break; sleep 2; done
 run $CENTRAL central 'cat /net/rear/dev/radar'
 say "The same three processes as before, and the status file tells the story"
-run $CENTRAL central "pidin -f an_U | awk '/crossnode-net/ {print \$1, \"crossnode-net\"}'"
+run $CENTRAL central '/tmp/netpids'
 run $CENTRAL central 'cat /net/rear/.status'
 say "Crossnode: the path part of Qnet, authenticated, confined, honest about failure"
 pause 2
