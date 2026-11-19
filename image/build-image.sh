@@ -115,5 +115,15 @@ DAT
         fi
     fi
 } > $S/post_start.custom
-"$MK" --build
+# The SDP's preprocessor runs under emulation in our build container and sometimes crashes; mkqnximage then
+# carries on and writes an empty generated file (observed: an empty startup.sh, so the image could not start).
+# Fail instead, after removing the files it generated, so the next run makes them again.
+set -o pipefail
+"$MK" --build 2>&1 | tee output/build-image.log
+BAD=$(find output/build -maxdepth 1 -type f -size 0 ! -name qemu_options)
+if [ -n "$BAD" ] || grep -q "internal compiler error" output/build-image.log; then
+    echo "build-image: the emulated compiler crashed or a generated file is empty ($BAD); build again"
+    sed -n 's/^Generating \(output\/build\/[^ ]*\)$/\1/p' output/build-image.log | xargs rm -f
+    exit 1
+fi
 echo "image ready: $DIR/output (role $ROLE, link $LINK, secpol $SECPOL, layout $LAYOUT)"
