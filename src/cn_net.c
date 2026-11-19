@@ -1407,9 +1407,8 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
 /* -f CONF: one line per peer, "NAME ADDRESS:PORT KEYFILE"; blank lines and lines starting with # are skipped. */
 #define CN_MAX_PEERS 32
 struct peercfg {
-    char name[64], addr[64];
-    unsigned char key[CN_KEY_MAX];
-    size_t keylen;
+    char name[64], addr[64], keyfile[256];
+    unsigned char khash[32];          /* SHA-256 of the key file's contents: the supervisor never keeps a key, only this */
 };
 
 /* A peer name becomes one path component under DIR: letters, digits, '-', '_' and '.', but not "." or "..", and
@@ -1479,16 +1478,22 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
                 }
             }
             char err[512];                    /* room for the longest path the line can hold */
-            int kl = bad ? 0 : cn_load_key(kf, pc[n].key, err, sizeof err);
+            unsigned char kb[CN_KEY_MAX];     /* the key is read here only to check it, then wiped */
+            int kl = bad ? 0 : cn_load_key(kf, kb, err, sizeof err);
             if (kl < 0) {
                 fprintf(stderr, "crossnode-net: %s line %d: %s\n", path, lineno, err);
                 bad = 1;
             } else if (!bad) {
                 snprintf(pc[n].name, sizeof pc[n].name, "%s", nm);
                 snprintf(pc[n].addr, sizeof pc[n].addr, "%s", ad);
-                pc[n].keylen = (size_t)kl;
+                snprintf(pc[n].keyfile, sizeof pc[n].keyfile, "%s", kf);
+                struct cn_sha256 h;
+                cn_sha256_init(&h);
+                cn_sha256_update(&h, kb, (size_t)kl);
+                cn_sha256_final(&h, pc[n].khash);
                 n++;
             }
+            memset(kb, 0, sizeof kb);
         }
     }
     fclose(f);
@@ -1496,11 +1501,8 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
         fprintf(stderr, "crossnode-net: %s lists no peer\n", path);
         bad = 1;
     }
-    if (bad) {
-        for (int i = 0; i < max; i++)
-            memset(pc[i].key, 0, sizeof pc[i].key);
+    if (bad)
         return -1;
-    }
     return n;
 }
 
@@ -1598,7 +1600,7 @@ static int supervise(const char *conf, struct peercfg *pc)
             for (int j = 0; j < nn; j++) {
                 for (int i = 0; i < np; i++) {
                     if (!kept[i] && strcmp(pc[i].name, nc[j].name) == 0 && strcmp(pc[i].addr, nc[j].addr) == 0 &&
-                        pc[i].keylen == nc[j].keylen && memcmp(pc[i].key, nc[j].key, pc[i].keylen) == 0) {
+                        strcmp(pc[i].keyfile, nc[j].keyfile) == 0 && memcmp(pc[i].khash, nc[j].khash, 32) == 0) {
                         kept[i] = 1;
                         nk[j] = kids[i];
                         ns[j] = started[i];
@@ -1618,10 +1620,6 @@ static int supervise(const char *conf, struct peercfg *pc)
                 started[j] = ns[j];
                 due[j] = nd[j];
             }
-            for (int i = nn; i < np; i++)
-                memset(pc[i].key, 0, sizeof pc[i].key);
-            for (int i = 0; i < CN_MAX_PEERS; i++)
-                memset(nc[i].key, 0, sizeof nc[i].key);
             np = nn;
             slog("crossnode-net: %s reloaded: %d peer%s\n", conf, np, np == 1 ? "" : "s");
         } else if (sig == SIGTERM || sig == SIGINT) {
@@ -1690,10 +1688,7 @@ int main(int argc, char **argv)
         snprintf(conf_addr, sizeof conf_addr, "%s", pc[me].addr);
         name = conf_name;
         target = conf_addr;
-        memcpy(G.key, pc[me].key, pc[me].keylen);
-        G.keylen = pc[me].keylen;
-        for (int i = 0; i < CN_MAX_PEERS; i++)    /* keep only this link's key */
-            memset(pc[i].key, 0, sizeof pc[i].key);
+        keyfile = pc[me].keyfile;            /* this peer's process reads its own key, below; no other */
     }
     if (name == NULL || target == NULL || !name_ok(name))
         usage();
@@ -1702,7 +1697,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (keyfile != NULL) {
-        char err[256];
+        char err[512];
         int n = cn_load_key(keyfile, G.key, err, sizeof err);
         if (n < 0) {
             fprintf(stderr, "crossnode-net: %s\n", err);

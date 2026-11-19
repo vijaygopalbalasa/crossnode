@@ -35,8 +35,9 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
   the peer comes back, with nothing restarted. `cat /net/<peer>/.status` says whether the link is up, authenticated,
   how many calls wait, and how often it dropped or refused a frame, each with its last reason.
-- One file lists every peer (`crossnode-net -f`). That process supervises: each peer gets its own process, keeping
-  only its own key in memory, so one peer that hangs cannot hold up another; a peer process that dies is started
+- One file lists every peer (`crossnode-net -f`). That process supervises and holds no key (only each key file's
+  path and a hash of it, to see a changed key on reload): each peer gets its own process, which reads only its own
+  key, so one peer that hangs cannot hold up another; a peer process that dies is started
   again, and `kill -HUP` re-reads the file (new peers start, removed ones stop, the others are left alone).
   `scripts/new-link.sh NAME ADDRESS:PORT` makes a link's key and prints both ends' lines.
 - An ordinary program written the Qnet way runs unchanged: `examples/serialwatch.c` (open, `tcsetattr`, `select`,
