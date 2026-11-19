@@ -31,11 +31,12 @@ run $CENTRAL central 'cat /net/front/dev/temp /net/rear/dev/radar'
 say "Stock tools, no code changes. The services run as uid 70 under their own security types"
 run $CENTRAL central 'pidin -f an_U | grep crossnode'
 run $CENTRAL central 'secpol -Q'
-say "Central reads the rear radar with a plain cat, four times a second"
+say "Central reads the rear radar with a plain cat in a loop; each line starts with central's clock"
 ssh_to $CENTRAL "rm -f /tmp/catloop.log; nohup sh -c 'while :; do v=\$(cat /net/rear/dev/radar 2>&1); echo \"\$(date +%T) \$v\"; case \"\$v\" in *rear-radar*) ;; *) break ;; esac; sleep 0.25; done' > /tmp/catloop.log 2>&1 &"
 for i in 1 2 3 4 5; do ssh_to $CENTRAL 'tail -1 /tmp/catloop.log'; sleep 0.6; done
 say "Cut the rear zone's power"
-printf '\033[1;35mhost$\033[0m kill rear  (its QEMU process: the link goes silent)   %s UTC\n' "$(date -u +%T)"
+t=$(ssh_to $CENTRAL 'date +%T')   # central's clock, so the cut and the loop's lines share one clock
+printf '\033[1;35mhost$\033[0m kill rear  (its QEMU process: the link goes silent)   central clock just before the cut: %s\n' "$t"
 kill "$(cat "$D/rear/output/qemu.pid")"
 sleep 3.5
 run $CENTRAL central 'tail -3 /tmp/catloop.log'
