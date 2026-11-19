@@ -8,7 +8,8 @@
 #        CN_EXPECT says what the images were built with (CN_SECPOL): the confinement checks then run and must pass,
 #        instead of being skipped when the machines do not look confined.
 #        CN_MUTATE=1 test/zonal.sh PROJECTS_DIR   a deliberately broken run: front loses power instead of rear, rear
-#        is cut later and not booted again, and central's crossnode-net processes are killed before the last check.
+#        is cut later and not booted again, and central's crossnode-net processes are killed before check 14.
+#        Checks 10 to 15 must fail.
 #        Checks 10 to 14 must then fail; run it on a policy-recording (open) set, where root may kill the services.
 #        CN_MUTATE=confinement CN_EXPECT=secure on a set built without the policy: checks 4 to 8 must fail.
 set -u
@@ -31,7 +32,7 @@ trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
 echo "== Crossnode zonal demo check, $STAMP, build $(cd "$ROOT" && git describe --always --dirty)"
 [ "$MUTATE" = confinement ] && echo "== MUTATION RUN (CN_MUTATE=confinement): the set was built without the security policy (CN_SECPOL=no) but is checked as CN_EXPECT=secure. Checks 4 to 8 must FAIL."
-[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 14 must FAIL."
+[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 15 must FAIL."
 "$ROOT/image/run-zones.sh" "$D"
 sleep 8
 for p in $FRONT $REAR $CENTRAL; do echo "  $(ssh_to $p 'uname -n; uname -r' | tr '\n' ' ')"; done
@@ -118,6 +119,15 @@ check "13 central reads the rear radar again after rear reboots" $? "$R3"
 NOW=$(ssh_to $CENTRAL 'pidin arg' | awk '/crossnode-net/ && !/awk/ {print $1}' | sort | tr '\n' ' ')
 [ -n "$NETPIDS" ] && [ "$NOW" = "$NETPIDS" ]
 check "14 nothing was restarted on central: the same crossnode-net processes serve both zones" $? "pids before: $NETPIDS after: $NOW"
+O=$(ssh_to $CENTRAL 'cat /net/rear/.status' 2>&1)
+echo "$O" | sed 's/^/  central# cat \/net\/rear\/.status: /'
+echo "$O" | grep -q '^state       up for ' && echo "$O" | grep -q '^connects    2$' && echo "$O" | grep -q '^drops       1$' \
+  && echo "$O" | grep -q '^last down   no answer within the liveness limit$' && echo "$O" | grep -q '^refused     0 frames$'
+check "15 /net/rear/.status tells the story: up again, connected twice, dropped once for silence, nothing refused" $? "$(echo "$O" | grep -E '^(connects|drops|last down)' | tr -s ' ' | tr '\n' ';')"
+O=$(ssh_to $CENTRAL 'pidin arg' | awk '/crossnode-net/ && !/awk/' | grep -c -- '-f /data/etc/crossnode.conf')
+C=$(ssh_to $CENTRAL 'grep -v "^#" /data/etc/crossnode.conf | awk "NF {print \$1}" | tr "\n" " "')
+[ "$O" = 2 ] && [ "$C" = "front rear " ]
+check "16 central's links come from one file: both crossnode-net processes were started by one -f /data/etc/crossnode.conf listing front and rear" $? "$O processes; peers in the file: $C"
 echo
 echo "== RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

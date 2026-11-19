@@ -6,7 +6,10 @@
 #
 # ROLE "front":   a zone that owns a device. Starts hellodev (a stand-in sensor at /dev/hello) and the agent,
 #                 which shares /dev/hello on its link address 10.9.0.2.
-# ROLE "central": a zone that uses it. Starts crossnode-net so that /net/front appears at boot.
+# ROLE "central": a zone that uses it. Starts crossnode-net from one file, /data/etc/crossnode.conf, listing each
+#                 peer, so that /net/front (and /net/rear) appear at boot.
+# Both sides run the link threads at priority 30 (-r), and the agents run each request at its caller's priority, up
+# to 30 (-P).
 # Both bring up the second network interface (vtnet1) on the 10.9.0.0/24 link. Each link gets its own random key,
 # made once next to the projects (crossnode-front.key, crossnode-rear.key) and copied into the images that use that
 # link (mode 600). Nothing from the SDP is stored in this repository; the images stay on the build machine.
@@ -80,12 +83,18 @@ else
     printf 'crossnode:x:%s:%s:Crossnode service:/:/bin/false\nsensor:x:%s:%s:Simulated sensors:/:/bin/false\n' $SVC $SVC $SENSOR $SENSOR > $S/passwd_file.custom
     printf 'crossnode::%s:\nsensor::%s:\n' $SVC $SENSOR > $S/group_file.custom
 fi
+{
+    echo "# name   address:port     key file (one process per peer, each holding only its own key)"
+    echo "front    10.9.0.2:7777    /data/etc/crossnode-front.key"
+    [ "$LAYOUT" != zones ] || echo "rear     10.10.0.2:7777   /data/etc/crossnode-rear.key"
+} > crossnode.conf
 cat > $S/data_files.custom <<DAT
 [type=dir dperms=755] etc
 $(case $ROLE in
     front) echo "[perms=600 $OWNER] etc/crossnode.key=$KEYS/crossnode-front.key" ;;
     rear)  echo "[perms=600 $OWNER] etc/crossnode.key=$KEYS/crossnode-rear.key" ;;
-    central) echo "[perms=600 $OWNER] etc/crossnode-front.key=$KEYS/crossnode-front.key"
+    central) echo "[perms=644 uid=0 gid=0] etc/crossnode.conf=$PWD/crossnode.conf"
+             echo "[perms=600 $OWNER] etc/crossnode-front.key=$KEYS/crossnode-front.key"
              if [ "$LAYOUT" = zones ]; then echo "[perms=600 $OWNER] etc/crossnode-rear.key=$KEYS/crossnode-rear.key"; fi ;;
 esac)
 DAT
@@ -101,18 +110,17 @@ DAT
             echo "waitfor /dev/temp"
             SHARES="$SHARES -e /dev/temp"
         fi
-        echo "${RUN_AGENT}/system/bin/crossnode-agent -k /data/etc/crossnode.key $SHARES -l $LINK -p 7777 > /tmp/crossnode-agent.log 2>&1 &"
+        echo "${RUN_AGENT}/system/bin/crossnode-agent -r 30 -P 30 -k /data/etc/crossnode.key $SHARES -l $LINK -p 7777 > /tmp/crossnode-agent.log 2>&1 &"
     elif [ "$ROLE" = rear ]; then
         echo "${RUN_SENSOR}/system/bin/zonesensor /dev/radar rear-radar cm 40 200 -7 > /tmp/zonesensor.log 2>&1 &"
         echo "waitfor /dev/radar"
-        echo "${RUN_AGENT}/system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/radar -l $LINK -p 7777 > /tmp/crossnode-agent.log 2>&1 &"
+        echo "${RUN_AGENT}/system/bin/crossnode-agent -r 30 -P 30 -k /data/etc/crossnode.key -e /dev/radar -l $LINK -p 7777 > /tmp/crossnode-agent.log 2>&1 &"
     else
-        echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode-front.key -g 1000 -n front -c 10.9.0.2:7777 > /tmp/crossnode-net.log 2>&1 &"
         if [ "$LAYOUT" = zones ]; then
             echo "if_up -p -r 20 vtnet2"
             echo "ifconfig vtnet2 10.10.0.1/24 up"
-            echo "${RUN_NET}/system/bin/crossnode-net -k /data/etc/crossnode-rear.key -g 1000 -n rear -c 10.10.0.2:7777 > /tmp/crossnode-net-rear.log 2>&1 &"
         fi
+        echo "${RUN_NET}/system/bin/crossnode-net -f /data/etc/crossnode.conf -r 30 -g 1000 > /tmp/crossnode-net.log 2>&1 &"
     fi
 } > $S/post_start.custom
 # Check that no generated file is empty, and that the compiler reported no internal error, before trusting the

@@ -493,6 +493,23 @@ q 'slay -f -s KILL crossnode-net >/dev/null 2>&1; true'
 q "cd /tmp/cn; $AGENT; (./crossnode-net -v -k /tmp/cn/key -g 1000 -n self -c 127.0.0.1:7777 >> net.log 2>&1 &)"; sleep 2
 
 echo
+echo "== 27. One file lists every peer (crossnode-net -f)"
+q 'cd /tmp/cn; printf "# name     address          key\nconfa      127.0.0.1:7777   /tmp/cn/key\n\nconfb      127.0.0.1:7797   /tmp/cn/key\n" > peers.conf; printf "confa 127.0.0.1:7777 /tmp/cn/key\nconfa 127.0.0.1:7778 /tmp/cn/key\n" > twice.conf; printf "confa 127.0.0.1:7777 /tmp/cn/no-such-key\n" > nokey.conf'
+O=$(q 'cd /tmp/cn; ./crossnode-net -f twice.conf 2>&1; echo "exit=$?"; ./crossnode-net -f nokey.conf 2>&1; echo "exit=$?"; ls -d /net/confa 2>&1 | grep -c "^/net/confa$"')
+echo "$O" | sed 's/^/  /'
+[ "$(echo "$O" | grep -c '^exit=2$')" = 2 ] && echo "$O" | grep -q 'named twice' && echo "$O" | grep -q 'no-such-key' && [ "$(echo "$O" | tail -1)" = 0 ]
+check "27a a file that names a peer twice, or points at a missing key, is refused before anything is attached" $? "$(echo "$O" | grep -c '^exit=2$') refused, $(echo "$O" | tail -1) attached"
+q "cd /tmp/cn; (./crossnode-net -v -f peers.conf > conf-net.log 2>&1 &); i=0; while [ \$i -lt 20 ] && ! ls -d /net/confa /net/confb >/dev/null 2>&1; do sleep 0.3; i=\$((i + 1)); done"
+O=$(q 'cd /tmp/cn; ./cnprobe get /net/confa/dev/hello; ./cnprobe get /net/confb/dev/hello; ./cnprobe get /net/confa/dev/hello; pidin -p crossnode-net arg | grep -c "\-f peers.conf"; sed -n 1,2p /net/confa/.status; sed -n 1p /net/confb/.status')
+echo "$O" | sed 's/^/  /'
+A1=$(echo "$O" | grep "^op=" | sed -n 1p); B1=$(echo "$O" | grep "^op=" | sed -n 2p); A2=$(echo "$O" | grep "^op=" | sed -n 3p)
+[ "$(field rc "$A1")" = EOK ] && [ "$(field rc "$B1")" = EHOSTDOWN ] && [ "$(field rc "$A2")" = EOK ] \
+  && [ "$(echo "$O" | grep -x '[0-9]*' | head -1)" = 2 ] \
+  && echo "$O" | grep -q '^peer        confa at 127.0.0.1:7777$' && echo "$O" | grep -q '^peer        confb at 127.0.0.1:7797$'
+check "27b one command serves both peers from the file, one process each: confa answers, confb (nothing listening) fails cleanly and does not hold up confa" $? "confa $(field rc "$A1"), confb $(field rc "$B1"), confa again $(field rc "$A2")"
+q 'cd /tmp/cn; for p in $(pidin -p crossnode-net arg | grep "\-f peers.conf" | awk "{print \$1}"); do kill $p; done; true'
+
+echo
 echo "== crossnode-net log"
 q 'cat /tmp/cn/net.log' | sed 's/^/  /'
 q 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; true'

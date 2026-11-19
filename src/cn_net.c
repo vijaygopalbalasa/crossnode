@@ -1302,10 +1302,87 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
     return iofunc_close_ocb_default(ctp, reserved, &ocb->hdr);
 }
 
+/* -f CONF: one line per peer, "NAME ADDRESS:PORT KEYFILE"; blank lines and lines starting with # are skipped. */
+#define CN_MAX_PEERS 32
+struct peercfg {
+    char name[64], addr[64];
+    unsigned char key[CN_KEY_MAX];
+    size_t keylen;
+};
+
+static int read_conf(const char *path, struct peercfg *pc, int max)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "crossnode-net: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    char line[512];
+    int n = 0, lineno = 0, bad = 0;
+    while (!bad && fgets(line, sizeof line, f) != NULL) {
+        lineno++;
+        char nm[64], ad[64], kf[256], extra[2];
+        char *t = line + strspn(line, " \t");
+        if (*t == '#' || *t == '\n' || *t == '\0')
+            continue;
+        int k = sscanf(t, "%63s %63s %255s %1s", nm, ad, kf, extra);
+        struct in_addr ia;
+        char host[64];
+        const char *colon = strrchr(ad, ':');
+        if (k != 3) {
+            fprintf(stderr, "crossnode-net: %s line %d: want NAME ADDRESS:PORT KEYFILE\n", path, lineno);
+            bad = 1;
+        } else if (strchr(nm, '/') != NULL || strcmp(nm, CN_STATUS_NAME) == 0) {
+            fprintf(stderr, "crossnode-net: %s line %d: bad name %s\n", path, lineno, nm);
+            bad = 1;
+        } else if (colon == NULL || colon - ad >= (long)sizeof host || atoi(colon + 1) <= 0 || atoi(colon + 1) > 65535 ||
+                   (snprintf(host, sizeof host, "%.*s", (int)(colon - ad), ad), inet_pton(AF_INET, host, &ia) != 1)) {
+            fprintf(stderr, "crossnode-net: %s line %d: bad address %s\n", path, lineno, ad);
+            bad = 1;
+        } else if (n == max) {
+            fprintf(stderr, "crossnode-net: %s: more than %d peers\n", path, max);
+            bad = 1;
+        } else {
+            for (int i = 0; i < n; i++) {
+                if (strcmp(pc[i].name, nm) == 0) {
+                    fprintf(stderr, "crossnode-net: %s line %d: %s is named twice\n", path, lineno, nm);
+                    bad = 1;
+                }
+            }
+            char err[256];
+            int kl = bad ? 0 : cn_load_key(kf, pc[n].key, err, sizeof err);
+            if (kl < 0) {
+                fprintf(stderr, "crossnode-net: %s line %d: %s\n", path, lineno, err);
+                bad = 1;
+            } else if (!bad) {
+                snprintf(pc[n].name, sizeof pc[n].name, "%s", nm);
+                snprintf(pc[n].addr, sizeof pc[n].addr, "%s", ad);
+                pc[n].keylen = (size_t)kl;
+                n++;
+            }
+        }
+    }
+    fclose(f);
+    if (!bad && n == 0) {
+        fprintf(stderr, "crossnode-net: %s lists no peer\n", path);
+        bad = 1;
+    }
+    if (bad) {
+        for (int i = 0; i < max; i++)
+            memset(pc[i].key, 0, sizeof pc[i].key);
+        return -1;
+    }
+    return n;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
             "usage: crossnode-net -n NAME -c ADDRESS:PORT (-k KEYFILE | -I) [-g GID] [-m DIR] [-r PRIO] [-v]\n"
+            "       crossnode-net -f CONF [-g GID] [-m DIR] [-r PRIO] [-v]\n"
+            "  -f CONF          one peer per line: NAME ADDRESS:PORT KEYFILE (# starts a comment). Every line is\n"
+            "                   checked first; then each peer gets its own process, holding only its own key,\n"
+            "                   so a peer that hangs or fails cannot hold up another\n"
             "  -k KEYFILE       shared key with the agent (at least 16 bytes, mode 600)\n"
             "  -I               no authentication (only against an agent that was also started with -I)\n"
             "  -n NAME          the peer appears as DIR/NAME\n"
@@ -1322,10 +1399,10 @@ int main(int argc, char **argv)
 {
     const char *mountdir = "/net";
     char *target = NULL;
-    const char *keyfile = NULL;
+    const char *keyfile = NULL, *conf = NULL;
     int insecure = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "n:c:g:m:vk:Ir:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:c:g:m:vk:Ir:f:")) != -1) {
         switch (opt) {
         case 'n': name = optarg; break;
         case 'c': target = optarg; break;
@@ -1335,12 +1412,46 @@ int main(int argc, char **argv)
         case 'k': keyfile = optarg; break;
         case 'I': insecure = 1; break;
         case 'r': io_prio = atoi(optarg); break;
+        case 'f': conf = optarg; break;
         default: usage();
         }
     }
-    if (name == NULL || target == NULL || strchr(name, '/') != NULL || name[0] == '\0')
+    static char conf_addr[64];
+    if (conf != NULL) {
+        if (name != NULL || target != NULL || keyfile != NULL || insecure) {
+            fprintf(stderr, "crossnode-net: -f replaces -n, -c, -k and -I\n");
+            return 2;
+        }
+        static struct peercfg pc[CN_MAX_PEERS];
+        int np = read_conf(conf, pc, CN_MAX_PEERS);
+        if (np < 0)
+            return 2;
+        int me = np - 1;              /* this process serves the last peer; a child serves each of the others */
+        for (int i = 0; i < np - 1; i++) {
+            pid_t c = fork();
+            if (c < 0) {
+                perror("crossnode-net: fork");
+                return 1;
+            }
+            if (c == 0) {
+                me = i;
+                break;
+            }
+        }
+        static char conf_name[64];
+        snprintf(conf_name, sizeof conf_name, "%s", pc[me].name);
+        snprintf(conf_addr, sizeof conf_addr, "%s", pc[me].addr);
+        name = conf_name;
+        target = conf_addr;
+        memcpy(G.key, pc[me].key, pc[me].keylen);
+        G.keylen = pc[me].keylen;
+        for (int i = 0; i < np; i++)          /* keep only this link's key */
+            memset(pc[i].key, 0, sizeof pc[i].key);
+    }
+    if (name == NULL || target == NULL || strchr(name, '/') != NULL || name[0] == '\0' ||
+        strcmp(name, CN_STATUS_NAME) == 0)
         usage();
-    if ((keyfile == NULL) == (insecure == 0)) {
+    if (conf == NULL && (keyfile == NULL) == (insecure == 0)) {
         fprintf(stderr, "crossnode-net: give either -k KEYFILE or -I (no authentication), not both and not neither\n");
         return 2;
     }
