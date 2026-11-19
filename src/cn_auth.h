@@ -92,6 +92,15 @@ static inline void cn_sha256_update(struct cn_sha256 *s, const unsigned char *p,
     }
 }
 
+/* Wipe secret bytes in a way the compiler may not drop as a dead store (plain memset before a buffer goes out of
+ * scope can be removed). */
+static inline void cn_wipe(void *p, size_t n)
+{
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n--)
+        *v++ = 0;
+}
+
 static inline void cn_sha256_final(struct cn_sha256 *s, unsigned char out[32])
 {
     uint64_t bits = s->total * 8;
@@ -110,6 +119,7 @@ static inline void cn_sha256_final(struct cn_sha256 *s, unsigned char out[32])
         out[4 * i + 2] = (unsigned char)(s->h[i] >> 8);
         out[4 * i + 3] = (unsigned char)s->h[i];
     }
+    cn_wipe(s, sizeof *s);      /* the context still holds the input's last block (all of a short key) */
 }
 
 static inline void cn_hmac_sha256_parts(const unsigned char *key, size_t klen, const unsigned char *const *part,
@@ -138,6 +148,10 @@ static inline void cn_hmac_sha256_parts(const unsigned char *key, size_t klen, c
     cn_sha256_update(&s, opad, 64);
     cn_sha256_update(&s, inner, 32);
     cn_sha256_final(&s, out);
+    cn_wipe(k, sizeof k);
+    cn_wipe(ipad, sizeof ipad);
+    cn_wipe(opad, sizeof opad);
+    cn_wipe(inner, sizeof inner);
 }
 
 static inline void cn_hmac_sha256(const unsigned char *key, size_t klen, const unsigned char *msg, size_t n,

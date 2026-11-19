@@ -1493,7 +1493,7 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
                 cn_sha256_final(&h, pc[n].khash);
                 n++;
             }
-            memset(kb, 0, sizeof kb);
+            cn_wipe(kb, sizeof kb);
         }
     }
     fclose(f);

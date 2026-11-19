@@ -90,6 +90,15 @@ int main(void)
         if (cn_ct_equal(t0, t1, 32)) { printf("FAIL frame tag must change with the counter\n"); fails++; } else printf("PASS frame tag changes with the counter (a replay is caught)\n");
         if (cn_ct_equal(t0, t2, 32)) { printf("FAIL frame tag must change with one payload bit\n"); fails++; } else printf("PASS frame tag changes with one payload bit\n");
     }
+    {   /* Secrets do not stay behind in a finished hash context. */
+        struct cn_sha256 st;
+        unsigned char out[32], zero[sizeof st];
+        memset(zero, 0, sizeof zero);
+        cn_sha256_init(&st);
+        cn_sha256_update(&st, (const unsigned char *)"a short secret key", 18);
+        cn_sha256_final(&st, out);
+        if (memcmp(&st, zero, sizeof st) != 0) { printf("FAIL sha256 context must be wiped after final\n"); fails++; } else printf("PASS sha256 context is wiped after final\n");
+    }
     printf("%s\n", fails ? "FAILED" : "ALL PASSED");
     return fails != 0;
 }
