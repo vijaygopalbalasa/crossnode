@@ -42,7 +42,7 @@ qx 'stty baud=57600 < /net/nodey/dev/ser1' >/dev/null 2>&1
 say "A devctl from nodex lands on nodey's driver"
 run x '/tmp/cn/cnprobe set /net/nodey/dev/hello 42 | cut -d" " -f1-4'
 run y '/tmp/cn/cnprobe get /dev/hello | cut -d" " -f1-4'
-say "A read on nodey's quiet serial line waits. Ctrl-C returns at once"
+say "A read on nodey's quiet serial line waits until Ctrl-C"
 printf '\033[1;36mnodex#\033[0m %s\n' 'cat /net/nodey/dev/ser1'
 python3 -I - "$KEY" <<'PY'
 import os, pty, sys, time, select
@@ -110,7 +110,7 @@ run y 'tail -1 /tmp/cn/agent.log'
 qx 'slay -f cnmitm >/dev/null 2>&1; true'
 say "The link's own status file, answered on nodex"
 run x 'cat /net/nodey/.status'
-say "Priority travels with the request. The test fills both of nodey's CPUs with priority 12 work, then calls in"
+say "The priority test: priority 12 work fills both CPUs of nodey, then of nodex; priority 30 calls still get answers"
 "$ROOT/test/priority.sh" "$IMG" 2>&1 | grep -E '^(PASS|FAIL)|RESULT' | sed 's/^/  /'
 say "Crossnode: QNX's own priority-driven message passing, across machines"
 pause 2
