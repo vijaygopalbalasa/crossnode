@@ -1,5 +1,5 @@
 # Security policy rules for the Crossnode and sensor types in the zonal layout (CN_LAYOUT=zones), as recorded by
-# secpolgenerate (image/record-policy.sh) at aa53a3c and then enforced with CN_SECPOL=secure. Only these types are
+# secpolgenerate (image/record-policy.sh) at be2f81a and then enforced with CN_SECPOL=secure. Only these types are
 # shown; the full policies are recorded on your own build. The sensors are simulations. Every ability not listed is denied.
 
 # --- front ---
@@ -11,6 +11,7 @@ allow crossnode_agent_t self:ability {
     channel_connect:random_t,io_sock_t,hellodev_t,zonesensor_t
     network/jailroot
 };
+
 # === Rules for type hellodev_t ============
 allow_attach hellodev_t {
     /dev/hello
@@ -22,6 +23,7 @@ allow hellodev_t self:ability {
     map_fixed
     public_channel
 };
+
 # === Rules for type zonesensor_t ============
 allow_attach zonesensor_t {
     /dev/temp
@@ -43,6 +45,7 @@ allow crossnode_agent_t self:ability {
     channel_connect:random_t,io_sock_t,zonesensor_t
     network/jailroot
 };
+
 # === Rules for type zonesensor_t ============
 allow_attach zonesensor_t {
     /dev/radar
@@ -58,12 +61,13 @@ allow zonesensor_t self:ability {
 # --- central ---
 # === Rules for type crossnode_net_t ============
 allow_attach crossnode_net_t {
-    /net/front
     /net/rear
+    /net/front
 };
 allow crossnode_net_t self:ability {
     nonroot
     pathspace
+    fork
     prot_exec
     map_fixed
     public_channel

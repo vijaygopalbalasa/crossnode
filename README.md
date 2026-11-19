@@ -27,23 +27,39 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - Each link has its own key. Both ends prove they hold it when they connect, and every frame after that carries an
   HMAC-SHA256 tag with a frame counter, checked at both ends in the code. The tests change and replay replies on the
   wire and show them refused. The traffic is not encrypted.
+- The caller's priority travels with each request. The other machine does the work at that priority, never above a
+  cap its operator sets, so a priority 30 caller is still answered while priority 12 work fills every CPU on either
+  machine. A build that drops the priority fails that test.
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
-  the peer comes back, with nothing restarted.
+  the peer comes back, with nothing restarted. `cat /net/<peer>/.status` says whether the link is up, authenticated,
+  how many calls wait, and how often it dropped or refused a frame, each with its last reason.
+- One file lists every peer (`crossnode-net -f`); each peer gets its own process holding only its own key, so one
+  peer that hangs cannot hold up another.
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
   and cannot be changed while the system runs.
 
 The creative part is a non-obvious use of QNX's own resource manager, message passing, boot image and security
 policy features to bring back something QNX 8.0 lost.
 
-Who it is for: a QNX 7 system whose programs reach a device on another board through Qnet's `/net/<node>/` paths (a
-supervisor on one board reading a sensor driver on another, for example) finds no drop-in replacement for those
-paths listed for QNX 8.0, so each such program would otherwise move to sockets or to middleware such as SOME/IP or
-DDS. Crossnode keeps them unchanged, because on QNX every
-open, read and devctl is already a message to whichever server owns the path, and a user-space server can own a path
-that stands for another machine. It is not a real-time transport: requests go over TCP, and a lost peer is noticed
-after 2 s of silence. What it bounds is failure: a caller gets an error within a stated time instead of hanging.
-The demo's radar and temperature sensors are labelled stand-ins: the fit is supervision, diagnostics and
-configuration across boards, not a sensor's real-time data path.
+Who it is for: systems built from several QNX boards that talk through Qnet's `/net/<node>/` paths, such as
+distributed control systems, test rigs and lab instruments with a supervisor on one board and drivers on others,
+and multi-board controllers. Their users noticed. On the OpenQNX forum, the maintainer of a QNX multi-port serial
+driver, a Qnet user since 1987, described customers who reach serial ports on machines elsewhere in a building
+through Qnet rather than run serial cables, and wrote "Arguably QNX ain't QNX without Qnet" when its removal was
+announced ([thread, 2020](https://forums.openqnx.com/t/topic/8120)); Crossnode's tests run the stock `stty -a` on
+another machine's serial port through `/net`. A 2025 write-up of Qnet notes it is gone in 8.0 and hopes it returns
+([blog](https://linguini1.github.io/blog/2025/06/03/qnet.html)). QNX 8.0 lists no drop-in
+replacement for those paths, so each such program would otherwise move to sockets or to middleware such as SOME/IP
+or DDS. Crossnode keeps them unchanged, because on QNX every open, read and devctl is already a message to whichever
+server owns the path, and a user-space server can own a path that stands for another machine.
+
+Why a real-time OS matters here: the receiving thread of a QNX server inherits the priority of the client whose
+message it handles. Crossnode extends that across the wire: the caller's priority goes in each request and the other
+machine's worker runs at it, so important work stays ahead of less important work on both machines. It is still not a
+hard real-time transport: requests go over TCP, the network stack itself runs at priority 21 in these images, and a
+lost peer is noticed after 2 s of silence. What it bounds is failure, and what it keeps is priority order. The demo's
+radar and temperature sensors are labelled stand-ins: the fit is supervision, diagnostics and configuration across
+boards, not a sensor's real-time data path.
 
 ![Three QNX 8.0 machines: front and rear zones share simulated sensors, central reads them by path](docs/architecture.svg)
 
@@ -59,6 +75,9 @@ configuration across boards, not a sensor's real-time data path.
 | `stat` and `fstat`, including `stat` by name inside a combined message (`iofunc_stat_default`) | `src/cn_net.c`, `cn_stat`, `complete` | loopback 19a to 19h, two-node 2d-2 |
 | Directory reads (`_IO_XTYPE_READDIR`) | `src/cn_net.c`, `cn_read`; `src/cn_agent.c`, `do_readdir` (`fdopendir`) | loopback 20a to 20h |
 | Generic `devctl` forwarded by the command's direction bits | `src/cn_agent.c`, `do_devctl` | loopback 1, two-node 1 |
+| The caller's priority, as the kernel gave it to the receiving thread (`ctp->info.priority`), sent with the request and used for the worker on the other machine (`PTHREAD_EXPLICIT_SCHED`), capped by `-P` | `src/cn_net.c`, `submit`; `src/cn_agent.c`, job start | priority 1 to 4 |
+| A file answered by the resource manager itself, never forwarded (`/net/<peer>/.status`) | `src/cn_net.c`, `cn_open`, `status_text` | loopback 25c, 26a to 26d, zonal 15 |
+| A stale unblock pulse told apart from a live one (`MsgInfo`, `_NTO_MI_UNBLOCK_REQ`) | `src/cn_net.c`, `cancel_waiting` | loopback 21a to 21e, two-node 3, 3b |
 | Path containment (`realpath`), then the opened descriptor is asked where it points (`iofdinfo`) | `src/cn_agent.c`, `resolve`, `do_open` | loopback 3, 3b to 3e |
 | A blocked device call interrupted with a targeted signal (`pthread_kill`) | `src/cn_agent.c`, `cancel_job_locked` | loopback 16d, 16e, two-node 2c-2 |
 | Security policy: one type per program, recorded with `secpolgenerate`, compiled into the boot image and enforced (`on -T`, `mkqnximage --secpol --policy`, `secpol -Q`) | `image/build-image.sh`, `image/record-policy.sh` | zonal 4 to 8, boot image 6 to 13 |
@@ -104,7 +123,7 @@ give the Crossnode and sensor types (`image/crossnode-types-zones.secpol`):
 
 | Type | Runs as | May attach | May connect to | Other abilities granted (recorded) |
 |---|---|---|---|---|
-| `crossnode_net_t` | `crossnode-net` on central, uid 70 | `/net/front` and `/net/rear` only | `io_sock_t` (the network stack), `pipe_t`, `random_t` | `nonroot`, `pathspace`, `public_channel`, `network/jailroot`; `prot_exec`, `map_fixed` (recorded for every program here; not shown to be required) |
+| `crossnode_net_t` | `crossnode-net` on central, uid 70 | `/net/front` and `/net/rear` only | `io_sock_t` (the network stack), `pipe_t`, `random_t` | `nonroot`, `pathspace`, `public_channel`, `network/jailroot`, `fork` (one process per peer from `-f`); `prot_exec`, `map_fixed` (recorded for every program here; not shown to be required) |
 | `crossnode_agent_t` | `crossnode-agent` on front and rear, uid 70 | nothing | its own zone's sensors (`hellodev_t`, `zonesensor_t`), `io_sock_t`, `random_t` | `nonroot`, `network/jailroot`; `prot_exec`, `map_fixed` (as above) |
 | `hellodev_t`, `zonesensor_t` | the simulated sensors, uid 71 | each only its own device (`/dev/hello`, `/dev/temp`, `/dev/radar`) | nothing | `nonroot`, `pathspace`, `public_channel`; `prot_exec`, `map_fixed` (as above) |
 
@@ -114,8 +133,8 @@ Every ability not listed is denied.
 
 `CN_LAYOUT=zones` adds a rear zone. Front shares a simulated cabin temperature (`/dev/temp`) and a test device
 (`/dev/hello`); rear shares a simulated radar (`/dev/radar`, `tools/zonesensor.c`), whose reading moves every second.
-Central reaches each zone over its own direct link and mounts both, one `crossnode-net` per zone, each with that
-link's key. `image/run-zones.sh` boots the three. Nothing is typed on the machines after power-on; `test/zonal.sh`
+Central reaches each zone over its own direct link and mounts both from one file, `/data/etc/crossnode.conf`, with
+one `crossnode-net` process per zone, each holding only that link's key. `image/run-zones.sh` boots the three. Nothing is typed on the machines after power-on; `test/zonal.sh`
 and `demo/zonal-demo.sh` then run commands on central over SSH from the host. Rear loses power while central reads
 it; the read fails with `EHOSTDOWN` after about 2 s of silence, front keeps answering, and when rear boots again
 central reads it with the same `crossnode-net` processes.
@@ -161,13 +180,29 @@ On the machine that uses it (here central):
 ```
 ./crossnode-net -k /etc/crossnode-front.key -n front -c 10.9.0.2:7777 -g 1000 &     # front appears as /net/front
 cat /net/front/dev/hello
+cat /net/front/.status
+```
+
+With several peers, list them in a file and start once:
+
+```
+# /etc/crossnode.conf: name, address:port, key file
+front    10.9.0.2:7777    /etc/crossnode-front.key
+rear     10.10.0.2:7777   /etc/crossnode-rear.key
+```
+
+```
+./crossnode-net -f /etc/crossnode.conf -r 30 -g 1000 &     # /net/front and /net/rear, one process each
 ```
 
 Both programs need `-k KEYFILE` (the same 16 or more random bytes at both ends of a link, mode 600, for example
 `(umask 077; head -c 32 /dev/urandom > /etc/crossnode-front.key)`) or, for a throwaway test, `-I` on both, which has no handshake
 and no frame tags. `crossnode-agent -e PATH` shares PATH and everything under it; `-l` and `-p` choose the listening
-address and port. `crossnode-net -n NAME -c ADDRESS:PORT` mounts the peer at `/net/NAME`; `-g GID` lets that group
-use it besides root; `-m DIR` changes `/net`.
+address and port; `-P CAP` runs each request at its caller's priority up to CAP (default: the agent's own priority,
+so a peer can never raise work above it), and `-r PRIO` sets the priority of the threads that read the links.
+`crossnode-net -n NAME -c ADDRESS:PORT` mounts the peer at `/net/NAME`; `-g GID` lets that group use it besides root;
+`-m DIR` changes `/net`; `-r PRIO` runs the link's I/O thread at PRIO, so lower-priority work on the using machine
+cannot hold the link up.
 
 ## How it works
 
@@ -184,7 +219,9 @@ use it besides root; `-m DIR` changes `/net`.
 - The I/O thread sends a liveness probe every 500 ms and declares the peer down after 2 s of silence; a connection
   attempt has 1.5 s.
 - A signal to a waiting client arrives as an unblock pulse; the client gets `EINTR` at once and the peer is told to
-  stop the work.
+  stop the work. A pulse left over from a call already answered is told apart with `MsgInfo` and ignored.
+- Priority: the dispatch thread runs each request at its caller's priority (QNX does that for message passing), and
+  `crossnode-net` writes that priority into the request. The agent starts the request's worker at it, capped by `-P`.
 - `crossnode-agent` answers liveness probes on the connection's reader thread and runs every other request on a
   worker thread, so a slow device never looks like a dead machine. A worker's device call is interrupted with a
   signal when its caller gives up, its handle is closed or the connection ends.
@@ -201,11 +238,11 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 ## Limits
 
 - The traffic is not encrypted: on an untrusted network it can be read, though not changed or replayed unnoticed.
-  `-I` links have no handshake and no tags. The man-in-the-middle tests (loopback 25a, 25b) change and replay replies
-  only; the agent's check of request tags is in the code (`src/cn_agent.c`, `reader`) but not shown by a test.
+  `-I` links have no handshake and no tags.
 - The handshake caps (2 waiting handshakes per address, 4 authenticated connections per address) can drop a
   legitimate handshake from an address that is also flooding.
-- `crossnode-net` has one dispatch thread per process and one peer per process (central runs one per zone).
+- `crossnode-net` has one dispatch thread per process and one peer per process (`-f` starts one per peer). Peers are
+  listed, not discovered.
 - For a directory, the second check compares device and inode of a second open made with `O_DIRECTORY` (the
   descriptor `fdopendir` needs), not `iofdinfo`.
 - A device or FIFO is checked by name before and after a second resolve, not through an opened descriptor (opening
@@ -218,8 +255,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - The loopback and two-node suites run the services as root on plain test machines; the confined, enforced build is
   shown on the boot-image pair and the zonal set. The policy is recorded from the demo, so a use the recording did
   not see is denied until it is recorded too.
-- The caller's priority does not travel: on the sharing machine a request runs at `crossnode-agent`'s own priority,
-  whatever the caller's priority on the using machine.
+- Priority keeps order, not deadlines: the link is TCP, and the network stack (`io-sock`) runs at priority 21 in
+  these images, so work above 21 on either machine can still delay the link. The agent starts a thread per request.
 - Built and tested for x86_64 under QEMU; a mixed x86_64 and aarch64 pair is not shown.
 
 ## Tests

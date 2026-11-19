@@ -1,5 +1,5 @@
 # Security policy rules for the Crossnode types in the pair layout, as recorded by secpolgenerate
-# (image/record-policy.sh) at aa53a3c and then enforced with CN_SECPOL=secure. Only these types are shown; the full
+# (image/record-policy.sh) at be2f81a and then enforced with CN_SECPOL=secure. Only these types are shown; the full
 # policies are recorded on your own build. hellodev is the test device. Every ability not listed is denied.
 
 # --- front ---
@@ -11,6 +11,7 @@ allow crossnode_agent_t self:ability {
     channel_connect:random_t,io_sock_t,hellodev_t
     network/jailroot
 };
+
 # === Rules for type hellodev_t ============
 allow_attach hellodev_t {
     /dev/hello
