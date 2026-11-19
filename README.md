@@ -81,7 +81,14 @@ checks (including a power cut and a reboot) and saves each machine's policy; `CN
 into the boot image, where it is enforced and cannot be changed while the system runs. The rules were recorded from
 the demo, not hand-designed or minimised. What they give the Crossnode and sensor types (`image/crossnode-types-zones.secpol`):
 
-@@ABILITIES@@
+| Type | Runs as | May attach | May connect to | Other abilities granted |
+|---|---|---|---|---|
+| `crossnode_net_t` | `crossnode-net` on central, uid 70 | `/net/front` and `/net/rear` only | `io_sock_t` (the network stack), `pipe_t`, `random_t` | `nonroot`, `pathspace`, `public_channel`, `prot_exec`, `map_fixed`, `network/jailroot` |
+| `crossnode_agent_t` | `crossnode-agent` on front and rear, uid 70 | nothing | its own zone's sensors (`hellodev_t`, `zonesensor_t`), `io_sock_t`, `random_t` | `nonroot`, `prot_exec`, `map_fixed`, `network/jailroot` |
+| `hellodev_t`, `zonesensor_t` | the simulated sensors, uid 71 | each only its own device (`/dev/hello`, `/dev/temp`, `/dev/radar`) | nothing | `nonroot`, `pathspace`, `public_channel`, `prot_exec`, `map_fixed` |
+
+`prot_exec` and `map_fixed` were recorded for every program here, the sensors included; we did not test removing
+them.
 
 Every ability not listed is denied. The policy also decides which session types may open `/net/front` at all, on top
 of Crossnode's own root-or-group check.
@@ -94,9 +101,9 @@ Central reaches each zone over its own direct link and mounts both, one `crossno
 link's key. `image/run-zones.sh` boots the three, and `test/zonal.sh` checks the run: nothing is typed on the
 machines after power-on, and the checks run commands on central over SSH from the host. Rear loses power while
 central reads it; the read fails with `EHOSTDOWN` within the stated bound, front keeps answering, and when rear boots
-again central reads it with the same `crossnode-net` processes. On the enforced set: @@ZONAL_RESULT@@
-(`evidence/@@ZONAL@@`). With `CN_MUTATE=1` the same script cuts front instead of rear, leaves rear down and kills
-central's services, and checks 9 to 13 fail as they should (`evidence/@@ZONALMUT@@`). `demo/zonal-demo.sh` is the
+again central reads it with the same `crossnode-net` processes. On the enforced set: 13 of 13
+(`evidence/zonal-20261119T013940Z.txt`). With `CN_MUTATE=1` the same script cuts front instead of rear, leaves rear down and kills
+central's services, and checks 9 to 13 fail as they should (`evidence/zonal-mutation-20261119T014026Z.txt`). `demo/zonal-demo.sh` is the
 same story for the video, shown with a plain `cat` loop, which prints "Host is down".
 
 ## Reproduce

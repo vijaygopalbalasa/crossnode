@@ -16,6 +16,7 @@ allow_attach hellodev_t {
     /dev/hello
 };
 allow hellodev_t self:ability {
+    nonroot
     pathspace
     prot_exec
     map_fixed
@@ -26,6 +27,7 @@ allow_attach zonesensor_t {
     /dev/temp
 };
 allow zonesensor_t self:ability {
+    nonroot
     pathspace
     prot_exec
     map_fixed
@@ -46,6 +48,7 @@ allow_attach zonesensor_t {
     /dev/radar
 };
 allow zonesensor_t self:ability {
+    nonroot
     pathspace
     prot_exec
     map_fixed

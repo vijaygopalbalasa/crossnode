@@ -4,9 +4,9 @@ Check numbers are the ones printed in the transcripts under `evidence/`: loopbac
 `gate1-loopback-*.txt`), two-node (two plain test machines on a direct link, `gate1-twonode-*.txt`), boot image (the
 pair built by `image/build-image.sh`, `boot-image-*.txt`) and zonal (three machines, `zonal-*.txt`). Each transcript
 names the commit it ran on. Runs referred to here: `gate1-loopback-20261118T201529Z` (69 of 69),
-`gate1-twonode-20261118T201732Z` (19 of 19), `@@BOOTPAIR@@` (default pair, 5 of 5), `@@BOOTCONF@@` (confined pair,
-@@BOOTCONF_RESULT@@), `@@ZONAL@@` (zonal, confined and enforced, @@ZONAL_RESULT@@) and `@@ZONALMUT@@` (zonal with
-`CN_MUTATE=1`, where checks 9 to 13 must fail).
+`gate1-twonode-20261118T201732Z` (19 of 19), `boot-image-20261119T011705Z` (default pair, 5 of 5), `boot-image-20261119T012135Z` (confined pair,
+11 of 11), `zonal-20261119T013940Z` (zonal, confined and enforced, 13 of 13) and `zonal-mutation-20261119T014026Z` (zonal with
+`CN_MUTATE=1`, where checks 9 to 13 must fail). Earlier runs from the build-up are in `evidence/history/`.
 
 Times are pass or fail against the bound each test states, for this code on QEMU guests. They are not performance
 figures for QNX. Each bound adds 200 ms to a limit of our own code for process start and scheduling on an emulated

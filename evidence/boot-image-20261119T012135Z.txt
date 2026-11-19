@@ -1,4 +1,4 @@
-== Crossnode boot image check, 20261118T204113Z, build 5a9b937-dirty
+== Crossnode boot image check, 20261119T012135Z, build 4214b85
 front started
 central started
 front: 31 lines of console, startup complete
@@ -8,7 +8,7 @@ central: QNX central 8.0.0 2026/06/05-16:26:03EDT x86pc x86_64
   front processes:   405523 /system/bin/hellodev 
   front processes:   405524 /system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 
 PASS  1 front started hellodev and crossnode-agent by itself at boot  [ 405523 /system/bin/hellodev ; 405524 /system/bin/crossnode-agent -k /data/etc/crossnode.key -e /dev/hello -l 10.9.0.2 -p 7777 ;]
-PASS  2 central started crossnode-net by itself at boot  [ 405523 /system/bin/crossnode-net -k /data/etc/crossnode.key -g 1000 -n front -c 10.9.0.2 ]
+PASS  2 central started crossnode-net by itself at boot  [ 405523 /system/bin/crossnode-net -k /data/etc/crossnode-front.key -g 1000 -n front -c 10.9.0.2 ]
   on central: ls /net/front/dev; cat /net/front/dev/hello -> hello hello from front 
 PASS  3 central lists front's shared device and reads it, with no command typed on either node  [hello hello from front ]
   confined services: yes; security policy enforced: yes
@@ -16,7 +16,7 @@ PASS  4 the key file belongs to the service user (uid 70) and no one else may re
 PASS  5 a path outside front's share list is refused from central  [cat: /net/front/etc/passwd: Permission denied]
 PASS  6 front's crossnode-agent runs as uid 70 under its own security type  [crossnode_agent_ 70]
 PASS  7 central's crossnode-net runs as uid 70 under its own security type  [crossnode_net_t 70]
-PASS  8 both nodes run under a security policy that cannot be changed while they run  [front: policy id:c2af1a42 (immutable); central: policy id:e29bb0c4 (immutable)]
+PASS  8 both nodes run under a security policy that cannot be changed while they run  [front: policy id:ecab4090 (immutable); central: policy id:e29bb0c4 (immutable)]
   front policy: crossnode_agent_t  crc:34a80aee
   front policy:     PROT_EXEC allow root non-root inherit lock
   front policy:     MAP_FIXED allow root non-root inherit lock
