@@ -36,7 +36,10 @@ message passing, boot image and security policy features to bring back something
 
 Who it is for: a QNX 7 system whose programs reach a device on another board through Qnet's `/net/<node>/` paths (a
 supervisor on one board reading a sensor driver on another, for example) has no listed alternative on QNX 8.0, so
-each such program would have to be rewritten against sockets. Crossnode keeps them unchanged, because on QNX every
+each such program would have to be rewritten against sockets. Board support follows the same line: TI's QNX SDK for
+its J7 automotive SoCs says "In SDP 8.0 io-sock remains the only supported networking stack"
+([TI developer note](https://software-dl.ti.com/jacinto7/esd/processor-sdk-qnx-jacinto7/latest/exports/docs/developer_notes_devnp_vs_iosock_710.html)),
+while Qnet lived in io-pkt. Crossnode keeps them unchanged, because on QNX every
 open, read and devctl is already a message to whichever server owns the path, and a user-space server can own a path
 that stands for another machine. It is not a real-time transport: requests go over TCP, and a lost peer is noticed
 after 2 s of silence. What it bounds is failure: a caller gets an error within a stated time instead of hanging.
