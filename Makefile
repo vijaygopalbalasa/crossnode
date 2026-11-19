@@ -6,7 +6,7 @@ ARCH   ?= x86_64
 CC      = qcc -Vgcc_nto$(ARCH)
 CFLAGS ?= -O2 -g -std=gnu11 -Wall -Wextra -Werror
 OUT     = build/$(ARCH)
-BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/cnprobe
+BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe
 
 all: $(BINS)
 
@@ -21,6 +21,9 @@ $(OUT)/crossnode-agent: src/cn_agent.c src/cn_proto.h src/cn_auth.h | $(OUT)
 
 $(OUT)/hellodev: tools/hellodev.c tools/hello_dcmd.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/hellodev.c
+
+$(OUT)/zonesensor: tools/zonesensor.c tools/hello_dcmd.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ tools/zonesensor.c
 
 $(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c -lsocket

@@ -1,0 +1,43 @@
+== MUTATION RUN of test/zonal.sh (a deliberately broken copy, to prove checks 8 to 12 can fail): front lost power
+== instead of rear, rear was cut later and not booted again, and central's crossnode-net processes were killed
+== before the last check. Ran on the policy-recording set (open policy), so checks 6 and 7 do not apply. Expected: 8 to 12 FAIL.
+== Crossnode zonal demo check, 20261119T004912Z, build 
+front started
+rear started
+central started
+front: startup complete
+rear: startup complete
+central: startup complete
+  front 8.0.0 
+  rear 8.0.0 
+  central 8.0.0 
+  confined services: yes; security policy enforced: no
+== 1. Power on, nothing typed: central sees both zones by path
+  central# ls /net/front/dev; ls /net/rear/dev -> hello temp radar 
+PASS  1 central lists each zone's shared devices, and only those  [hello temp radar ]
+  central# cat /net/front/dev/temp -> cabin-temp value=23 C t=11
+  central# cat /net/rear/dev/radar -> rear-radar value=123 cm t=11
+PASS  2 central reads both zones' sensors with cat  [cabin-temp value=23 C t=11 | rear-radar value=123 cm t=11]
+  central# cat /net/rear/dev/radar (2 s later) -> rear-radar value=109 cm t=13
+PASS  3 the rear radar's reading moves as central watches it  [123 cm -> 109 cm]
+PASS  4 central's two crossnode-net processes run as uid 70 under crossnode_net_t  [ 2 crossnode_net_t 70]
+PASS  5 each zone's agent runs as uid 70 under its own security type  [front: crossnode_agent_ 70; rear: crossnode_agent_ 70]
+== 2. The rear zone loses power while central is watching it
+  power cut on rear at 00:49:39 UTC
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=29 rc=EOK value=46 ms=3
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=30 rc=EOK value=46 ms=5
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=31 rc=EOK value=46 ms=4
+  central# cnprobe watch /net/rear/dev/radar: op=watch i=32 rc=EOK value=41 ms=2
+FAIL  8 the live readings stop with EHOSTDOWN within the liveness limit when rear loses power  [33 readings, then , bound 2000+200 ms]
+cat: /net/front/dev/hello: Host is down
+  central# (front, rear down) op=open rc=EHOSTDOWN errno=264 ms=1506
+FAIL  9 the front zone keeps answering while rear is down  [0 readings and hello]
+FAIL  10 a new open on the dead zone fails cleanly instead of hanging  [op=open rc=EOK ms=2]
+== 3. The rear zone boots again
+cat: /net/rear/dev/radar: Host is down
+  central# cnprobe watch /net/rear/dev/radar 1 0 -> op=open rc=EHOSTDOWN errno=264 ms=1506
+  central# cat /net/rear/dev/radar -> 
+FAIL  11 central reads the rear radar again after rear reboots  []
+FAIL  12 nothing was restarted on central: the same crossnode-net processes serve both zones  [pids before: 524304 548885  after: ]
+
+== RESULT: 5 passed, 5 failed

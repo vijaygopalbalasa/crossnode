@@ -23,9 +23,10 @@ What does not work yet is listed too.
 
 Each row names the checks that show it. Check numbers are the ones printed in the transcripts: two-node
 (`evidence/gate1-twonode-*.txt`, two QNX 8.0 machines on a direct link), loopback (`evidence/gate1-loopback-*.txt`,
-one machine) and boot image (`evidence/boot-image-*.txt`). The values quoted are from the runs
+one machine), boot image (`evidence/boot-image-*.txt`) and zonal (`evidence/zonal-*.txt`, three machines). The values quoted are from the runs
 `gate1-twonode-20261118T201732Z`, `gate1-loopback-20261118T201529Z`, `boot-image-20261118T203710Z` (the default
-pair) and `boot-image-20261118T204113Z` (the confined pair).
+pair), `boot-image-20261118T204113Z` (the confined pair) and `zonal-20261119T004751Z` (three machines, confined
+and enforced).
 
 | Behaviour | Checks | What the transcript shows |
 |---|---|---|
@@ -48,6 +49,7 @@ pair) and `boot-image-20261118T204113Z` (the confined pair).
 | Replies that break the protocol never reach a program | loopback 18a to 18d | from `test/fake-agent.py`, a deliberately broken agent |
 | A pair built with `image/build-image.sh` boots already connected, with the key readable by root only | boot image 1 to 4 | `hello from front` on central with no command typed; key `-rw-------` |
 | Built confined, both services run as uid 70 under their own security types and an immutable policy: the agent may attach no path, `crossnode-net` may attach only `/net/front`, and root cannot start anything else under their types | boot image 6 to 11 (confined pair) | `allow_attach crossnode_net_t /net/front;`; `on: Operation not permitted` |
+| Three machines in a zonal layout, confined and enforced: central reads both zones by path; a zone that loses power stops its readings with `EHOSTDOWN` within the limit while the other zone keeps answering, and it comes back with nothing restarted | zonal 1 to 12 | `call_ms=1796` after rear's power cut (bound 2000+200 ms); the same `crossnode-net` pids before and after |
 
 Evidence: `evidence/gate1-loopback-*.txt` (69 checks, one machine over loopback) and
 `evidence/gate1-twonode-*.txt` (19 checks, two machines on a direct link). Each transcript names the commit it
@@ -62,7 +64,7 @@ ran on. The times in them are behaviour bounds on emulated machines, not perform
 - One peer per `crossnode-net` process.
 - Authentication proves both ends hold a shared key; the traffic after it is not encrypted or integrity-protected, so use a protected link.
 - The loopback and two-node suites run the services as root on plain test machines; the confined build under an
-  enforced security policy is shown on the boot-image pair (checks 6 to 11). The policy is recorded by running the
+  enforced security policy is shown on the boot-image pair (checks 6 to 11) and the zonal set (checks 4 to 12). The policy is recorded by running the
   demo, so a use the recording did not see is denied until it is recorded too.
 - Built and tested for x86_64 under QEMU. The base SDP has no QEMU startup for aarch64, so a mixed pair is not shown.
 
@@ -109,6 +111,35 @@ pair comes up already connected: `front` (a stand-in sensor at `/dev/hello` and 
 `/data/etc/crossnode.key`, mode 600. `image/run-pair.sh` boots the pair on a direct link, and
 `test/boot-image.sh` checks that, with no command typed, central lists and reads front's device
 (`evidence/boot-image-*.txt`). The images stay on the build machine; nothing from QNX is in this repository.
+
+## Zonal demo: three machines
+
+`CN_LAYOUT=zones image/build-image.sh` adds a third role, `rear`, and gives each zone a simulated sensor
+(`tools/zonesensor.c`, a resource manager whose reading moves every second): a cabin temperature on front
+(`/dev/temp`) and a rear radar on rear (`/dev/radar`). Central reaches front and rear over two direct links and
+mounts both, one `crossnode-net` per zone. `image/run-zones.sh` boots the three, and `test/zonal.sh` checks, with
+nothing typed on any machine:
+
+```
+central# ls /net/front/dev; ls /net/rear/dev
+hello temp
+radar
+central# cat /net/rear/dev/radar
+rear-radar value=123 cm t=11
+(rear loses power while central watches it)
+central# cnprobe watch /net/rear/dev/radar 400 250
+op=watch i=11 rc=EOK value=74 ms=2
+op=watch i=12 rc=EHOSTDOWN value=0 ms=1796
+(front keeps answering; rear boots again and central reads it, with nothing restarted)
+```
+
+Built confined (`CN_SECPOL=open`, then `image/record-policy.sh`, then `CN_SECPOL=secure`), the same run also checks
+that every Crossnode process runs as uid 70 under its own type, that all three machines run immutable policies, and
+that central's `crossnode-net` may attach exactly `/net/front` and `/net/rear`: 12 of 12 in
+`evidence/zonal-20261119T004751Z.txt`. A deliberately broken copy of the test (front cut instead of rear, rear left
+down, central's services killed) fails checks 8 to 12, as it should (`evidence/zonal-mutation-20261119T004912Z.txt`).
+The recorded rules are in `image/crossnode-types-zones.secpol`. The sensors and the vehicle are simulations on
+QEMU, not vehicle interfaces, and the times are behaviour bounds of this code on emulated machines.
 
 ## Confined: non-root, under a QNX security policy
 
