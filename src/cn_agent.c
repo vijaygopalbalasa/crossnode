@@ -68,7 +68,8 @@ static char *exports[MAX_EXPORTS];      /* as given, without the leading '/' */
 static char *rexports[MAX_EXPORTS];     /* the same, resolved with realpath() at start */
 static int nexports;
 static int verbose;
-static int prio_cap = 63;     /* -P: a request runs at its caller's priority, up to this; 0 = never */
+static int prio_cap = -1;     /* -P: a request runs at its caller's priority, up to this; 0 = never;
+                               * default: the agent's own priority, so a peer can never raise work above it */
 static int reader_prio;       /* -r: priority of the threads that read each peer's link; 0 = inherit */
 static int base_prio;         /* the agent's own priority: requests that carry none run at it */
 
@@ -944,9 +945,12 @@ static void start_job(struct conn *c, const struct cn_hdr *h, unsigned char *p)
      * reader thread's priority (-r), which only keeps the link read. */
     int prio = base_prio;
     if (prio_cap > 0 && (h->flags & CN_F_PRIO) != 0) {
+        /* The carried priority is the peer's claim: it is only ever capped, never trusted upward. */
         prio = h->flags & CN_PRIO_MASK;
         if (prio > prio_cap)
             prio = prio_cap;
+        if (prio < 1)
+            prio = base_prio;
     }
     attr_prio(&at, prio);
     int rc = pthread_create(&t, &at, worker, j);
@@ -1123,7 +1127,7 @@ static void usage(void)
             "  -e PATH     export PATH and everything under it (for example /dev/hello or /dev)\n"
             "  -l ADDRESS  listen on this IPv4 address (default 127.0.0.1)\n"
             "  -p PORT     listen on this TCP port (default 7777)\n"
-            "  -P CAP      run each request at its caller's priority, up to CAP (default 63; 0 = never)\n"
+            "  -P CAP      run each request at its caller's priority, up to CAP (default: the agent's own; 0 = never)\n"
             "  -r PRIO     run the threads that read each link at PRIO (default: inherited)\n");
     exit(2);
 }
@@ -1170,6 +1174,8 @@ int main(int argc, char **argv)
         default: usage();
         }
     }
+    if (prio_cap < 0)
+        prio_cap = base_prio;
     if (nexports == 0 || port <= 0 || port > 65535)
         usage();
     if (keyfile != NULL && insecure) {
