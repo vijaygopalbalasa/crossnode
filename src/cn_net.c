@@ -70,6 +70,9 @@ struct cn_ocb {
     int isdir;                /* the peer said the opened object is a directory */
     uint32_t dpos;            /* directories: index of the next entry to hand out */
     char *text;               /* OCB_STATUS: the snapshot taken at open, so one read sees one moment */
+    iofunc_notify_t notify[3];/* select, poll and ionotify waiters on this open (input, output, out-of-band) */
+    int armed;                /* a NOTIFY request is out at the peer for this open */
+    int ready;                /* the peer said input is there; cleared when a read goes out */
     size_t tlen;
 };
 
@@ -380,6 +383,7 @@ static int reply_valid(const struct pend *e, const struct cn_hdr *h, const unsig
     case CN_OP_DEVCTL:  return h->len == 0 || h->len == e->req;
     case CN_OP_STAT:    return h->len == sizeof(struct cn_stat) && stat_valid(p);
     case CN_OP_READDIR: return h->len <= e->req && h->b >= 0 && dents_valid(p, h->len, h->b);
+    case CN_OP_NOTIFY:  return h->len == 0;
     default:            return 0;
     }
 }
@@ -751,6 +755,46 @@ static int submit(resmgr_context_t *ctp, int op, struct cn_ocb *gen_ocb, struct 
 }
 
 /* Undo an OCB bound for an open that did not succeed: remove the client mapping, then free it. */
+/* Ask the peer to answer when this open has input. No client waits on the answer: it wakes the open's select, poll
+ * and ionotify waiters. On a link failure the entry fails like any other, which wakes them too. */
+static int notify_peer(struct cn_ocb *ocb)
+{
+#ifdef CN_NO_NOTIFY
+    (void)ocb;
+    return -1;                  /* mutation build: never asks, so a select on a peer's device never wakes */
+#endif
+    pthread_mutex_lock(&G.mtx);
+    if (ocb->gen != G.gen || G.state != C_UP) {
+        pthread_mutex_unlock(&G.mtx);
+        return -1;
+    }
+    struct pend *e = NULL;
+    for (int i = 0; i < NPEND; i++) {
+        if (!G.pend[i].used) {
+            e = &G.pend[i];
+            break;
+        }
+    }
+    if (e == NULL) {
+        pthread_mutex_unlock(&G.mtx);
+        return -1;
+    }
+    memset(e, 0, sizeof *e);
+    e->used = 1;
+    e->op = CN_OP_NOTIFY;
+    e->seq = ++G.seq;
+    e->ocb = ocb;
+    struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_NOTIFY, .seq = e->seq, .handle = ocb->rh };
+    if (out_append(&h, NULL, 0) != 0) {
+        e->used = 0;
+        pthread_mutex_unlock(&G.mtx);
+        return -1;
+    }
+    pthread_mutex_unlock(&G.mtx);
+    wake_io();
+    return 0;
+}
+
 static void drop_opening_ocb(resmgr_context_t *ctp, const struct _msg_info *info, struct cn_ocb *ocb)
 {
     struct _msg_info keep = ctp->info;
@@ -893,6 +937,15 @@ static void complete(resmgr_context_t *ctp, struct pend *e)
         free(buf);
         break;
     }
+    case CN_OP_NOTIFY:
+        /* No client waits on this one: wake every select, poll or ionotify waiter on the open. When the link failed,
+         * wake them too, so their read fails with the reason instead of waiting forever. */
+        if (e->ocb != NULL) {
+            e->ocb->armed = 0;
+            e->ocb->ready = 1;
+            iofunc_notify_trigger(e->ocb->notify, 1, IOFUNC_NOTIFY_INPUT);
+        }
+        break;
     default:
         MsgError(e->rcvid, ENOSYS);
         break;
@@ -945,7 +998,7 @@ static void cancel_waiting(resmgr_context_t *ctp, rcvid_t rcvid)
     pthread_mutex_lock(&G.mtx);
     for (int i = 0; i < NPEND; i++) {
         struct pend *p = &G.pend[i];
-        if (p->used && !p->cancelled && !p->done &&
+        if (p->used && !p->cancelled && !p->done && p->op != CN_OP_NOTIFY &&
             (p->rcvid == rcvid || (p->cpid == who->pid && p->ctid == who->tid && p->cscoid == who->scoid))) {
             e = p;
             break;
@@ -1218,6 +1271,7 @@ static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
     }
     if (n > CN_MAX_DATA)
         n = CN_MAX_DATA;
+    ocb->ready = 0;
     return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0, (uint32_t)n, NULL);
 }
 
@@ -1275,6 +1329,25 @@ static int cn_devctl(resmgr_context_t *ctp, io_devctl_t *msg, struct cn_ocb *ocb
     return st;
 }
 
+/* select, poll and ionotify. Output is always ready (a write waits on the peer, never on room here). Input is ready
+ * once the peer said so; otherwise the waiter is armed and one NOTIFY request goes to the peer, whose answer wakes
+ * every waiter on this open (complete). */
+static int cn_notify(resmgr_context_t *ctp, io_notify_t *msg, struct cn_ocb *ocb)
+{
+    if (ocb->state == OCB_STATUS)
+        return iofunc_notify(ctp, msg, ocb->notify, _NOTIFY_COND_INPUT | _NOTIFY_COND_OUTPUT, NULL, NULL);
+    if (ocb->state != OCB_OPEN || ocb->isdir)
+        return ENOSYS;
+    int trig = _NOTIFY_COND_OUTPUT;
+    if (ocb->ready)
+        trig |= _NOTIFY_COND_INPUT;
+    int armed = 0;
+    int st = iofunc_notify(ctp, msg, ocb->notify, trig, NULL, &armed);
+    if (armed && !ocb->armed && !(trig & _NOTIFY_COND_INPUT) && notify_peer(ocb) == 0)
+        ocb->armed = 1;
+    return st;
+}
+
 /* Offsets live on the peer and are not forwarded: say so instead of moving a local copy. A directory is
  * the exception, because its position is only an entry index that this side keeps (rewinddir, seekdir). */
 static int cn_lseek(resmgr_context_t *ctp, io_lseek_t *msg, struct cn_ocb *ocb)
@@ -1315,6 +1388,7 @@ static int cn_close_ocb(resmgr_context_t *ctp, void *reserved, struct cn_ocb *oc
         queue_close_locked(ocb->rh);    /* fire and forget: close never waits on the peer */
     pthread_mutex_unlock(&G.mtx);
     wake_io();
+    iofunc_notify_remove(ctp, ocb->notify);
     return iofunc_close_ocb_default(ctp, reserved, &ocb->hdr);
 }
 
@@ -1563,6 +1637,7 @@ int main(int argc, char **argv)
     iof.lseek = cn_lseek;
     iof.stat = cn_stat;
     iof.unblock = io_unblock;
+    iof.notify = cn_notify;
     /* One dispatch thread, so no attribute locking; this also keeps the library away from an OCB
      * that an unblock handler has just freed. Metadata changes are not forwarded yet. */
     iof.lock_ocb = NULL;

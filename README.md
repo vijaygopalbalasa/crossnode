@@ -30,6 +30,8 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - The caller's priority travels with each request. The other machine does the work at that priority, never above a
   cap its operator sets, so a priority 30 caller is still answered while priority 12 work fills every CPU on either
   machine. A build that drops the priority fails that test.
+- `select`, `poll` and `ionotify` wait for input on another machine's device: a program waiting on
+  `/net/<peer>/dev/ser2` wakes when a line is typed on that machine's serial port.
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
   the peer comes back, with nothing restarted. `cat /net/<peer>/.status` says whether the link is up, authenticated,
   how many calls wait, and how often it dropped or refused a frame, each with its last reason.
@@ -38,17 +40,19 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
   and cannot be changed while the system runs.
 
-The creative part is a non-obvious use of QNX's own resource manager, message passing, boot image and security
-policy features to bring back something QNX 8.0 lost.
+QNX's own documentation describes Qnet as "deployed as a network of tightly coupled trusted machines"
+([QNX 7.1 System Architecture, Native Networking](https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/qnet.html)).
+Crossnode does not trust the network: per-link keys, tagged frames, non-root programs under an immutable policy, and
+one process per peer, so one hung peer cannot hold up another.
 
 Who it is for: systems built from several QNX boards that talk through Qnet's `/net/<node>/` paths, such as
 distributed control systems, test rigs and lab instruments with a supervisor on one board and drivers on others,
 and multi-board controllers. Their users noticed. On the OpenQNX forum, when the QNX 7.1 notes said Qnet would be
-removed in a future release, the maintainer of a QNX multi-port serial driver, a Qnet user since 1987, described
+removed in a future release, the maintainer of a QNX multi-port serial driver, who has "exploited it since 1987", described
 reaching serial ports on remote machines through Qnet instead of running serial cables around buildings and
 factories, named wind farms and even cars and motorbikes as places where linking remote CPUs matters, and wrote
 "Arguably QNX ain't QNX without Qnet" ([thread, 2020](https://forums.openqnx.com/t/topic/8120)); Crossnode's tests run the stock `stty -a` on
-another machine's serial port through `/net`. A 2025 write-up of Qnet notes it is gone in 8.0 and hopes it returns
+another machine's serial port through `/net`, and wait with `select` on it until a line is typed there. A 2025 write-up of Qnet notes it is gone in 8.0 and hopes it returns
 ([blog](https://linguini1.github.io/blog/2025/06/03/qnet.html)). QNX 8.0 lists no drop-in
 replacement for those paths, so each such program would otherwise move to sockets or to middleware such as SOME/IP
 or DDS. Crossnode keeps them unchanged, because on QNX every open, read and devctl is already a message to whichever
@@ -58,7 +62,8 @@ Why a real-time OS matters here: the receiving thread of a QNX server inherits t
 message it handles. Crossnode extends that across the wire: the caller's priority goes in each request and the other
 machine's worker runs at it, so important work stays ahead of less important work on both machines. It is still not a
 hard real-time transport: requests go over TCP, the network stack itself runs at priority 21 in these images, and a
-lost peer is noticed after 2 s of silence. What it bounds is failure, and what it keeps is priority order. The demo's
+lost peer is noticed after 2 s of silence, and requests share one TCP stream in the order they were sent. What it
+bounds is failure; what it carries is the caller's priority for the work on the other machine. The demo's
 radar and temperature sensors are labelled stand-ins: the fit is supervision, diagnostics and configuration across
 boards, not a sensor's real-time data path.
 
@@ -79,6 +84,7 @@ boards, not a sensor's real-time data path.
 | The caller's priority, as the kernel gave it to the receiving thread (`ctp->info.priority`), sent with the request and used for the worker on the other machine (`PTHREAD_EXPLICIT_SCHED`), capped by `-P` | `src/cn_net.c`, `submit`; `src/cn_agent.c`, job start | priority 1 to 4 |
 | A file answered by the resource manager itself, never forwarded (`/net/<peer>/.status`) | `src/cn_net.c`, `cn_open`, `status_text` | loopback 25c, 26a to 26d, zonal 15 |
 | A stale unblock pulse told apart from a live one (`MsgInfo`, `_NTO_MI_UNBLOCK_REQ`) | `src/cn_net.c`, `cancel_waiting` | loopback 21a to 21e, two-node 3, 3b |
+| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8c |
 | Path containment (`realpath`), then the opened descriptor is asked where it points (`iofdinfo`) | `src/cn_agent.c`, `resolve`, `do_open` | loopback 3, 3b to 3e |
 | A blocked device call interrupted with a targeted signal (`pthread_kill`) | `src/cn_agent.c`, `cancel_job_locked` | loopback 16d, 16e, two-node 2c-2 |
 | Security policy: one type per program, recorded with `secpolgenerate`, compiled into the boot image and enforced (`on -T`, `mkqnximage --secpol --policy`, `secpol -Q`) | `image/build-image.sh`, `image/record-policy.sh` | zonal 4 to 8, boot image 6 to 13 |
@@ -155,6 +161,15 @@ Needs QNX SDP 8.0 (the free non-commercial licence works), a Linux shell where `
 `qcc -Vgcc_ntox86_64`); the target is x86_64 QEMU guests built with `mkqnximage`. The images stay on your machine;
 nothing from QNX is in this repository.
 
+One command does all of it, from source to the demo (six image builds and a policy recording, so it takes a while):
+
+```
+scripts/zonal-from-scratch.sh ~/cn-work                     # build, record the policy, enforce it, 16 zonal checks, the demo
+```
+
+Where the SDP runs in a container and QEMU on the host, set `CN_BUILD`, `CN_HOST_ROOT` and `CN_BUILD_ROOT` (see the
+script's header). The same steps by hand:
+
 ```
 source ~/qnx800/qnxsdp-env.sh && make                       # build/x86_64: the two programs, the sensors and the test tools
 scripts/patch-mkqnximage.sh ~/tools                         # a copy of mkqnximage whose images accept SSH logins
@@ -228,8 +243,8 @@ cannot hold the link up.
 - `crossnode-agent` answers liveness probes on the connection's reader thread and runs every other request on a
   worker thread, so a slow device never looks like a dead machine. A worker's device call is interrupted with a
   signal when its caller gives up, its handle is closed or the connection ends.
-- Each open is resolved with `realpath()` and must land inside a share. As a second check, the agent asks the opened
-  descriptor where it really points (`iofdinfo`).
+- Each open is resolved with `realpath()` and must land inside a share. As a second check, for a file the agent asks
+  the opened descriptor where it really points (`iofdinfo`); directories and devices are checked as the limits say.
 - After the handshake, each direction has its own key, derived from both nonces, and every frame carries
   HMAC-SHA256 over a per-direction frame counter, its header and its payload (`src/cn_auth.h`). `crossnode-net` tags
   whole frames as they move to the socket, under the lock that orders them; the agent tags replies under the
@@ -253,8 +268,9 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - `stat` follows links, so `ls -l` shows a link inside a share as the file it points to.
 - `lseek`, `pread` and `pwrite` on a file answer `ESPIPE` or `ENOSYS` rather than pretending (a directory can be
   rewound).
-- No `mmap`, shared memory, or server-to-client events (`select`, `ionotify`); programs that find a server by name
-  (`name_open`) rather than by path are not covered.
+- No `mmap` or shared memory. `select`, `poll` and `ionotify` cover input only (output always reads as ready, since a
+  write waits on the peer anyway). Programs that find a server by name (`name_open`) rather than by path are not
+  covered.
 - The loopback and two-node suites run the services as root on plain test machines; the confined, enforced build is
   shown on the boot-image pair and the zonal set. The policy is recorded from the demo, so a use the recording did
   not see is denied until it is recorded too.
@@ -268,7 +284,8 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 test/twonode-up.sh IMAGES_DIR                           # boot two plain test machines (nodex, nodey) with a direct link
 test/gate1-loopback.sh 2222                             # 79 checks on one machine
 CN_MUTATE=1 test/gate1-loopback.sh 2222                 # builds that skip the frame check: 25a to 25d fail
-test/gate1-twonode.sh IMAGES_DIR                        # 19 checks across the two machines
+test/gate1-twonode.sh IMAGES_DIR                        # 22 checks across the two machines
+CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b and 8c fail
 CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR     # a crossnode-net without the liveness limit: 4, 5a and 5b fail
 test/priority.sh IMAGES_DIR                             # 4 checks: the caller's priority on both machines
 CN_MUTATE=1|central test/priority.sh IMAGES_DIR         # priority not carried: 2 fails; no -r on the caller's side: 4 fails

@@ -30,6 +30,8 @@ enum cn_op {
                            Reply payload: b entries (struct cn_dent + name, padded to 8); b == 0 is the end */
     CN_OP_AUTH   = 10,  /* handshake, see cn_auth.h: the agent opens with a challenge (a reply-flagged frame with a
                            nonce), the net side answers with a nonce and a proof, the agent answers with its proof */
+    CN_OP_NOTIFY = 11,  /* handle; answered when the handle has input to read (select, poll, ionotify on the using
+                           machine); b of the reply: the poll events seen. Cancelled like any request */
 };
 
 #define CN_OFLAG_DIR    0x40000000      /* in the flags of an OPEN request: fail with ENOTDIR unless a directory */

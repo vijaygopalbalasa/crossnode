@@ -8,6 +8,8 @@
 # Usage: test/gate1-twonode.sh IMAGES_DIR
 #        CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR   nodex runs crossnode-net-noliveness, built without the
 #        liveness limit: checks 4, 5a and 5b must FAIL (7 can fail too, depending on timing). Section 6 is skipped there (a new open would wait forever).
+#        CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR     nodex runs crossnode-net-nonotify, which never asks the peer
+#        about input: checks 8b and 8c must FAIL (select on the peer's serial port never wakes).
 set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,7 +17,7 @@ BIN=$ROOT/build/x86_64
 KEY=${CN_SSH_KEY:?set CN_SSH_KEY to the private key whose public half the images were built with (mkqnximage --ssh-ident)}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 MUTATE=${CN_MUTATE:-0}
-OUT=$ROOT/evidence/gate1-twonode-$([ "$MUTATE" = liveness ] && echo mutation-liveness-)$STAMP.txt
+OUT=$ROOT/evidence/gate1-twonode-$([ "$MUTATE" = liveness ] && echo mutation-liveness-)$([ "$MUTATE" = notify ] && echo mutation-notify-)$STAMP.txt
 mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
 
@@ -32,7 +34,7 @@ le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
    || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h \
-   || stale crossnode-net-noliveness src/cn_net.c src/cn_proto.h src/cn_auth.h; then
+   || stale crossnode-net-noliveness src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-net-nonotify src/cn_net.c src/cn_proto.h src/cn_auth.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
 HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT   # one shared key for this run
@@ -51,7 +53,7 @@ push() {   # push SSH_FUNCTION
 }
 start_nodey() {
     qy 'rm -rf /tmp/cnx && mkdir /tmp/cnx && : > /tmp/cnx/w && dd if=/dev/urandom of=/tmp/cnx/big bs=1024 count=200 2>/dev/null'
-    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /tmp/cnx -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
+    qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -v -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /dev/ser2 -e /tmp/cnx -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
 }
 wait_lines() {  # wait_lines FILE PATTERN SECONDS: until FILE on nodex has a line matching PATTERN
     local i
@@ -73,6 +75,10 @@ push qy
 if [ "$MUTATE" = liveness ]; then
     echo "== MUTATION RUN (CN_MUTATE=liveness): nodex runs crossnode-net-noliveness, which never declares a silent peer down. Checks 4, 5a and 5b must FAIL (7 can fail too: nodex may not notice that nodey rebooted)."
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-noliveness"
+fi
+if [ "$MUTATE" = notify ]; then
+    echo "== MUTATION RUN (CN_MUTATE=notify): nodex runs crossnode-net-nonotify, which never asks nodey about input. Checks 8b and 8c must FAIL."
+    qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-nonotify"
 fi
 start_nodey
 qx 'cd /tmp/cn && (./crossnode-net -v -k /tmp/cn/key -g 1000 -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
@@ -124,7 +130,7 @@ echo
 echo "== 2d. nodex lists and stats nodey's paths"
 O=$(qx 'ls /net/nodey/dev; ls /net/nodey' | tr '\n' ' ')
 echo "  ls /net/nodey/dev, ls /net/nodey: $O"
-[ "$O" = "hello ser1 dev tmp " ]
+[ "$O" = "hello ser1 ser2 dev tmp " ]
 check "2d-1 the stock ls on nodex shows nodey's shared devices and the top of its share list" $? "$O"
 R=$(qx 'cd /tmp/cn; ./cnprobe stat /net/nodey/tmp/cnx/big'); L=$(qy 'cd /tmp/cn; ./cnprobe stat /tmp/cnx/big')
 echo "  through /net: $R"; echo "  on nodey:     $L"
@@ -214,11 +220,43 @@ echo "== 7. nodey boots again; nodex needs no restart"
 "$ROOT/test/twonode-up.sh" "$IMG" nodey | sed 's/^/  /'
 push qy
 start_nodey
-sleep 1
-O=$(qx "cd /tmp/cn; cat $P; ./cnprobe get $P")
+# A call right after a failed connect fails at once for 1 s (crossnode-net's retry window), so try for up to 10 s.
+O=""
+for i in $(seq 1 20); do O=$(qx "cd /tmp/cn; cat $P; ./cnprobe get $P" 2>&1); [ "$(field rc "$(echo "$O" | tail -1)")" = EOK ] && break; sleep 0.5; done
 echo "$O" | sed 's/^/  /'
 echo "$O" | head -1 | grep -q 'hello from nodey' && [ "$(field rc "$(echo "$O" | tail -1)")" = EOK ]
-check "7 /net/nodey works again" $? "$(echo "$O" | tail -1)"
+check "7 /net/nodey works again within 10 s of its agent starting" $? "$(echo "$O" | tail -1)"
+
+echo
+echo "== 8. select on nodey's serial port, from nodex"
+# nodey's second serial port is wired to a socket on this host (twonode-up.sh): bytes sent there arrive on nodey's
+# /dev/ser2 as if typed on the line.
+SER2=$IMG/nodey/output/ser2.sock
+for i in $(seq 1 20); do qx "/tmp/cn/cnprobe get $P" 2>/dev/null | grep -q rc=EOK && break; sleep 0.5; done
+qy 'for i in 1 2 3 4 5; do /tmp/cn/cnprobe select /dev/ser2 300 | grep -q ready=1 || break; done' >/dev/null 2>&1   # drop anything left on nodey's ser2 from an earlier run
+type_on_ser2() {   # type_on_ser2 DELAY_S TEXT: send TEXT one character at a time after DELAY_S
+    python3 -I -c 'import socket,sys,time
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(float(sys.argv[2]))
+for c in sys.argv[3] + "\n": s.send(c.encode()); time.sleep(0.05)
+time.sleep(1); s.close()' "$SER2" "$1" "$2"
+}
+O=$(qx '/tmp/cn/cnprobe select /net/nodey/dev/ser2 1500')
+echo "  nodex# cnprobe select /net/nodey/dev/ser2 1500 (nothing typed) -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
+[ "$(field rc "$O")" = EOK ] && [ "$(field ready "$O")" = 0 ] && le "$(field ms "$O")" $((1500 + 500))
+check "8a with nothing on the line, select on /net/nodey/dev/ser2 times out with nothing ready" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
+type_on_ser2 3 typed-on-nodey-ser2 &
+O=$(qx '/tmp/cn/cnprobe select /net/nodey/dev/ser2 10000'); wait
+echo "  nodex# cnprobe select /net/nodey/dev/ser2 10000 (a line typed on nodey's ser2 after 3 s) -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
+[ "$(field ready "$O")" = 1 ] && [ "$(field read "$O")" = EOK ] && [ "$(field data "$O")" = typed-on-nodey-ser2_ ] && [ "$(field ms "$O")" -ge 2500 ]
+check "8b select waits on nodey's serial port and wakes when a line is typed there; the read returns that line" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
+qx '(/tmp/cn/cnprobe select /net/nodey/dev/ser2 15000 > /tmp/cn/s8c.txt 2>&1 < /dev/null &)'
+sleep 2
+qy 'slay -f -s KILL crossnode-agent >/dev/null 2>&1; true'
+wait_lines /tmp/cn/s8c.txt op=select 10
+O=$(qx 'cat /tmp/cn/s8c.txt')
+echo "  nodex# select waiting while nodey's agent is killed -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
+[ "$(field ready "$O")" = 1 ] && [ "$(field read "$O")" = EHOSTDOWN ]
+check "8c a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
 
 echo
 echo "== crossnode-net log on nodex"

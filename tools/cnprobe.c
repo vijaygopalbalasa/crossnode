@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/select.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -102,7 +103,7 @@ static void on_alarm(int sig)
 
 static int usage(void)
 {
-    fprintf(stderr, "usage: cnprobe get|set|add|watch|open|stale|eintr|exit PATH [ARGS]\n");
+    fprintf(stderr, "usage: cnprobe get|set|add|watch|open|stale|eintr|exit|select PATH [ARGS]\n");
     return 2;
 }
 
@@ -152,6 +153,40 @@ int main(int argc, char **argv)
                 break;
             }
             pause_ms(period);
+        }
+        close(fd);
+        return 0;
+    }
+    if (strcmp(cmd, "select") == 0) {
+        /* select PATH TIMEOUT_MS: wait with select() for input, then read once and print what came */
+        if (argc < 4)
+            return usage();
+        long ms = atol(argv[3]);
+        int fd = open_or_report(path, O_RDONLY);
+        if (fd < 0)
+            return 0;
+        fd_set r;
+        FD_ZERO(&r);
+        FD_SET(fd, &r);
+        struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+        double t0 = now_ms();
+        int n = select(fd + 1, &r, NULL, NULL, &tv);
+        double waited = now_ms() - t0;
+        if (n < 0) {
+            printf("op=select rc=%s ms=%.0f\n", ename(errno), waited);
+        } else if (n == 0 || !FD_ISSET(fd, &r)) {
+            printf("op=select rc=EOK ready=0 ms=%.0f\n", waited);
+        } else {
+            char buf[256];
+            ssize_t k = read(fd, buf, sizeof buf - 1);
+            int e = k < 0 ? errno : EOK;
+            if (k < 0)
+                k = 0;
+            buf[k] = '\0';
+            for (ssize_t i = 0; i < k; i++)
+                if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == ' ')
+                    buf[i] = '_';
+            printf("op=select rc=EOK ready=1 read=%s data=%s ms=%.0f\n", ename(e), buf, waited);
         }
         close(fd);
         return 0;

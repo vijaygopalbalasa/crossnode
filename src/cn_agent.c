@@ -845,6 +845,33 @@ static void do_devctl(struct job *j)
     send_reply(j->c, h, err, info, j->buf, out);
 }
 
+/* Wait until the handle has input, then answer: select, poll and ionotify on the using machine. The wait ends
+ * early when the request is cancelled (the caller stopped waiting, closed the handle, or the link ended). */
+static void do_notify(struct job *j)
+{
+    const struct cn_hdr *h = &j->h;
+    if ((j->fd = get_fd(j->c, h->handle)) < 0) {
+        send_reply(j->c, h, EBADF, 0, NULL, 0);
+        return;
+    }
+    struct pollfd pf = { .fd = j->fd, .events = POLLIN | POLLRDNORM };
+    int r;
+    for (;;) {
+        if (job_cancelled(j)) {
+            r = -1;
+            errno = EINTR;
+            break;
+        }
+        r = poll(&pf, 1, -1);
+        if (r >= 0 || errno != EINTR)
+            break;
+    }
+    if (r < 0)
+        send_reply(j->c, h, errno, 0, NULL, 0);
+    else
+        send_reply(j->c, h, 0, (int32_t)pf.revents, NULL, 0);
+}
+
 /* Close a handle; any job still working on it is cancelled, since nobody can want its answer. */
 static void do_close(struct conn *c, int32_t h)
 {
@@ -901,6 +928,7 @@ static void *worker(void *arg)
     case CN_OP_DEVCTL: do_devctl(j); break;
     case CN_OP_STAT:   do_stat(j);   break;
     case CN_OP_READDIR: do_readdir(j); break;
+    case CN_OP_NOTIFY: do_notify(j); break;
     default:           send_reply(j->c, &j->h, ENOSYS, 0, NULL, 0); break;
     }
     job_end(j);

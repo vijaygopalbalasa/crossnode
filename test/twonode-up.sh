@@ -5,7 +5,9 @@
 #   nodey: SSH on 127.0.0.1:2223, link address 10.9.0.2
 # The link is a second virtio NIC on each guest whose frames travel as UDP datagrams between the
 # two QEMU processes (netdev dgram). Nothing else is on it, so killing one QEMU is a silent peer,
-# the same as pulling a node's power.
+# the same as pulling a node's power. Each guest's second serial port (/dev/ser2) is wired to a socket on the host,
+# IMAGES_DIR/<node>/output/ser2.sock, so characters written there arrive on that serial line. Disk writes are kept
+# out of the image (-snapshot), so the tests' power cuts can never damage it.
 #
 # Usage: test/twonode-up.sh IMAGES_DIR      (IMAGES_DIR/nodex and IMAGES_DIR/nodey from mkqnximage)
 #        test/twonode-up.sh IMAGES_DIR nodey  (boot only that node)
@@ -21,8 +23,8 @@ boot() {   # boot NAME SSH_PORT MAC_LAN MAC_LINK LINK_LOCAL_PORT LINK_REMOTE_POR
     fi
     rm -f "$d/serial.log"
     ( cd "$d/.." && qemu-system-x86_64 -cpu max -m 1G -smp 2 -display none -daemonize \
-        -serial file:output/serial.log -pidfile output/qemu.pid \
-        -kernel output/ifs.bin -drive file=output/disk-qemu.vmdk,if=ide,id=drv0 \
+        -serial file:output/serial.log -serial unix:output/ser2.sock,server=on,wait=off -pidfile output/qemu.pid \
+        -kernel output/ifs.bin -drive file=output/disk-qemu.vmdk,if=ide,id=drv0 -snapshot \
         -netdev user,id=lan,hostfwd=tcp:127.0.0.1:$2-:22 \
         -device virtio-net-pci,netdev=lan,mac=$3 \
         -netdev dgram,id=link,local.type=inet,local.host=127.0.0.1,local.port=$5,remote.type=inet,remote.host=127.0.0.1,remote.port=$6 \

@@ -23,10 +23,10 @@ run() {   # run x|y COMMAND: show the prompt and the command, then its real outp
 HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT
 for m in qx qy; do
     $m 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; true'
-    for f in hellodev crossnode-agent crossnode-net cnprobe; do $m "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"; done
+    for f in hellodev crossnode-agent crossnode-net cnprobe cnmitm; do $m "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"; done
     $m 'umask 077; cat > /tmp/cn/key' < "$HOSTKEY"
 done
-qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -r 30 -P 30 -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
+qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -r 30 -P 30 -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /dev/ser2 -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
 sleep 1
 qx 'cd /tmp/cn && (./crossnode-net -r 30 -k /tmp/cn/key -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
 for i in $(seq 1 20); do qx '/tmp/cn/cnprobe get /net/nodey/dev/hello' 2>/dev/null | grep -q rc=EOK && break; sleep 0.5; done
@@ -82,6 +82,32 @@ if not done:
     os.kill(pid, 9)
 PY
 pause
+say "A program on nodex waits with select on nodey's second serial port. A line is typed on that serial line"
+SER2=$IMG/nodey/output/ser2.sock
+qy 'for i in 1 2 3 4 5; do /tmp/cn/cnprobe select /dev/ser2 300 | grep -q ready=1 || break; done' >/dev/null 2>&1   # drop anything left on the line
+printf '\033[1;36mnodex#\033[0m %s\n' 'cnprobe select /net/nodey/dev/ser2 20000'; pause 0.6
+python3 -I -c 'import socket,sys,time
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(4)
+sys.stdout.write("\033[1;35mhost$\033[0m typing into nodey'"'"'s ser2 (a QEMU socket): hello from the serial line\n"); sys.stdout.flush()
+for c in "hello from the serial line\n": s.send(c.encode()); time.sleep(0.06)
+time.sleep(1); s.close()' "$SER2" &
+qx '/tmp/cn/cnprobe select /net/nodey/dev/ser2 20000' | sed 's/ ms=[0-9]*//'
+wait
+pause
+say "Priority travels. Two callers on nodex, at priority 5 and 30, wait on that serial port"
+qx '(on -p 5 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &); (on -p 30 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &)'
+sleep 2
+say "On nodey, the agent's two workers wait in the serial driver (devc-ser8250) at the callers' priorities, 5 and 30"
+run y 'pidin -p crossnode-agent; pidin -p devc-ser8250 | sed -n 2p'
+qx 'slay -f cat >/dev/null 2>&1; true'
+pause
+say "Change one bit of a request on the wire (a test proxy between the two machines)"
+qx 'cd /tmp/cn && (./cnmitm 7790 10.9.0.2 7777 flipreq 32 > mitm.log 2>&1 < /dev/null &) && (./crossnode-net -k /tmp/cn/key -n tampered -c 127.0.0.1:7790 > tnet.log 2>&1 < /dev/null &); sleep 1; true'
+run y '/tmp/cn/cnprobe set /dev/hello 7 | cut -d" " -f1-4'
+run x '/tmp/cn/cnprobe set /net/tampered/dev/hello 42 | cut -d" " -f1-2'
+run y '/tmp/cn/cnprobe get /dev/hello | cut -d" " -f1-4'
+run y 'tail -1 /tmp/cn/agent.log'
+qx 'slay -f cnmitm >/dev/null 2>&1; true'
 say "The link's own status file, answered on nodex"
 run x 'cat /net/nodey/.status'
 say "Priority travels with the request. The test fills both of nodey's CPUs with priority 12 work, then calls in"

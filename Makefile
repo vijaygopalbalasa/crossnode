@@ -7,7 +7,7 @@ CC      = qcc -Vgcc_nto$(ARCH)
 CFLAGS ?= -O2 -g -std=gnu11 -Wall -Wextra -Werror
 OUT     = build/$(ARCH)
 BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe $(OUT)/cnmitm \
-          $(OUT)/crossnode-net-noverify $(OUT)/crossnode-net-noprio $(OUT)/crossnode-net-noliveness \
+          $(OUT)/crossnode-net-noverify $(OUT)/crossnode-net-noprio $(OUT)/crossnode-net-noliveness $(OUT)/crossnode-net-nonotify \
           $(OUT)/crossnode-agent-noverify
 
 all: $(BINS)
@@ -42,6 +42,10 @@ $(OUT)/crossnode-net-noprio: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
 # Mutation build: an agent that skips the per-frame check on requests (test/gate1-loopback.sh, CN_MUTATE=1).
 $(OUT)/crossnode-agent-noverify: src/cn_agent.c src/cn_proto.h src/cn_auth.h | $(OUT)
 	$(CC) $(CFLAGS) -DCN_NO_VERIFY -o $@ src/cn_agent.c -lsocket
+
+# Mutation build: never asks the peer about input, so select on a peer's device never wakes (loopback, CN_MUTATE=notify).
+$(OUT)/crossnode-net-nonotify: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
+	$(CC) $(CFLAGS) -DCN_NO_NOTIFY -o $@ src/cn_net.c -lsocket
 
 # Mutation build: never declares a silent peer down (test/gate1-twonode.sh, CN_MUTATE=liveness).
 $(OUT)/crossnode-net-noliveness: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
