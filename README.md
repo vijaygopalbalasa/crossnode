@@ -24,8 +24,8 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 
 - A machine shares only the paths it lists, and only root or one named group may use a peer's paths.
 - Each link has its own key. Both ends prove they hold it when they connect, and every frame after that carries an
-  HMAC-SHA256 tag with a frame counter, checked at both ends. The tests change and replay replies on the wire and
-  show them refused. The traffic is not encrypted.
+  HMAC-SHA256 tag with a frame counter, checked at both ends in the code. The tests change and replay replies on the
+  wire and show them refused. The traffic is not encrypted.
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
   the peer comes back, with nothing restarted.
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
@@ -36,13 +36,12 @@ message passing, boot image and security policy features to bring back something
 
 Who it is for: a QNX 7 system whose programs reach a device on another board through Qnet's `/net/<node>/` paths (a
 supervisor on one board reading a sensor driver on another, for example) has no listed alternative on QNX 8.0, so
-each such program would have to be rewritten against sockets. Board support follows the same line: TI's Processor
-SDK QNX for the J721E says "In SDP 8.0 io-sock remains the only supported networking stack"
-([TI developer note, SDK 11.02](https://software-dl.ti.com/jacinto7/esd/processor-sdk-qnx-jacinto7/11_02_00_04/exports/docs/developer_notes_devnp_vs_iosock_710.html)),
-while Qnet lived in io-pkt. Crossnode keeps them unchanged, because on QNX every
+each such program would have to be rewritten against sockets. Crossnode keeps them unchanged, because on QNX every
 open, read and devctl is already a message to whichever server owns the path, and a user-space server can own a path
 that stands for another machine. It is not a real-time transport: requests go over TCP, and a lost peer is noticed
 after 2 s of silence. What it bounds is failure: a caller gets an error within a stated time instead of hanging.
+The demo's radar and temperature sensors are labelled stand-ins: the fit is supervision, diagnostics and
+configuration across boards, not a sensor's real-time data path.
 
 ![Three QNX 8.0 machines: front and rear zones share simulated sensors, central reads them by path](docs/architecture.svg)
 
