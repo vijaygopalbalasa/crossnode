@@ -9,7 +9,7 @@
 #        instead of being skipped when the machines do not look confined.
 #        CN_MUTATE=1 test/zonal.sh PROJECTS_DIR   a deliberately broken run: front loses power instead of rear, rear
 #        is cut later and not booted again, and central's crossnode-net processes are killed before check 14.
-#        Checks 10 to 16 must fail.
+#        Checks 10 to 17 must fail.
 #        Checks 10 to 14 must then fail; run it on a policy-recording (open) set, where root may kill the services.
 #        CN_MUTATE=confinement CN_EXPECT=secure on a set built without the policy: checks 4 to 8 must fail.
 set -u
@@ -32,7 +32,7 @@ trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
 echo "== Crossnode zonal demo check, $STAMP, build $(cd "$ROOT" && git describe --always --dirty)"
 [ "$MUTATE" = confinement ] && echo "== MUTATION RUN (CN_MUTATE=confinement): the set was built without the security policy (CN_SECPOL=no) but is checked as CN_EXPECT=secure. Checks 4 to 8 must FAIL."
-[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 16 must FAIL."
+[ "$MUTATE" = 1 ] && echo "== MUTATION RUN (CN_MUTATE=1): front loses power instead of rear, rear is cut later and not booted again, central's crossnode-net is killed. Checks 10 to 17 must FAIL."
 "$ROOT/image/run-zones.sh" "$D"
 sleep 8
 for p in $FRONT $REAR $CENTRAL; do echo "  $(ssh_to $p 'uname -n; uname -r' | tr '\n' ' ')"; done
@@ -59,8 +59,8 @@ check "3 the rear radar's reading moves as central watches it" $? "$(field value
 
 if [ "$EXPECT" != none ]; then
     O=$(ssh_to $CENTRAL 'pidin -f an_U' | awk '/crossnode-net/ {print $3, $4}' | sort | uniq -c | tr -s ' ')
-    [ "$(echo "$O" | tr -d '\n')" = " 2 crossnode_net_t 70" ]
-    check "4 central's two crossnode-net processes run as uid 70 under crossnode_net_t" $? "$O"
+    [ "$(echo "$O" | tr -d '\n')" = " 3 crossnode_net_t 70" ]
+    check "4 central's crossnode-net processes (a supervisor and one per zone) run as uid 70 under crossnode_net_t" $? "$O"
     O="front: $(ssh_to $FRONT 'pidin -f an_U' | awk '/crossnode-agent|hellodev|zonesensor/ {print $3, $4}' | tr '\n' ' '); rear: $(ssh_to $REAR 'pidin -f an_U' | awk '/crossnode-agent|zonesensor/ {print $3, $4}' | tr '\n' ' ')"
     [ "$(echo "$O" | grep -o 'crossnode_agent_[a-z]* 70' | grep -c .)" = 2 ] && [ "$(echo "$O" | grep -o -E '(hellodev_t|zonesensor_t) +71' | grep -c .)" = 3 ]
     check "5 each zone's agent runs as uid 70 and each sensor as uid 71, each under its own security type" $? "$O"
@@ -126,8 +126,15 @@ echo "$O" | grep -q '^state       up for ' && echo "$O" | grep -q '^connects    
 check "15 /net/rear/.status tells the story: up again, connected twice, dropped once for silence, nothing refused" $? "$(echo "$O" | grep -E '^(connects|drops|last down)' | tr -s ' ' | tr '\n' ';')"
 O=$(ssh_to $CENTRAL 'pidin arg' | awk '/crossnode-net/ && !/awk/' | grep -c -- '-f /data/etc/crossnode.conf')
 C=$(ssh_to $CENTRAL 'grep -v "^#" /data/etc/crossnode.conf | awk "NF {print \$1}" | tr "\n" " "')
-[ "$O" = 2 ] && [ "$C" = "front rear " ]
-check "16 central's links come from one file: both crossnode-net processes were started by one -f /data/etc/crossnode.conf listing front and rear" $? "$O processes; peers in the file: $C"
+[ "$O" = 3 ] && [ "$C" = "front rear " ]
+check "16 central's links come from one file: the supervisor and both zone processes come from one -f /data/etc/crossnode.conf listing front and rear" $? "$O processes; peers in the file: $C"
+R1=$(ssh_to $CENTRAL 'grep "rear started" /tmp/crossnode-net.log | tail -1 | sed "s/.*pid \([0-9]*\).*/\1/"')
+[ -n "$R1" ] && ssh_to $CENTRAL "kill -9 $R1" >/dev/null 2>&1
+O=""; for i in $(seq 1 24); do O=$(ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null); echo "$O" | grep -q "rc=EOK" && break; sleep 0.5; done
+R2=$(ssh_to $CENTRAL 'grep "rear started" /tmp/crossnode-net.log | tail -1 | sed "s/.*pid \([0-9]*\).*/\1/"')
+echo "  central# kill -9 $R1 (rear's process); then rear $(echo "$O" | grep -o 'rc=[A-Z]*' | head -1) from pid $R2"
+echo "$O" | grep -q "rc=EOK" && [ -n "$R2" ] && [ "$R2" != "$R1" ]
+check "17 under the enforced policy, the supervisor starts rear's process again when it is killed, and central reads rear again within 12 s" $? "pid ${R1:-none} killed, rear back from pid ${R2:-none}"
 echo
 echo "== RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

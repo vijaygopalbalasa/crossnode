@@ -41,6 +41,7 @@ struct cn_ocb;
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1477,7 +1478,7 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
                     bad = 1;
                 }
             }
-            char err[256];
+            char err[512];                    /* room for the longest path the line can hold */
             int kl = bad ? 0 : cn_load_key(kf, pc[n].key, err, sizeof err);
             if (kl < 0) {
                 fprintf(stderr, "crossnode-net: %s line %d: %s\n", path, lineno, err);
@@ -1503,14 +1504,144 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
     return n;
 }
 
+/* One supervisor message in one write, so it never interleaves with a peer process's lines in a shared log. */
+static void slog(const char *fmt, ...)
+{
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    if ((size_t)n >= sizeof b)
+        n = (int)sizeof b - 1;
+    (void)!write(2, b, (size_t)n);
+}
+
+/* -f: this process supervises and serves no peer itself; each peer runs in a child of its own. A child that exits
+ * is started again (after 1 s, or 5 s if it lived under 5 s). SIGHUP re-reads the file: new names start, removed
+ * names stop, a name whose address or key changed restarts, the others are left alone. SIGTERM or SIGINT stops all.
+ * Returns only in a child, with the index of the peer it serves; -1 if the file is bad at start. */
+static int supervise(const char *conf, struct peercfg *pc)
+{
+    static struct peercfg nc[CN_MAX_PEERS];
+    pid_t kids[CN_MAX_PEERS] = { 0 };
+    uint64_t started[CN_MAX_PEERS] = { 0 }, due[CN_MAX_PEERS] = { 0 };
+    int np = read_conf(conf, pc, CN_MAX_PEERS);
+    if (np < 0)
+        return -1;
+    sigset_t ss, old;
+    sigemptyset(&ss);
+    sigaddset(&ss, SIGCHLD);
+    sigaddset(&ss, SIGHUP);
+    sigaddset(&ss, SIGTERM);
+    sigaddset(&ss, SIGINT);
+    sigprocmask(SIG_BLOCK, &ss, &old);
+    for (;;) {
+        uint64_t t = now_ms();
+        int64_t wait = -1;
+        for (int i = 0; i < np; i++) {
+            if (kids[i] != 0)
+                continue;
+            if (due[i] <= t) {
+                pid_t c = fork();
+                if (c == 0) {
+                    signal(SIGHUP, SIG_IGN);     /* a HUP meant for the supervisor never stops a peer */
+                    sigprocmask(SIG_SETMASK, &old, NULL);
+                    return i;
+                }
+                if (c < 0) {
+                    due[i] = t + 1000;
+                } else {
+                    kids[i] = c;
+                    started[i] = t;
+                    slog("crossnode-net: %s started (pid %d)\n", pc[i].name, (int)c);
+                    continue;
+                }
+            }
+            int64_t d = (int64_t)(due[i] - t);
+            if (wait < 0 || d < wait)
+                wait = d;
+        }
+        siginfo_t si;
+        int sig;
+        if (wait >= 0) {
+            struct timespec ts = { .tv_sec = wait / 1000, .tv_nsec = (wait % 1000) * 1000000 };
+            sig = sigtimedwait(&ss, &si, &ts);
+        } else {
+            sig = sigwaitinfo(&ss, &si);
+        }
+        if (sig == SIGCHLD) {
+            pid_t c;
+            int st;
+            while ((c = waitpid(-1, &st, WNOHANG)) > 0) {
+                for (int i = 0; i < np; i++) {
+                    if (kids[i] == c) {
+                        uint64_t now = now_ms();
+                        int back = now - started[i] < 5000 ? 5 : 1;
+                        kids[i] = 0;
+                        due[i] = now + (uint64_t)back * 1000u;
+                        slog("crossnode-net: %s exited; starting it again in %d s\n", pc[i].name, back);
+                    }
+                }
+            }
+        } else if (sig == SIGHUP) {
+            int nn = read_conf(conf, nc, CN_MAX_PEERS);
+            if (nn < 0) {
+                slog("crossnode-net: %s not reloaded; the running peers are kept\n", conf);
+                continue;
+            }
+            pid_t nk[CN_MAX_PEERS] = { 0 };
+            uint64_t ns[CN_MAX_PEERS] = { 0 }, nd[CN_MAX_PEERS] = { 0 };
+            int kept[CN_MAX_PEERS] = { 0 };
+            for (int j = 0; j < nn; j++) {
+                for (int i = 0; i < np; i++) {
+                    if (!kept[i] && strcmp(pc[i].name, nc[j].name) == 0 && strcmp(pc[i].addr, nc[j].addr) == 0 &&
+                        pc[i].keylen == nc[j].keylen && memcmp(pc[i].key, nc[j].key, pc[i].keylen) == 0) {
+                        kept[i] = 1;
+                        nk[j] = kids[i];
+                        ns[j] = started[i];
+                        nd[j] = due[i];
+                    }
+                }
+            }
+            for (int i = 0; i < np; i++) {
+                if (!kept[i] && kids[i] > 0) {
+                    kill(kids[i], SIGTERM);
+                    slog("crossnode-net: %s stopped (removed or changed in %s)\n", pc[i].name, conf);
+                }
+            }
+            for (int j = 0; j < nn; j++) {
+                pc[j] = nc[j];
+                kids[j] = nk[j];
+                started[j] = ns[j];
+                due[j] = nd[j];
+            }
+            for (int i = nn; i < np; i++)
+                memset(pc[i].key, 0, sizeof pc[i].key);
+            for (int i = 0; i < CN_MAX_PEERS; i++)
+                memset(nc[i].key, 0, sizeof nc[i].key);
+            np = nn;
+            slog("crossnode-net: %s reloaded: %d peer%s\n", conf, np, np == 1 ? "" : "s");
+        } else if (sig == SIGTERM || sig == SIGINT) {
+            for (int i = 0; i < np; i++)
+                if (kids[i] > 0)
+                    kill(kids[i], SIGTERM);
+            exit(0);
+        }
+    }
+}
+
 static void usage(void)
 {
     fprintf(stderr,
             "usage: crossnode-net -n NAME -c ADDRESS:PORT (-k KEYFILE | -I) [-g GID] [-m DIR] [-r PRIO] [-v]\n"
             "       crossnode-net -f CONF [-g GID] [-m DIR] [-r PRIO] [-v]\n"
             "  -f CONF          one peer per line: NAME ADDRESS:PORT KEYFILE (# starts a comment). Every line is\n"
-            "                   checked first; then each peer gets its own process, holding only its own key,\n"
-            "                   so a peer that hangs or fails cannot hold up another\n"
+            "                   checked first. This process then supervises: each peer gets its own process,\n"
+            "                   keeping only its own key in memory, so a peer that hangs or fails cannot hold up\n"
+            "                   another; a peer process that exits is started again; kill -HUP re-reads CONF\n"
             "  -k KEYFILE       shared key with the agent (at least 16 bytes, mode 600)\n"
             "  -I               no authentication (only against an agent that was also started with -I)\n"
             "  -n NAME          the peer appears as DIR/NAME\n"
@@ -1551,26 +1682,9 @@ int main(int argc, char **argv)
             return 2;
         }
         static struct peercfg pc[CN_MAX_PEERS];
-        int np = read_conf(conf, pc, CN_MAX_PEERS);
-        if (np < 0)
+        int me = supervise(conf, pc);     /* returns only in a child: the peer this process serves */
+        if (me < 0)
             return 2;
-        int me = np - 1;              /* this process serves the last peer; a child serves each of the others */
-        pid_t kids[CN_MAX_PEERS];
-        signal(SIGCHLD, SIG_IGN);     /* a child that exits is reaped by the system, never left a zombie */
-        for (int i = 0; i < np - 1; i++) {
-            pid_t c = fork();
-            if (c < 0) {
-                perror("crossnode-net: fork");
-                for (int j = 0; j < i; j++)    /* all or nothing: stop the peers already started */
-                    kill(kids[j], SIGTERM);
-                return 1;
-            }
-            kids[i] = c;
-            if (c == 0) {
-                me = i;
-                break;
-            }
-        }
         static char conf_name[64];
         snprintf(conf_name, sizeof conf_name, "%s", pc[me].name);
         snprintf(conf_addr, sizeof conf_addr, "%s", pc[me].addr);
@@ -1578,7 +1692,7 @@ int main(int argc, char **argv)
         target = conf_addr;
         memcpy(G.key, pc[me].key, pc[me].keylen);
         G.keylen = pc[me].keylen;
-        for (int i = 0; i < np; i++)          /* keep only this link's key */
+        for (int i = 0; i < CN_MAX_PEERS; i++)    /* keep only this link's key */
             memset(pc[i].key, 0, sizeof pc[i].key);
     }
     if (name == NULL || target == NULL || !name_ok(name))

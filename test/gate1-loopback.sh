@@ -504,9 +504,28 @@ O=$(q 'cd /tmp/cn; ./cnprobe get /net/confa/dev/hello; ./cnprobe get /net/confb/
 echo "$O" | sed 's/^/  /'
 A1=$(echo "$O" | grep "^op=" | sed -n 1p); B1=$(echo "$O" | grep "^op=" | sed -n 2p); A2=$(echo "$O" | grep "^op=" | sed -n 3p)
 [ "$(field rc "$A1")" = EOK ] && [ "$(field rc "$B1")" = EHOSTDOWN ] && [ "$(field rc "$A2")" = EOK ] \
-  && [ "$(echo "$O" | grep -x '[0-9]*' | head -1)" = 2 ] \
+  && [ "$(echo "$O" | grep -x '[0-9]*' | head -1)" = 3 ] \
   && echo "$O" | grep -q '^peer        confa at 127.0.0.1:7777$' && echo "$O" | grep -q '^peer        confb at 127.0.0.1:7797$'
-check "27b one command serves both peers from the file, one process each: confa answers, confb (nothing listening) fails cleanly and does not hold up confa" $? "confa $(field rc "$A1"), confb $(field rc "$B1"), confa again $(field rc "$A2")"
+check "27b one command serves both peers from the file, a supervisor and one process per peer: confa answers, confb (nothing listening) fails cleanly and does not hold up confa" $? "confa $(field rc "$A1"), confb $(field rc "$B1"), confa again $(field rc "$A2")"
+# The supervisor: its log names each peer's process ("NAME started (pid N)"); the supervisor is the -f process not named.
+peerpid() { q "grep \"^crossnode-net: $1 started\" /tmp/cn/conf-net.log | tail -1 | sed 's/.*pid \([0-9]*\).*/\1/'"; }
+A1=$(peerpid confa)
+q "kill -9 $A1"
+O=""; for i in $(seq 1 24); do O=$(q '/tmp/cn/cnprobe get /net/confa/dev/hello' 2>/dev/null); [ "$(field rc "$O")" = EOK ] && break; sleep 0.5; done
+A2=$(peerpid confa)
+echo "  confa's process $A1 killed; now: $(echo "$O" | cut -d' ' -f1-2), served by pid $A2"
+[ "$(field rc "$O")" = EOK ] && [ -n "$A2" ] && [ "$A2" != "$A1" ] && q 'grep -q "confa exited; starting it again" /tmp/cn/conf-net.log'
+check "27c the supervisor starts a peer's process again when it dies: confa works again within 12 s, served by a new process" $? "pid $A1 killed, confa $(field rc "$O") from pid $A2"
+SUP=$(q 'pidin -p crossnode-net arg' | grep -- '-f peers.conf' | awk '{print $1}' | while read p; do q "grep -q \"(pid $p)\" /tmp/cn/conf-net.log" || echo "$p"; done | head -1)
+q 'cd /tmp/cn; printf "confa 127.0.0.1:7777 /tmp/cn/key\nconfc 127.0.0.1:7777 /tmp/cn/key\n" > peers.conf'
+q "kill -HUP $SUP"
+O=""; for i in $(seq 1 20); do O=$(q '/tmp/cn/cnprobe get /net/confc/dev/hello' 2>/dev/null); [ "$(field rc "$O")" = EOK ] && break; sleep 0.5; done
+B=$(q 'ls -d /net/confb 2>&1 | grep -c "^/net/confb$"; /tmp/cn/cnprobe get /net/confa/dev/hello | cut -d" " -f1-2')
+A3=$(peerpid confa)
+echo "  after kill -HUP: confc $(field rc "$O"); /net/confb listed $(echo "$B" | head -1) times; confa $(echo "$B" | tail -1) from pid $A3"
+q 'grep "stopped\|reloaded" /tmp/cn/conf-net.log' | sed 's/^/  /'
+[ "$(field rc "$O")" = EOK ] && [ "$(echo "$B" | head -1)" = 0 ] && echo "$B" | tail -1 | grep -q rc=EOK && [ "$A3" = "$A2" ]
+check "27d kill -HUP re-reads the file: a new peer (confc) appears and works, a removed one (confb) goes away, and confa keeps its process" $? "confc $(field rc "$O"), confb gone, confa pid $A2 -> $A3"
 q 'cd /tmp/cn; for p in $(pidin -p crossnode-net arg | grep "\-f peers.conf" | awk "{print \$1}"); do kill $p; done; true'
 
 echo

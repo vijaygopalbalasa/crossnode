@@ -7,7 +7,7 @@ CC      = qcc -Vgcc_nto$(ARCH)
 CFLAGS ?= -O2 -g -std=gnu11 -Wall -Wextra -Werror
 OUT     = build/$(ARCH)
 BINS    = $(OUT)/crossnode-net $(OUT)/crossnode-agent $(OUT)/hellodev $(OUT)/zonesensor $(OUT)/cnprobe $(OUT)/cnmitm \
-          $(OUT)/crossnode-net-noverify $(OUT)/crossnode-net-noprio $(OUT)/crossnode-net-noliveness $(OUT)/crossnode-net-nonotify \
+          $(OUT)/crossnode-net-noverify $(OUT)/crossnode-net-noprio $(OUT)/crossnode-net-noliveness $(OUT)/crossnode-net-nonotify $(OUT)/serialwatch \
           $(OUT)/crossnode-agent-noverify
 
 all: $(BINS)
@@ -50,6 +50,10 @@ $(OUT)/crossnode-net-nonotify: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT
 # Mutation build: never declares a silent peer down (test/gate1-twonode.sh, CN_MUTATE=liveness).
 $(OUT)/crossnode-net-noliveness: src/cn_net.c src/cn_proto.h src/cn_auth.h | $(OUT)
 	$(CC) $(CFLAGS) -DCN_NO_LIVENESS -o $@ src/cn_net.c -lsocket
+
+# An ordinary serial-port program with no Crossnode code (examples/), run unchanged against /net/<node>/dev/serN.
+$(OUT)/serialwatch: examples/serialwatch.c | $(OUT)
+	$(CC) $(CFLAGS) -o $@ examples/serialwatch.c
 
 $(OUT)/cnprobe: tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ tools/cnprobe.c -lsocket

@@ -9,7 +9,7 @@
 #        CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR   nodex runs crossnode-net-noliveness, built without the
 #        liveness limit: checks 4, 5a and 5b must FAIL (7 can fail too, depending on timing). Section 6 is skipped there (a new open would wait forever).
 #        CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR     nodex runs crossnode-net-nonotify, which never asks the peer
-#        about input: checks 8b, 8c and 8d must FAIL (select on the peer's serial port never wakes).
+#        about input: checks 8b to 8e must FAIL (select on the peer's serial port never wakes).
 set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,6 +34,7 @@ le() { [ -n "$1" ] && [ "$1" -le "$2" ]; }
 stale() { local b=$1; shift; for f in "$@"; do [ "$ROOT/$f" -nt "$BIN/$b" ] && return 0; done; return 1; }
 if [ ! -x "$BIN/crossnode-net" ] || stale crossnode-net src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-agent src/cn_agent.c src/cn_proto.h \
    || stale hellodev tools/hellodev.c tools/hello_dcmd.h || stale cnprobe tools/cnprobe.c tools/hello_dcmd.h src/cn_proto.h \
+   || stale serialwatch examples/serialwatch.c \
    || stale crossnode-net-noliveness src/cn_net.c src/cn_proto.h src/cn_auth.h || stale crossnode-net-nonotify src/cn_net.c src/cn_proto.h src/cn_auth.h; then
     echo "STALE BUILD: a binary in build/x86_64 is older than its sources; run make first"; exit 1
 fi
@@ -46,7 +47,7 @@ check() {
 }
 push() {   # push SSH_FUNCTION
     $1 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; rm -f /tmp/cn/*.log /tmp/cn/*.txt; true'
-    for f in hellodev crossnode-agent crossnode-net cnprobe; do
+    for f in hellodev crossnode-agent crossnode-net cnprobe serialwatch; do
         $1 "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"
     done
     $1 'umask 077; cat > /tmp/cn/key' < "$HOSTKEY"
@@ -77,7 +78,7 @@ if [ "$MUTATE" = liveness ]; then
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-noliveness"
 fi
 if [ "$MUTATE" = notify ]; then
-    echo "== MUTATION RUN (CN_MUTATE=notify): nodex runs crossnode-net-nonotify, which never asks nodey about input. Checks 8b, 8c and 8d must FAIL."
+    echo "== MUTATION RUN (CN_MUTATE=notify): nodex runs crossnode-net-nonotify, which never asks nodey about input. Checks 8b to 8e must FAIL."
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-nonotify"
 fi
 start_nodey
@@ -255,6 +256,16 @@ O=$(qx 'cd /tmp/cn; echo "eagain=$(cat s8d-[0-9]*.txt | grep -c rc=EAGAIN) timed
 echo "  nodex# 20 programs select on /net/nodey/dev/ser2 at once, then a devctl -> $(echo "$O" | tr '\n' ' ' | sed 's/ ms=[0-9]*//')"
 [ "$(field eagain "$O")" = 4 ] && [ "$(field timedout "$O")" = 16 ] && [ "$(field rc "$(echo "$O" | grep op=get)")" = EOK ]
 check "8c at most 16 select waiters per link: the 17th to 20th get EAGAIN at once, the 16 others time out normally, and an ordinary call is still answered" $? "$(echo "$O" | head -1)"
+# 8d: an ordinary program with no Crossnode code (examples/serialwatch.c: open, tcsetattr, select, read), the way a
+# Qnet-era program watches another machine's serial port, run unchanged against /net/nodey/dev/ser2.
+qy 'for i in 1 2 3 4 5; do /tmp/cn/cnprobe select /dev/ser2 300 | grep -q ready=1 || break; done' >/dev/null 2>&1
+type_on_ser2 3 a-line-for-serialwatch &
+O=$(qx '/tmp/cn/serialwatch /net/nodey/dev/ser2 115200 8' 2>&1); wait
+B=$(qy 'stty -a < /dev/ser2 | grep -o "baud=[0-9]*"'); qy 'stty baud=57600 < /dev/ser2' >/dev/null 2>&1
+echo "$O" | sed 's/^/  nodex# serialwatch \/net\/nodey\/dev\/ser2 115200 4: /'
+echo "  nodey# stty -a < /dev/ser2 (after it ran) -> $B"
+echo "$O" | grep -q 'set to 115200 baud' && echo "$O" | grep -qx '/net/nodey/dev/ser2: a-line-for-serialwatch' && [ "$B" = baud=115200 ]
+check "8d an ordinary POSIX program (tcsetattr, select, read; no Crossnode code) sets nodey's serial port to 115200 baud and prints the line typed there" $? "$(echo "$O" | grep -c 'ser2: a-line') line, nodey reports $B"
 qx '(/tmp/cn/cnprobe select /net/nodey/dev/ser2 15000 > /tmp/cn/s8w.txt 2>&1 < /dev/null &)'
 sleep 2
 qy 'slay -f -s KILL crossnode-agent >/dev/null 2>&1; true'
@@ -262,7 +273,7 @@ wait_lines /tmp/cn/s8w.txt op=select 10
 O=$(qx 'cat /tmp/cn/s8w.txt')
 echo "  nodex# select waiting while nodey's agent is killed -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
 [ "$(field ready "$O")" = 1 ] && [ "$(field read "$O")" = EHOSTDOWN ]
-check "8d a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
+check "8e a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
 
 echo
 echo "== crossnode-net log on nodex"

@@ -45,7 +45,7 @@ printf '\033[1;35mhost$\033[0m kill rear  (its QEMU process: the link goes silen
 kill "$(cat "$D/rear/output/qemu.pid")"
 sleep 3.5
 run $CENTRAL central 'tail -3 /tmp/catloop.log'
-say "The waiting cat ended with Host is down after about 2 s of silence. Front is not affected"
+say "The waiting cat ended with Host is down: the 2 s liveness limit, plus the loop's own quarter-second pause. Front is not affected"
 run $CENTRAL central 'cat /net/front/dev/temp; cat /net/rear/dev/radar'
 run $CENTRAL central 'cat /net/rear/.status'
 say "Power the rear zone back on. Nothing is restarted on central"

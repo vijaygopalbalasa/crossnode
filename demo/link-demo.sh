@@ -23,7 +23,7 @@ run() {   # run x|y COMMAND: show the prompt and the command, then its real outp
 HOSTKEY=$(mktemp); head -c 32 /dev/urandom > "$HOSTKEY"; trap 'rm -f "$HOSTKEY"' EXIT
 for m in qx qy; do
     $m 'slay -f -s KILL hellodev crossnode-agent crossnode-net >/dev/null 2>&1; mkdir -p /tmp/cn; true'
-    for f in hellodev crossnode-agent crossnode-net cnprobe cnmitm; do $m "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"; done
+    for f in hellodev crossnode-agent crossnode-net cnprobe cnmitm serialwatch; do $m "cat > /tmp/cn/$f && chmod +x /tmp/cn/$f" < "$BIN/$f"; done
     $m 'umask 077; cat > /tmp/cn/key' < "$HOSTKEY"
 done
 qy 'cd /tmp/cn && (./hellodev > hellodev.log 2>&1 &) && (./crossnode-agent -r 30 -P 30 -k /tmp/cn/key -e /dev/hello -e /dev/ser1 -e /dev/ser2 -l 10.9.0.2 -p 7777 > agent.log 2>&1 &)'
@@ -82,17 +82,18 @@ if not done:
     os.kill(pid, 9)
 PY
 pause
-say "A program on nodex waits with select on nodey's second serial port. A line is typed on that serial line"
+say "An ordinary program, written the Qnet way (open, tcsetattr, select, read; no Crossnode code), on nodey's second serial port"
 SER2=$IMG/nodey/output/ser2.sock
 qy 'for i in 1 2 3 4 5; do /tmp/cn/cnprobe select /dev/ser2 300 | grep -q ready=1 || break; done' >/dev/null 2>&1   # drop anything left on the line
-printf '\033[1;36mnodex#\033[0m %s\n' 'cnprobe select /net/nodey/dev/ser2 20000'; pause 0.6
+printf '\033[1;36mnodex#\033[0m %s\n' 'serialwatch /net/nodey/dev/ser2 115200 3'; pause 0.6
 python3 -I -c 'import socket,sys,time
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(4)
 sys.stdout.write("\033[1;35mhost$\033[0m typing into nodey'"'"'s ser2 (a QEMU socket): hello from the serial line\n"); sys.stdout.flush()
 for c in "hello from the serial line\n": s.send(c.encode()); time.sleep(0.06)
 time.sleep(1); s.close()' "$SER2" &
-qx '/tmp/cn/cnprobe select /net/nodey/dev/ser2 20000' | sed 's/ ms=[0-9]*//'
+qx '/tmp/cn/serialwatch /net/nodey/dev/ser2 115200 3'
 wait
+run y 'stty -a < /dev/ser2 | tail -1'
 pause
 say "Priority travels. Two callers on nodex, at priority 5 and 30, wait on that serial port"
 qx '(on -p 5 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &); (on -p 30 cat /net/nodey/dev/ser2 > /dev/null 2>&1 < /dev/null &)'
@@ -110,7 +111,13 @@ run y 'tail -1 /tmp/cn/agent.log'
 qx 'slay -f cnmitm >/dev/null 2>&1; true'
 say "The link's own status file, answered on nodex"
 run x 'cat /net/nodey/.status'
-say "The priority test: priority 12 work fills both CPUs of nodey, then of nodex; priority 30 calls still get answers"
-"$ROOT/test/priority.sh" "$IMG" 2>&1 | grep -E '^(PASS|FAIL)|RESULT' | sed 's/^/  /'
-say "Crossnode: QNX's own priority-driven message passing, across machines"
+say "Now fill both of nodey's CPUs with priority 12 work for 8 s, and call in from nodex at priority 30 and at 5"
+qx 'cd /tmp/cn; rm -f order.txt; (on -p 30 sh -c "sleep 2; ./cnprobe get /net/nodey/dev/hello > /dev/null; echo \"priority 30 call: answered\" >> order.txt" > /dev/null 2>&1 < /dev/null &); (on -p 5 sh -c "sleep 2; ./cnprobe get /net/nodey/dev/hello > /dev/null; echo \"priority 5 call: answered\" >> order.txt" > /dev/null 2>&1 < /dev/null &); (on -p 40 sh -c "sleep 5; echo \"(nodey: the priority 12 work is still running)\" >> order.txt" > /dev/null 2>&1 < /dev/null &)'
+qy "rm -f /tmp/cn/snap.txt; (on -p 40 sh -c 'sleep 4; pidin | grep -E \" (5|12)r \"' > /tmp/cn/snap.txt 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+8)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 < /dev/null &"
+sleep 12
+say "nodey, seen from a priority 40 snapshot taken while the work ran: the two priority 12 loops, and the priority 5 call's worker waiting behind them"
+run y 'cat /tmp/cn/snap.txt'
+say "nodex, the order things happened in"
+run x 'cat /tmp/cn/order.txt'
+say "Crossnode: QNX's priority-driven I/O, carried across machines"
 pause 2

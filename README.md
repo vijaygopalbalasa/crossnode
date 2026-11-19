@@ -35,8 +35,13 @@ Crossnode brings the path-based part back for QNX 8.0 as two small user-space pr
 - When a peer goes silent, every waiting caller gets a clean error instead of hanging, and the path works again when
   the peer comes back, with nothing restarted. `cat /net/<peer>/.status` says whether the link is up, authenticated,
   how many calls wait, and how often it dropped or refused a frame, each with its last reason.
-- One file lists every peer (`crossnode-net -f`); each peer gets its own process holding only its own key, so one
-  peer that hangs cannot hold up another.
+- One file lists every peer (`crossnode-net -f`). That process supervises: each peer gets its own process, keeping
+  only its own key in memory, so one peer that hangs cannot hold up another; a peer process that dies is started
+  again, and `kill -HUP` re-reads the file (new peers start, removed ones stop, the others are left alone).
+  `scripts/new-link.sh NAME ADDRESS:PORT` makes a link's key and prints both ends' lines.
+- An ordinary program written the Qnet way runs unchanged: `examples/serialwatch.c` (open, `tcsetattr`, `select`,
+  `read`; no Crossnode code) sets another machine's serial port to 115200 baud through `/net` and prints the lines
+  typed on it.
 - Both programs, and the simulated sensors, can run as non-root users under a QNX security policy that is enforced
   and cannot be changed while the system runs.
 
@@ -84,11 +89,11 @@ boards, not a sensor's real-time data path.
 | The caller's priority, as the kernel gave it to the receiving thread (`ctp->info.priority`), sent with the request and used for the worker on the other machine (`PTHREAD_EXPLICIT_SCHED`), capped by `-P` | `src/cn_net.c`, `submit`; `src/cn_agent.c`, job start | priority 1 to 4 |
 | A file answered by the resource manager itself, never forwarded (`/net/<peer>/.status`) | `src/cn_net.c`, `cn_open`, `status_text` | loopback 25c, 26a to 26d, zonal 15 |
 | A stale unblock pulse told apart from a live one (`MsgInfo`, `_NTO_MI_UNBLOCK_REQ`) | `src/cn_net.c`, `cancel_waiting` | loopback 21a to 21e, two-node 3, 3b |
-| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8d |
+| `select`, `poll` and `ionotify` on a peer's device: the caller is armed (`iofunc_notify`), the peer's worker waits with `poll` on the real descriptor, and its answer wakes the caller (`iofunc_notify_trigger`) | `src/cn_net.c`, `cn_notify`, `notify_peer`, `complete`; `src/cn_agent.c`, `do_notify` | two-node 8a to 8e |
 | Path containment (`realpath`), then the opened descriptor is asked where it points (`iofdinfo`) | `src/cn_agent.c`, `resolve`, `do_open` | loopback 3, 3b to 3e |
 | A blocked device call interrupted with a targeted signal (`pthread_kill`) | `src/cn_agent.c`, `cancel_job_locked` | loopback 16d, 16e, two-node 2c-2 |
 | Security policy: one type per program, recorded with `secpolgenerate`, compiled into the boot image and enforced (`on -T`, `mkqnximage --secpol --policy`, `secpol -Q`) | `image/build-image.sh`, `image/record-policy.sh` | zonal 4 to 8, boot image 6 to 13 |
-| A boot image that starts everything with no command typed (`mkqnximage` snippets, `waitfor`) | `image/build-image.sh` | boot image 1 to 3, zonal 1 |
+| Boot image configuration: images that start everything with no command typed (`mkqnximage` snippets, `waitfor`) | `image/build-image.sh` | boot image 1 to 3, zonal 1 |
 | Simulated sensors as resource managers | `tools/zonesensor.c`, `tools/hellodev.c` | zonal 2, 3 |
 
 ## Shown by tests
@@ -108,7 +113,7 @@ Every check, with what its transcript shows: [docs/EVIDENCE.md](docs/EVIDENCE.md
 `evidence/` ran at commit `8b04ac9` (earlier runs, including the first submission's, are in `evidence/history/`); each
 names its commit. Every important check has a deliberately broken build or run that fails it: the frame check
 (loopback 25a to 25d), priority carrying (priority 2), the I/O thread's priority (priority 4), the liveness limit
-(two-node 4, 5a, 5b), `select` forwarding (two-node 8b to 8d), the power cut (zonal 10 to 16) and confinement (zonal 4 to 8). The times are pass or fail
+(two-node 4, 5a, 5b), `select` forwarding (two-node 8b to 8e), the power cut (zonal 10 to 16) and confinement (zonal 4 to 8). The times are pass or fail
 against bounds stated in the tests, for this code on emulated machines, not performance figures for QNX.
 
 ## Why not Qnet, NFS, SSHFS or plain sockets?
@@ -144,7 +149,8 @@ Every ability not listed is denied.
 `CN_LAYOUT=zones` adds a rear zone. Front shares a simulated cabin temperature (`/dev/temp`) and a test device
 (`/dev/hello`); rear shares a simulated radar (`/dev/radar`, `tools/zonesensor.c`), whose reading moves every second.
 Central reaches each zone over its own direct link and mounts both from one file, `/data/etc/crossnode.conf`, with
-one `crossnode-net` process per zone, each holding only that link's key. `image/run-zones.sh` boots the three. Nothing is typed on the machines after power-on; `test/zonal.sh`
+a supervising `crossnode-net` and one process per zone, each keeping only that link's key in memory (all run as
+the same user under the same type, so this is not a boundary between peers on disk). `image/run-zones.sh` boots the three. Nothing is typed on the machines after power-on; `test/zonal.sh`
 and `demo/zonal-demo.sh` then run commands on central over SSH from the host. Rear loses power while central reads
 it; the read fails with `EHOSTDOWN` after about 2 s of silence, front keeps answering, and when rear boots again
 central reads it with the same `crossnode-net` processes.
@@ -211,7 +217,8 @@ rear     10.10.0.2:7777   /etc/crossnode-rear.key
 ```
 
 ```
-./crossnode-net -f /etc/crossnode.conf -r 30 -g 1000 &     # /net/front and /net/rear, one process each
+./crossnode-net -f /etc/crossnode.conf -r 30 -g 1000 &     # /net/front and /net/rear, one process each, supervised
+kill -HUP <the supervisor's pid>                             # after editing the file: add, remove or change peers
 ```
 
 Both programs need `-k KEYFILE` (the same 16 or more random bytes at both ends of a link, mode 600, for example
@@ -267,6 +274,10 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 - A device or FIFO is checked by name before and after a second resolve, not through an opened descriptor (opening
   it would run its open handler), so a path swapped in between is narrowed but not ruled out.
 - `stat` follows links, so `ls -l` shows a link inside a share as the file it points to.
+- Not forwarded: `chmod`, `chown` and `utime` (refused), and `unlink`, `rename`, `mkdir`, `link` and private
+  messages (`_IO_MSG`), which have no handler. `/net/<peer>` is for using devices and files, not managing them.
+- The worker's priority is set once, when it starts; a priority boost the caller gets later, and the caller's
+  scheduling policy, are not carried. Locally a QNX server thread follows its client's priority as it changes.
 - `lseek`, `pread` and `pwrite` on a file answer `ESPIPE` or `ENOSYS` rather than pretending (a directory can be
   rewound).
 - No `mmap` or shared memory. `select`, `poll` and `ionotify` cover input only (output always reads as ready, since a
@@ -285,15 +296,15 @@ Wire format: `src/cn_proto.h`, version 2: a 28-byte header, the payload and, on 
 
 ```
 test/twonode-up.sh IMAGES_DIR                           # boot two plain test machines (nodex, nodey) with a direct link
-test/gate1-loopback.sh 2222                             # 79 checks on one machine
+test/gate1-loopback.sh 2222                             # 81 checks on one machine
 CN_MUTATE=1 test/gate1-loopback.sh 2222                 # builds that skip the frame check: 25a to 25d fail
-test/gate1-twonode.sh IMAGES_DIR                        # 23 checks across the two machines
-CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b, 8c and 8d fail
+test/gate1-twonode.sh IMAGES_DIR                        # 24 checks across the two machines
+CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR       # a crossnode-net that never forwards select: 8b to 8e fail
 CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR     # a crossnode-net without the liveness limit: 4, 5a and 5b fail
 test/priority.sh IMAGES_DIR                             # 4 checks: the caller's priority on both machines
 CN_MUTATE=1|central test/priority.sh IMAGES_DIR         # priority not carried: 2 fails; no -r on the caller's side: 4 fails
 CN_EXPECT=none|open|secure test/boot-image.sh DIR       # the pair: 5 checks, 13 when confined and enforced
-CN_EXPECT=secure test/zonal.sh DIR                      # the three-machine zonal set: 16 checks when confined and enforced
+CN_EXPECT=secure test/zonal.sh DIR                      # the three-machine zonal set: 17 checks when confined and enforced
 cc -o /tmp/auth-vectors test/auth-vectors.c && /tmp/auth-vectors   # SHA-256, HMAC-SHA256 and frame-tag vectors, on the host
 ```
 

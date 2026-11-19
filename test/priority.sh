@@ -27,7 +27,7 @@ mkdir -p "$ROOT/evidence"
 exec > >(tee "$OUT") 2>&1
 
 HOG_S=8           # how long the hogs hold nodey's CPUs
-FAST_MS=3000      # bound for the whole priority 30 call (open and GET, timed on the host, SSH included)
+FAST_MS=1000      # bound for the whole priority 30 call (open and GET), timed inside the caller's machine
 SLOW_MS=5000      # the priority 5 call must take at least this long: it waits for the hogs
 
 qx() { ssh -i "$KEY" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes root@127.0.0.1 "$@"; }
@@ -75,8 +75,15 @@ hogs() {   # start the hogs on nodey one second from now, so this SSH session en
     qy "(sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+$HOG_S)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 &"
     sleep 2
 }
+# The network stack's priority on both machines (the ceiling the README states).
+echo "io-sock on nodex: $(qx 'pidin -p io-sock' | awk 'NR==2 {print $4}'); on nodey: $(qy 'pidin -p io-sock' | awk 'NR==2 {print $4}')"
+in_guest() {   # in_guest PRIO FILE: one open plus GET from a shell at PRIO on nodex, timed there, 2 s from now
+    qx "cd /tmp/cn; rm -f $2; (on -p $1 sh -c 'sleep 2; a=\$(./cnprobe now); r=\$(./cnprobe get /net/nodey/dev/hello); b=\$(./cnprobe now); echo \"\$r total_ms=\$((b - a))\" > $2' > /dev/null 2>&1 < /dev/null &)"
+}
+in_guest 30 c2.txt
 hogs
-O=$(timed 30)
+sleep 2
+O=$(qx 'cat /tmp/cn/c2.txt 2>/dev/null')
 MS=$(echo "$O" | sed -n 's/.*total_ms=\([0-9]*\).*/\1/p')
 echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ]
 check "2 while priority 12 hogs hold nodey's CPUs, a priority 30 call is answered within ${FAST_MS} ms" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ] && echo inside || echo outside) the bound"

@@ -26,8 +26,8 @@ echo "$O" | sed 's/^/  front processes: /'
 [ "$(echo "$O" | grep -c .)" = 2 ]
 check "1 front started hellodev and crossnode-agent by itself at boot" $? "$(echo "$O" | tr -s ' ' | tr '\n' ';')"
 O=$(ssh_to 2225 'pidin arg | grep -E "crossnode-net" | grep -v grep')
-[ "$(echo "$O" | grep -c .)" = 1 ]
-check "2 central started crossnode-net by itself at boot" $? "$(echo "$O" | tr -s ' ')"
+[ "$(echo "$O" | grep -c .)" = 2 ]
+check "2 central started crossnode-net by itself at boot (a supervisor and one process for front)" $? "$(echo "$O" | tr -s ' ')"
 for i in 1 2 3 4 5 6 7 8; do ssh_to 2225 'ls /net/front/dev' >/dev/null 2>&1 && break; sleep 2; done
 O=$(ssh_to 2225 'ls /net/front/dev; cat /net/front/dev/hello' | tr '\n' ' ')
 echo "  on central: ls /net/front/dev; cat /net/front/dev/hello -> $O"
@@ -53,7 +53,7 @@ if [ "$EXPECT" != none ]; then
     O=$(ssh_to 2224 'pidin -f an_U' | awk '/crossnode-agent/ {print $3, $4}')
     case "$O" in "crossnode_agent"*" 70") true ;; *) false ;; esac
     check "6 front's crossnode-agent runs as uid 70 under its own security type" $? "$O"
-    O=$(ssh_to 2225 'pidin -f an_U' | awk '/crossnode-net/ {print $3, $4}')
+    O=$(ssh_to 2225 'pidin -f an_U' | awk '/crossnode-net/ {print $3, $4}' | sort -u)
     [ "$O" = "crossnode_net_t 70" ]
     check "7 central's crossnode-net runs as uid 70 under its own security type" $? "$O"
     O=$(ssh_to 2224 'pidin -f an_U' | awk '/hellodev/ {print $3, $4}')

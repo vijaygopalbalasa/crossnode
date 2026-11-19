@@ -52,6 +52,13 @@ if [ -d "$D/rear" ]; then
     sleep 8
     ssh_to 2225 'for i in $(seq 1 30); do cnprobe watch /net/rear/dev/radar 1 0 2>/dev/null | grep -q EOK && break; sleep 2; done
         cat /net/rear/dev/radar; pidin arg; pidin -f an_U; cat /net/rear/.status; cat /net/front/.status' >/dev/null 2>&1 || true
+    # The supervisor's own paths: a peer process that dies is started again, and SIGHUP drops a peer and adds it back.
+    ssh_to 2225 'S=$(pidin arg | awk "/crossnode-net -f/ && !/awk/ {print \$1}" | while read p; do grep -q "(pid $p)" /tmp/crossnode-net.log || echo $p; done | head -1)
+        R=$(grep "rear started" /tmp/crossnode-net.log | tail -1 | sed "s/.*pid \([0-9]*\).*/\1/")
+        kill -9 $R; sleep 7; cp /data/etc/crossnode.conf /tmp/cn.conf; grep -v "^rear" /tmp/cn.conf > /data/etc/crossnode.conf
+        kill -HUP $S; sleep 2; cp /tmp/cn.conf /data/etc/crossnode.conf; kill -HUP $S; sleep 3
+        for i in $(seq 1 15); do cnprobe watch /net/rear/dev/radar 1 0 2>/dev/null | grep -q EOK && break; sleep 1; done
+        cat /tmp/crossnode-net.log' >/dev/null 2>&1 || true
     ssh_to 2225 'cat /dev/secpolgenerate/policy' > "$D/central-policy.txt"
     echo "central: $(grep -c . "$D/central-policy.txt") policy lines"
     TYPES='crossnode_agent_t|crossnode_net_t|hellodev_t|zonesensor_t'
