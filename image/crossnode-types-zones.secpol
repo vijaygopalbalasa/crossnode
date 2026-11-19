@@ -1,6 +1,6 @@
 # Security policy rules for the Crossnode and sensor types in the zonal layout (CN_LAYOUT=zones), as recorded by
-# secpolgenerate (image/record-policy.sh) and then enforced with CN_SECPOL=secure. Only these types are shown; the
-# full policies are recorded on your own build. The sensors are simulations. Every ability not listed is denied.
+# secpolgenerate (image/record-policy.sh) at aa53a3c and then enforced with CN_SECPOL=secure. Only these types are
+# shown; the full policies are recorded on your own build. The sensors are simulations. Every ability not listed is denied.
 
 # --- front ---
 # === Rules for type crossnode_agent_t ============

@@ -39,7 +39,7 @@ printf '\033[1;35mhost$\033[0m kill rear  (its QEMU process: the link goes silen
 kill "$(cat "$D/rear/output/qemu.pid")"
 sleep 3.5
 run $CENTRAL central 'tail -3 /tmp/catloop.log'
-say "The waiting cat ended with Host is down inside the 2 s limit. Front is not affected"
+say "The waiting cat ended with Host is down after about 2 s of silence. Front is not affected"
 run $CENTRAL central 'cat /net/front/dev/temp; cat /net/rear/dev/radar'
 say "Power the rear zone back on. Nothing is restarted on central"
 "$ROOT/image/run-zones.sh" "$D" rear | sed 's/^/  /'

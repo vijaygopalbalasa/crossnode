@@ -1,6 +1,6 @@
-# Security policy rules for the Crossnode and sensor types in the pair layout, as recorded by secpolgenerate
-# (image/record-policy.sh) and then enforced with CN_SECPOL=secure. Only these types are shown; the full policies are
-# recorded on your own build. hellodev is the stand-in test device. Every ability not listed is denied.
+# Security policy rules for the Crossnode types in the pair layout, as recorded by secpolgenerate
+# (image/record-policy.sh) at aa53a3c and then enforced with CN_SECPOL=secure. Only these types are shown; the full
+# policies are recorded on your own build. hellodev is the test device. Every ability not listed is denied.
 
 # --- front ---
 # === Rules for type crossnode_agent_t ============
