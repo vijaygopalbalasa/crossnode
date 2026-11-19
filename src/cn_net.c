@@ -74,6 +74,7 @@ struct cn_ocb {
     iofunc_notify_t notify[3];/* select, poll and ionotify waiters on this open (input, output, out-of-band) */
     int armed;                /* a NOTIFY request is out at the peer for this open */
     int ready;                /* the peer said input is there; cleared when a read goes out */
+    uint32_t reads;           /* reads sent on this open: a NOTIFY answer from before the last read is stale */
     size_t tlen;
 };
 
@@ -762,7 +763,7 @@ static int notify_peer(struct cn_ocb *ocb)
 {
 #ifdef CN_NO_NOTIFY
     (void)ocb;
-    return -1;                  /* mutation build: never asks, so a select on a peer's device never wakes */
+    return 0;                   /* mutation build: claims to have asked but sends nothing, so a select never wakes */
 #endif
     pthread_mutex_lock(&G.mtx);
     if (ocb->gen != G.gen || G.state != C_UP) {
@@ -785,6 +786,7 @@ static int notify_peer(struct cn_ocb *ocb)
     e->op = CN_OP_NOTIFY;
     e->seq = ++G.seq;
     e->ocb = ocb;
+    e->cookie = ocb->reads;
     struct cn_hdr h = { .magic = CN_MAGIC, .op = CN_OP_NOTIFY, .seq = e->seq, .handle = ocb->rh };
     if (out_append(&h, NULL, 0) != 0) {
         e->used = 0;
@@ -942,9 +944,23 @@ static void complete(resmgr_context_t *ctp, struct pend *e)
         /* No client waits on this one: wake every select, poll or ionotify waiter on the open. When the link failed,
          * wake them too, so their read fails with the reason instead of waiting forever. */
         if (e->ocb != NULL) {
-            e->ocb->armed = 0;
-            e->ocb->ready = 1;
-            iofunc_notify_trigger(e->ocb->notify, 1, IOFUNC_NOTIFY_INPUT);
+            struct cn_ocb *o = e->ocb;
+            o->armed = 0;
+            /* "Nothing yet" (the agent's wait timed out), or input reported before the last read took it: ask again
+             * if anyone still waits, otherwise let the slot go. A failed link always wakes the waiters. */
+            int again = e->err == EOK && (e->val == 0 || e->cookie != o->reads);
+            if (again) {
+                if (o->notify[IOFUNC_NOTIFY_INPUT].list != NULL) {
+                    if (notify_peer(o) == 0)
+                        o->armed = 1;
+                    else
+                        again = 0;          /* could not ask: wake them, the read will tell */
+                }
+            }
+            if (!again) {
+                o->ready = 1;
+                iofunc_notify_trigger(o->notify, 1, IOFUNC_NOTIFY_INPUT);
+            }
         }
         break;
     default:
@@ -1273,6 +1289,7 @@ static int cn_read(resmgr_context_t *ctp, io_read_t *msg, struct cn_ocb *ocb)
     if (n > CN_MAX_DATA)
         n = CN_MAX_DATA;
     ocb->ready = 0;
+    ocb->reads++;
     return submit(ctp, CN_OP_READ, ocb, NULL, ocb->rh, (int32_t)n, 0, NULL, 0, (uint32_t)n, NULL);
 }
 
@@ -1355,8 +1372,15 @@ static int cn_notify(resmgr_context_t *ctp, io_notify_t *msg, struct cn_ocb *ocb
         return EAGAIN;                  /* enough waiters already: keep the room ordinary calls need */
     int armed = 0;
     int st = iofunc_notify(ctp, msg, ocb->notify, trig, NULL, &armed);
-    if (armed && !ocb->armed && !(trig & _NOTIFY_COND_INPUT) && notify_peer(ocb) == 0)
-        ocb->armed = 1;
+    if (armed && !ocb->armed && !(trig & _NOTIFY_COND_INPUT)) {
+        if (notify_peer(ocb) == 0) {
+            ocb->armed = 1;
+        } else {
+            /* Nothing went out (no free slot, or the link just failed): wake the waiter now rather than never. */
+            ocb->ready = 1;
+            iofunc_notify_trigger(ocb->notify, 1, IOFUNC_NOTIFY_INPUT);
+        }
+    }
     return st;
 }
 
@@ -1487,8 +1511,12 @@ static int read_conf(const char *path, struct peercfg *pc, int max)
                 snprintf(pc[n].name, sizeof pc[n].name, "%s", nm);
                 snprintf(pc[n].addr, sizeof pc[n].addr, "%s", ad);
                 snprintf(pc[n].keyfile, sizeof pc[n].keyfile, "%s", kf);
+                /* A fingerprint to see a changed key on reload. Domain-separated, so it is never the value HMAC
+                 * uses as the key itself (which, for keys over 64 bytes, is their plain SHA-256). */
+                static const unsigned char dom[] = "crossnode reload fingerprint v1";
                 struct cn_sha256 h;
                 cn_sha256_init(&h);
+                cn_sha256_update(&h, dom, sizeof dom - 1);
                 cn_sha256_update(&h, kb, (size_t)kl);
                 cn_sha256_final(&h, pc[n].khash);
                 n++;
@@ -1567,14 +1595,11 @@ static int supervise(const char *conf, struct peercfg *pc)
                 wait = d;
         }
         siginfo_t si;
-        int sig;
-        if (wait >= 0) {
-            struct timespec ts = { .tv_sec = wait / 1000, .tv_nsec = (wait % 1000) * 1000000 };
-            sig = sigtimedwait(&ss, &si, &ts);
-        } else {
-            sig = sigwaitinfo(&ss, &si);
-        }
-        if (sig == SIGCHLD) {
+        if (wait < 0 || wait > 1000)
+            wait = 1000;                  /* look for dead children at least once a second, whatever SIGCHLD does */
+        struct timespec ts = { .tv_sec = wait / 1000, .tv_nsec = (wait % 1000) * 1000000 };
+        int sig = sigtimedwait(&ss, &si, &ts);
+        if (sig != SIGHUP && sig != SIGTERM && sig != SIGINT) {
             pid_t c;
             int st;
             while ((c = waitpid(-1, &st, WNOHANG)) > 0) {
@@ -1611,6 +1636,10 @@ static int supervise(const char *conf, struct peercfg *pc)
             for (int i = 0; i < np; i++) {
                 if (!kept[i] && kids[i] > 0) {
                     kill(kids[i], SIGTERM);
+                    for (int t = 0; t < 30 && waitpid(kids[i], NULL, WNOHANG) == 0; t++) {
+                        struct timespec ps = { 0, 100000000 };   /* until its path is free, at most 3 s */
+                        nanosleep(&ps, NULL);
+                    }
                     slog("crossnode-net: %s stopped (removed or changed in %s)\n", pc[i].name, conf);
                 }
             }
@@ -1689,6 +1718,8 @@ int main(int argc, char **argv)
         name = conf_name;
         target = conf_addr;
         keyfile = pc[me].keyfile;            /* this peer's process reads its own key, below; no other */
+        for (int i = 0; i < CN_MAX_PEERS; i++)
+            cn_wipe(pc[i].khash, sizeof pc[i].khash);
     }
     if (name == NULL || target == NULL || !name_ok(name))
         usage();

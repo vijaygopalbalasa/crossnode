@@ -63,6 +63,8 @@ int main(int argc, char **argv)
         FD_SET(fd, &r);
         struct timeval tv = { .tv_sec = secs, .tv_usec = 0 };
         int n = select(fd + 1, &r, NULL, NULL, &tv);
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n < 0) {
             fprintf(stderr, "serialwatch: %s: select: %s\n", port, strerror(errno));
             return 1;
@@ -76,6 +78,10 @@ int main(int argc, char **argv)
         if (k < 0) {
             fprintf(stderr, "serialwatch: %s: read: %s\n", port, strerror(errno));
             return 1;
+        }
+        if (k == 0) {
+            printf("%s: closed\n", port);
+            return 0;
         }
         for (ssize_t i = 0; i < k; i++) {
             if (buf[i] == '\n' || buf[i] == '\r') {

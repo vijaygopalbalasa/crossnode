@@ -9,7 +9,7 @@
 #        CN_MUTATE=liveness test/gate1-twonode.sh IMAGES_DIR   nodex runs crossnode-net-noliveness, built without the
 #        liveness limit: checks 4, 5a and 5b must FAIL (7 can fail too, depending on timing). Section 6 is skipped there (a new open would wait forever).
 #        CN_MUTATE=notify test/gate1-twonode.sh IMAGES_DIR     nodex runs crossnode-net-nonotify, which never asks the peer
-#        about input: checks 8b to 8e must FAIL (select on the peer's serial port never wakes).
+#        about input: checks 8b to 8f must FAIL (select on the peer's serial port never wakes).
 set -u
 IMG=${1:?usage: gate1-twonode.sh IMAGES_DIR}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -78,7 +78,7 @@ if [ "$MUTATE" = liveness ]; then
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-noliveness"
 fi
 if [ "$MUTATE" = notify ]; then
-    echo "== MUTATION RUN (CN_MUTATE=notify): nodex runs crossnode-net-nonotify, which never asks nodey about input. Checks 8b to 8e must FAIL."
+    echo "== MUTATION RUN (CN_MUTATE=notify): nodex runs crossnode-net-nonotify, which never asks nodey about input. Checks 8b to 8f must FAIL."
     qx "cat > /tmp/cn/crossnode-net && chmod +x /tmp/cn/crossnode-net" < "$BIN/crossnode-net-nonotify"
 fi
 start_nodey
@@ -266,6 +266,11 @@ echo "$O" | sed 's/^/  nodex# serialwatch \/net\/nodey\/dev\/ser2 115200 4: /'
 echo "  nodey# stty -a < /dev/ser2 (after it ran) -> $B"
 echo "$O" | grep -q 'set to 115200 baud' && echo "$O" | grep -qx '/net/nodey/dev/ser2: a-line-for-serialwatch' && [ "$B" = baud=115200 ]
 check "8d an ordinary POSIX program (tcsetattr, select, read; no Crossnode code) sets nodey's serial port to 115200 baud and prints the line typed there" $? "$(echo "$O" | grep -c 'ser2: a-line') line, nodey reports $B"
+type_on_ser2 13 typed-after-13-s &
+O=$(qx '/tmp/cn/cnprobe select /net/nodey/dev/ser2 25000'); wait
+echo "  nodex# cnprobe select /net/nodey/dev/ser2 25000 (a line typed after 13 s) -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
+[ "$(field ready "$O")" = 1 ] && [ "$(field data "$O")" = typed-after-13-s_ ] && [ "$(field ms "$O")" -ge 12000 ]
+check "8e a select still wakes when the line comes after the agent's 10 s wait has ended (crossnode-net asks again while someone waits)" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
 qx '(/tmp/cn/cnprobe select /net/nodey/dev/ser2 15000 > /tmp/cn/s8w.txt 2>&1 < /dev/null &)'
 sleep 2
 qy 'slay -f -s KILL crossnode-agent >/dev/null 2>&1; true'
@@ -273,7 +278,7 @@ wait_lines /tmp/cn/s8w.txt op=select 10
 O=$(qx 'cat /tmp/cn/s8w.txt')
 echo "  nodex# select waiting while nodey's agent is killed -> $(echo "$O" | sed 's/ ms=[0-9]*//')"
 [ "$(field ready "$O")" = 1 ] && [ "$(field read "$O")" = EHOSTDOWN ]
-check "8e a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
+check "8f a select waiting on the peer wakes when the link fails, and the read says EHOSTDOWN" $? "$(echo "$O" | sed 's/ ms=[0-9]*//')"
 
 echo
 echo "== crossnode-net log on nodex"

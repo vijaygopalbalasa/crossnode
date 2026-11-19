@@ -48,6 +48,7 @@ static const uint32_t cn_sha_k[64] = {
 
 #define CN_ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
+static inline void cn_wipe(void *p, size_t n);
 static inline void cn_sha256_block(struct cn_sha256 *s, const unsigned char *p)
 {
     uint32_t w[64], a, b, c, d, e, f, g, h;
@@ -65,6 +66,7 @@ static inline void cn_sha256_block(struct cn_sha256 *s, const unsigned char *p)
         h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
     s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+    cn_wipe(w, sizeof w);      /* the schedule holds key-derived words (HMAC pads) */
 }
 
 static inline void cn_sha256_init(struct cn_sha256 *s)

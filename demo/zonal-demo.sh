@@ -20,39 +20,41 @@ run() {   # run PORT NAME COMMAND: show the prompt and the command, then its rea
 }
 trap '"$ROOT/image/run-zones.sh" "$D" stop >/dev/null 2>&1' EXIT
 
-say "Three QNX 8.0 machines in QEMU: a front zone, a rear zone and central (a simulation)"
+say "Three QNX 8.0 machines in QEMU: front, rear and central (the sensors are simulated)"
 "$ROOT/image/run-zones.sh" "$D" | sed 's/^/  /'
 sleep 6
 for i in $(seq 1 10); do ssh_to $CENTRAL 'ls /net/front/dev /net/rear/dev' >/dev/null 2>&1 && break; sleep 2; done
 run $CENTRAL central 'uname -sr; ls /net'
-say "Nothing was typed after power-on. From here, commands run on central over SSH from the host"
-say "Central's links come from one file: a supervisor and one process per zone, each reading only its own key"
-run $CENTRAL central 'cat /data/etc/crossnode.conf'
+say "Nothing was typed after power-on. Stock ls and cat on central reach both zones by path"
 run $CENTRAL central 'ls /net/front/dev /net/rear/dev'
 run $CENTRAL central 'cat /net/front/dev/temp /net/rear/dev/radar'
-say "A devctl from central lands on front's driver"
+say "Device control (devctl, the call stty uses), sent by our test tool, lands on front's driver"
 run $CENTRAL central 'cnprobe set /net/front/dev/hello 42 | cut -d" " -f1-4'
 run $FRONT front 'cnprobe get /dev/hello | cut -d" " -f1-4'
-say "Stock tools, no code changes. The services run as uid 70 under their own security types"
-run $CENTRAL central 'pidin -f an_U | grep crossnode'
+say "One file lists the zones: a supervisor runs one process per zone, each with its own key"
+run $CENTRAL central 'cat /data/etc/crossnode.conf'
+say "No root: each service runs as its own user, under its own security type"
+run $CENTRAL central "pidin -f an_U | awk '/crossnode/ {n = split(\$2, a, \"/\"); printf \"%-9s %-15s %-17s uid %s\\n\", \$1, a[n], \$3, \$4}'"
+say "And the security policy cannot be changed while the machine runs"
 run $CENTRAL central 'secpol -Q'
-say "Central reads the rear radar with a plain cat in a loop; each line starts with central's clock"
-ssh_to $CENTRAL "rm -f /tmp/catloop.log; nohup sh -c 'while :; do v=\$(cat /net/rear/dev/radar 2>&1); echo \"\$(date +%T) \$v\"; case \"\$v\" in *rear-radar*) ;; *) break ;; esac; sleep 0.25; done' > /tmp/catloop.log 2>&1 &"
+say "Central reads the rear radar with a plain cat in a loop"
+ssh_to $CENTRAL "rm -f /tmp/catloop.log; nohup sh -c 'n=0; while :; do n=\$((n + 1)); v=\$(cat /net/rear/dev/radar 2>&1); echo \"read \$n: \$v\"; case \"\$v\" in *rear-radar*) ;; *) break ;; esac; sleep 0.25; done' > /tmp/catloop.log 2>&1 &"
 for i in 1 2 3 4 5; do ssh_to $CENTRAL 'tail -1 /tmp/catloop.log'; sleep 0.6; done
 say "Cut the rear zone's power"
-t=$(ssh_to $CENTRAL 'date +%T')   # central's clock, so the cut and the loop's lines share one clock
-printf '\033[1;35mhost$\033[0m kill rear  (its QEMU process: the link goes silent)   central clock just before the cut: %s\n' "$t"
+printf '\033[1;35mhost$\033[0m kill rear   (its QEMU process: the link goes silent)\n'
 kill "$(cat "$D/rear/output/qemu.pid")"
 sleep 3.5
 run $CENTRAL central 'tail -3 /tmp/catloop.log'
-say "The waiting cat ended with Host is down: the 2 s liveness limit, plus the loop's own quarter-second pause. Front is not affected"
+say "The waiting cat ends with Host is down once the liveness limit passes. Front still answers"
 run $CENTRAL central 'cat /net/front/dev/temp; cat /net/rear/dev/radar'
+say "The link's status file says why"
 run $CENTRAL central 'cat /net/rear/.status'
 say "Power the rear zone back on. Nothing is restarted on central"
 "$ROOT/image/run-zones.sh" "$D" rear | sed 's/^/  /'
 for i in $(seq 1 30); do ssh_to $CENTRAL 'cnprobe watch /net/rear/dev/radar 1 0' 2>/dev/null | grep -q EOK && break; sleep 2; done
 run $CENTRAL central 'cat /net/rear/dev/radar'
-run $CENTRAL central 'pidin -f an_U | grep crossnode-net'
+say "The same three processes as before, and the status file tells the story"
+run $CENTRAL central "pidin -f an_U | awk '/crossnode-net/ {print \$1, \"crossnode-net\"}'"
 run $CENTRAL central 'cat /net/rear/.status'
-say "Same processes, same paths. Crossnode: the path-based part of Qnet, authenticated, confined, and honest about failure"
+say "Crossnode: the path part of Qnet, authenticated, confined, honest about failure"
 pause 2

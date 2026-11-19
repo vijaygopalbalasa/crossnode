@@ -28,7 +28,8 @@ exec > >(tee "$OUT") 2>&1
 
 HOG_S=8           # how long the hogs hold nodey's CPUs
 FAST_MS=1000      # bound for the whole priority 30 call (open and GET), timed inside the caller's machine
-SLOW_MS=5000      # the priority 5 call must take at least this long: it waits for the hogs
+SLOW_MS=3000      # the priority 5 call must take at least this long (three times FAST_MS): it waits for the hogs,
+                  # which hold both CPUs for about 6.5 s (the shell counts whole seconds), starting 2 s before the call
 
 qx() { ssh -i "$KEY" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes root@127.0.0.1 "$@"; }
 qy() { ssh -i "$KEY" -p 2223 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 root@127.0.0.1 "$@"; }
@@ -71,30 +72,44 @@ O=$(qx 'on -p 30 /tmp/cn/cnprobe get /net/nodey/dev/hello')
 echo "$O" | grep -q 'rc=EOK'
 check "1 with nodey idle, a priority 30 call is answered" $? "$(echo "$O" | grep op=get | sed 's/ ms=[0-9]*//')"
 
-hogs() {   # start the hogs on nodey one second from now, so this SSH session ends first
-    qy "(sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+$HOG_S)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 &"
+hogs() {   # start the hogs on nodey one second from now, so this SSH session ends first; a priority 40 shell counts
+           # them half a second after they start (SSH cannot run on nodey while they hold both CPUs). Everything is
+           # detached from the SSH session, which must end at once: when it ends it takes its children with it.
+    qy "rm -f /tmp/cn/hogs.txt; (on -p 40 sh -c 'sleep 1.5; pidin | grep -c \"/sh  *12r\" > /tmp/cn/hogs.txt' > /dev/null 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+$HOG_S)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 &"
     sleep 2
 }
 # The network stack's priority on both machines (the ceiling the README states).
 echo "io-sock on nodex: $(qx 'pidin -p io-sock' | awk 'NR==2 {print $4}'); on nodey: $(qy 'pidin -p io-sock' | awk 'NR==2 {print $4}')"
-in_guest() {   # in_guest PRIO FILE: one open plus GET from a shell at PRIO on nodex, timed there, 2 s from now
-    qx "cd /tmp/cn; rm -f $2; (on -p $1 sh -c 'sleep 2; a=\$(./cnprobe now); r=\$(./cnprobe get /net/nodey/dev/hello); b=\$(./cnprobe now); echo \"\$r total_ms=\$((b - a))\" > $2' > /dev/null 2>&1 < /dev/null &)"
+in_guest() {   # in_guest PRIO FILE: one open plus GET from a shell at PRIO on nodex, timed there, starting now
+    qx "cd /tmp/cn; rm -f $2; (on -p $1 sh -c 'a=\$(./cnprobe now); r=\$(./cnprobe get /net/nodey/dev/hello); b=\$(./cnprobe now); echo \"\$r total_ms=\$((b - a))\" > $2' > /dev/null 2>&1 < /dev/null &)"
 }
-in_guest 30 c2.txt
+hogcount() {   # hogcount: the hogs the priority 40 shell saw running (read after they stop)
+    qy 'cat /tmp/cn/hogs.txt 2>/dev/null' | tr -d '\r\n '
+}
+# Checks 2 and 3 start the hogs first (hogs() returns once they run), count them on nodey, then place the call, so
+# every call is made while both CPUs are held.
 hogs
-sleep 2
+in_guest 30 c2.txt
+sleep 3
 O=$(qx 'cat /tmp/cn/c2.txt 2>/dev/null')
+sleep $((HOG_S - 3))
+H=$(hogcount)
 MS=$(echo "$O" | sed -n 's/.*total_ms=\([0-9]*\).*/\1/p')
-echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ]
-check "2 while priority 12 hogs hold nodey's CPUs, a priority 30 call is answered within ${FAST_MS} ms" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ] && echo inside || echo outside) the bound"
-sleep $((HOG_S + 2))
+echo "  hogs running on nodey while the priority 30 call was made: ${H:-none}"
+echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ] && [ "${H:-0}" -ge 2 ]
+check "2 while priority 12 hogs hold nodey's CPUs, a priority 30 call is answered within ${FAST_MS} ms" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -le "$FAST_MS" ] && echo inside || echo outside) the bound, ${H:-no} hogs running"
+sleep 2
 
 hogs
-O=$(timed 5)
+in_guest 5 c3.txt
+sleep $((HOG_S + 1))
+O=$(qx 'cat /tmp/cn/c3.txt 2>/dev/null')
+H=$(hogcount)
 MS=$(echo "$O" | sed -n 's/.*total_ms=\([0-9]*\).*/\1/p')
-echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ]
-check "3 control: a priority 5 call waits until the hogs stop (at least ${SLOW_MS} ms), so the hogs do hold the CPUs" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ] && echo after || echo before) the hogs stopped"
-sleep $((HOG_S + 2))
+echo "  hogs running on nodey while the priority 5 call was made: ${H:-none}"
+echo "$O" | grep -q 'rc=EOK' && [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ] && [ "${H:-0}" -ge 2 ]
+check "3 control: a priority 5 call waits until the hogs stop (at least ${SLOW_MS} ms), so the hogs do hold the CPUs" $? "rc=$(echo "$O" | sed -n 's/.*rc=\([A-Z]*\).*/\1/p' | head -1), $( [ -n "$MS" ] && [ "$MS" -ge "$SLOW_MS" ] && echo after || echo before) the hogs stopped, ${H:-no} hogs running"
+sleep 2
 
 # 4: the hogs on nodex, where the caller is. sshd on nodex runs below the hogs, so the whole measurement runs on
 # nodex inside one shell started at priority 30, and the host only reads the result afterwards.

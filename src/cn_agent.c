@@ -863,14 +863,18 @@ static void do_notify(struct job *j)
             errno = EINTR;
             break;
         }
-        r = poll(&pf, 1, -1);
+        r = poll(&pf, 1, CN_NOTIFY_MS);   /* 0 after the limit: "nothing yet", and the slot is free again */
         if (r >= 0 || errno != EINTR)
             break;
     }
+    int e = r < 0 ? errno : 0;
+    pthread_mutex_lock(&j->c->mtx);
+    j->c->js[j->js].notify = 0;      /* free the slot before the answer, so the next wait is not refused */
+    pthread_mutex_unlock(&j->c->mtx);
     if (r < 0)
-        send_reply(j->c, h, errno, 0, NULL, 0);
+        send_reply(j->c, h, e, 0, NULL, 0);
     else
-        send_reply(j->c, h, 0, (int32_t)pf.revents, NULL, 0);
+        send_reply(j->c, h, 0, r == 0 ? 0 : (int32_t)pf.revents, NULL, 0);
 }
 
 /* Close a handle; any job still working on it is cancelled, since nobody can want its answer. */

@@ -39,6 +39,8 @@ enum cn_op {
 
 #define CN_REPLY        0x8000u         /* set in op on every reply */
 
+#define CN_NOTIFY_MS    10000           /* a NOTIFY wait answers "nothing yet" after this, so a waiter that went away
+                                         * stops holding a slot; crossnode-net asks again only if someone still waits */
 #define CN_MAX_NOTIFY   16              /* NOTIFY requests out at once per link: select waiters never take the room
                                          * that ordinary calls need (both ends enforce it) */
 
