@@ -32,7 +32,7 @@ sleep 1
 qx 'cd /tmp/cn && (./crossnode-net -r 30 -k /tmp/cn/key -n nodey -c 10.9.0.2:7777 > net.log 2>&1 &)'
 for i in $(seq 1 20); do qx '/tmp/cn/cnprobe get /net/nodey/dev/hello' 2>/dev/null | grep -q rc=EOK && break; sleep 0.5; done
 
-say "Two QNX 8.0 machines in QEMU on a direct link. nodey shares its serial ports"
+say "Two plain QNX 8.0 test machines in QEMU on a direct link (no security policy here)"
 run x 'uname -sr; ls /net/nodey/dev'
 say "The stock stty tool on nodex reads nodey's serial port through /net"
 run x 'stty -a < /net/nodey/dev/ser1 | tail -1'
@@ -122,12 +122,13 @@ say "nodey refused the changed frame: the device keeps 7, and the agent says why
 run y 'tail -1 /tmp/cn/agent.log'
 qx 'slay -f cnmitm >/dev/null 2>&1; true'
 say "Now priority 12 work fills both of nodey's CPUs, and nodex calls in at 30 and at 5"
-qy "rm -f /tmp/cn/snap.txt; (on -p 40 sh -c 'sleep 4; pidin' > /tmp/cn/snap.txt 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+8)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 < /dev/null &"
+# The load runs about 13 s (the shell counts whole seconds); the snapshot is taken 7 s in, after both calls arrived.
+qy "rm -f /tmp/cn/snap.txt; (on -p 40 sh -c 'sleep 7; pidin' > /tmp/cn/snap.txt 2>&1 < /dev/null &); (sleep 1; for c in 1 2; do on -p 12 sh -c 'e=\$((SECONDS+14)); while [ \$SECONDS -lt \$e ]; do :; done' & done) > /dev/null 2>&1 < /dev/null &"
 sleep 2
+say "Each answer prints on nodex the moment it arrives, at real speed"
 qx 'cd /tmp/cn; rm -f order.txt; for p in 30 5; do (on -p $p sh -c "./cnprobe get /net/nodey/dev/hello > /dev/null; echo \"priority $p call: answered\" >> order.txt" > /dev/null 2>&1 < /dev/null &); done'
-printf '\033[1;36mnodex#\033[0m %s\n' 'watch the answers arrive'
 seen=0
-for i in $(seq 1 24); do
+for i in $(seq 1 60); do
     n=$(qx 'cat /tmp/cn/order.txt 2>/dev/null' | tee /tmp/cn-order.$$ | wc -l | tr -d ' ')
     if [ "$n" -gt "$seen" ]; then sed -n "$((seen + 1)),${n}p" /tmp/cn-order.$$; seen=$n; fi
     [ "$seen" -ge 2 ] && break
